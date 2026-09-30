@@ -126,6 +126,27 @@ class StepError(PanguError):
         self.detail = detail
 
 
+class AtomFailure(StepError):
+    """**领域原子报告失败时使用**：原子自己说清「我失败在哪、属于哪一类」。
+
+    ``kind`` 是领域标签（``file_not_found`` / ``server_error`` …），
+    ``failure_class`` 是 :class:`~panguverse.core.contract.FailureClass` 的取值字符串
+    （``missing_resource`` / ``transient`` …）。这样内核无需认识任何领域就能正确决策。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str = "atom_error",
+        failure_class: str = "internal",
+        detail: Any = None,
+    ) -> None:
+        super().__init__(message, detail=detail)
+        self.kind = kind
+        self.failure_class = failure_class
+
+
 class AuthExpired(StepError):
     """凭证失效（401/403），可被自愈器识别并重新认证。"""
 

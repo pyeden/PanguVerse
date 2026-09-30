@@ -10,6 +10,7 @@ from panguverse.atoms import assertions as A
 from panguverse.atoms.schema import validate as validate_schema
 from panguverse.axe.healer import Healer, find_auth_step
 from panguverse.core.context import RunContext
+from panguverse.core.contract import FailureClass
 from panguverse.core.errors import (
     AssertionFailed,
     NetworkError,
@@ -20,10 +21,11 @@ from panguverse.engine.executor import (
     Executor,
     ExecutorSettings,
     classify_exception,
-    classify_status,
+    classify_failure_class,
 )
 from panguverse.engine.result import ERROR, FAILED, PASSED, SKIPPED
 from panguverse.http.client import HttpClient, HttpRequest
+from panguverse.packs.api_testing import ApiTestingSemantics, classify_status
 
 
 def run_case(registry, spec, env, **settings):
@@ -491,21 +493,37 @@ class TestExecutor:
 # 失败分类 & 自愈决策
 # --------------------------------------------------------------------------- #
 class TestClassification:
-    def test_classify_status(self):
-        assert classify_status(401) == "auth"
-        assert classify_status(403) == "auth"
-        assert classify_status(404) == "not_found"
-        assert classify_status(409) == "conflict"
-        assert classify_status(429) == "rate_limit"
-        assert classify_status(500) == "server_error"
-        assert classify_status(400) == "client_error"
+    def test_http_status_taxonomy_lives_in_the_api_pack(self):
+        """HTTP 状态码语义属于领域包（内核不再知道 401/500 是什么意思）。"""
+        assert classify_status(401) == (FailureClass.CREDENTIALS, "auth")
+        assert classify_status(403) == (FailureClass.CREDENTIALS, "auth")
+        assert classify_status(404) == (FailureClass.MISSING_RESOURCE, "not_found")
+        assert classify_status(409) == (FailureClass.CONFLICT, "conflict")
+        assert classify_status(429) == (FailureClass.TRANSIENT, "rate_limit")
+        assert classify_status(500) == (FailureClass.TRANSIENT, "server_error")
+        assert classify_status(400) == (FailureClass.INVALID_INPUT, "client_error")
+        assert classify_status(200) == (FailureClass.EXPECTATION, "unexpected_status")
 
-    def test_classify_exception(self):
+    def test_neutral_classification_in_engine(self):
+        """内核只做中立分类：与领域无关。"""
         assert classify_exception(NetworkError("x")) == "network"
-        assert classify_exception(AssertionFailed("x", actual=401)) == "auth"
         assert classify_exception(AssertionFailed("x")) == "assertion"
         assert classify_exception(PlanError("x")) == "plan"
         assert classify_exception(ValueError("x")) == "atom_error"
+        assert classify_failure_class(NetworkError("x")) is FailureClass.TRANSIENT
+        assert classify_failure_class(PlanError("x")) is FailureClass.INVALID_INPUT
+        assert classify_failure_class(AssertionFailed("x")) is FailureClass.EXPECTATION
+
+    def test_api_semantics_maps_status_to_class(self):
+        semantics = ApiTestingSemantics()
+        assert semantics.failure_class(None, {"status_code": 503}, None) is FailureClass.TRANSIENT
+        assert semantics.failure_kind(None, {"status_code": 503}, None) == "server_error"
+        assert semantics.failure_class(None, {"status_code": 404}, None) is FailureClass.MISSING_RESOURCE
+        assert semantics.failure_kind(None, {"status_code": 401}, None) == "auth"
+        # 成功结果里藏着可重试的失败（仅 5xx / 429）
+        assert semantics.result_status(None, {"status_code": 500})[1] is FailureClass.TRANSIENT
+        assert semantics.result_status(None, {"status_code": 404}) is None
+        assert semantics.result_status(None, {"status_code": 200}) is None
 
 
 class TestHealer:
@@ -523,32 +541,61 @@ class TestHealer:
         assert find_auth_step(case, before="me").id == "login"
         assert find_auth_step(case, before="login") is None
 
-    def test_reauth_decision(self):
+    def api_semantics(self, registry):
+        """自愈器的决策完全由领域语义驱动，因此测试要显式把语义传进去。"""
+        return ApiTestingSemantics(), registry.get("http_request")
+
+    def test_reauth_decision(self, registry):
+        semantics, atom = self.api_semantics(registry)
         healer = Healer()
         decision = healer.propose(
             case=self.case_with_auth(), step=self.case_with_auth().steps[1],
             exc=AssertionFailed("401", actual=401),
+            semantics=semantics, atom=atom, resolved_inputs={"url": "http://x/me"},
         )
         assert decision.kind == "reauth" and decision.auth_step_id == "login"
         assert decision.retry_override.attempts == 1
+        assert decision.failure_kind == "auth" and decision.failure_class == "credentials"
 
-    def test_transient_retry_decision(self):
+    def test_transient_retry_decision(self, registry):
+        semantics, atom = self.api_semantics(registry)
         healer = Healer()
         decision = healer.propose(
-            case=self.case_with_auth(), step=self.case_with_auth().steps[1], exc=NetworkError("boom")
+            case=self.case_with_auth(), step=self.case_with_auth().steps[1],
+            exc=NetworkError("boom"), semantics=semantics, atom=atom,
+            resolved_inputs={"url": "http://x/me"},
         )
         assert decision.kind == "retry" and decision.retry_override.attempts == 2
 
-    def test_assertion_gives_advice_only(self):
+    def test_non_idempotent_atom_is_not_auto_retried(self, registry):
+        """POST（mutate）自动重试可能重复执行 → 只给建议，除非计划显式写 retry。"""
+        semantics, atom = self.api_semantics(registry)
+        case = Molecule.from_spec(
+            {"id": "c", "steps": [
+                {"id": "login", "use": "http_request", "tags": ["auth"], "with": {"url": "http://x/login"}},
+                {"id": "pay", "use": "http_request", "with": {"url": "http://x/pay", "method": "POST"}},
+            ]}
+        )
+        healer = Healer()
+        decision = healer.propose(
+            case=case, step=case.steps[1], exc=NetworkError("boom"),
+            semantics=semantics, atom=atom, resolved_inputs={"url": "http://x/pay", "method": "POST"},
+        )
+        assert decision.kind == "none"
+        assert "重复执行" in decision.suggestion
+
+    def test_assertion_gives_advice_only(self, registry):
+        semantics, atom = self.api_semantics(registry)
         healer = Healer()
         decision = healer.propose(
             case=self.case_with_auth(), step=self.case_with_auth().steps[1],
             exc=AssertionFailed("期望 200 实际 404", actual=404),
+            semantics=semantics, atom=atom, resolved_inputs={"url": "http://x/me"},
         )
         assert decision.kind == "none"
         assert "资源" in decision.suggestion and decision.failure_kind == "not_found"
 
-    def test_lesson_driven_patch_retry(self):
+    def test_lesson_driven_patch_retry(self, registry):
         class FakeLesson:
             fix: ClassVar[dict] = {"retry": {"attempts": 3, "delay_ms": 1}}
             suggestion = "历史验证过"
@@ -558,13 +605,15 @@ class TestHealer:
                 return "server_error@http_request 需重试"
 
         class FakeLessons:
-            def recall(self, *, kind, atom="", target=None):
+            def recall(self, *, kind=None, failure_class=None, atom="", target=None):
                 return FakeLesson()
 
         healer = Healer(lessons=FakeLessons())
+        semantics, atom = self.api_semantics(registry)
         decision = healer.propose(
             case=self.case_with_auth(), step=self.case_with_auth().steps[1],
             exc=AssertionFailed("服务端错误 500", actual=500),
+            semantics=semantics, atom=atom, resolved_inputs={"url": "http://x/me", "method": "GET"},
         )
         assert decision.kind in {"patch_retry", "retry"}
         assert decision.retry_override.attempts == 3

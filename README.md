@@ -193,15 +193,60 @@ python -m panguverse run scenarios/order_flow.yaml --env BASE_URL=https://api.yo
 | 闭环环节 | 实现 | 关键点 |
 | --- | --- | --- |
 | **拆解** | `axe/planner.py` | 场景规格 → LLM 规划（严格 JSON + 计划校验 + 一次自修复）→ 规则模板，**三层降级永不空转** |
-| **原子** | `atoms/` | `http_request`（4xx/5xx 不抛异常，404 是合法结果）/ 断言 / 提取 / 流程，共 14 个原语 |
+| **原子** | `packs/` | 原子带**契约**（类型/副作用/能力/密钥）；HTTP 的 4xx/5xx 是合法被测结果，不是异常 |
 | **执行** | `engine/executor.py` | 变量模板 `${...}`、`capture`、`foreach` 数据驱动、`when` 条件、失败即停与 `optional` |
-| **自愈** | `engine` + `axe/healer.py` | 5xx/超时/网络退避重试；401/403 自动重新执行认证步骤后重试；语义失败只给可执行建议 |
+| **自愈** | `engine` + `axe/healer.py` | 5xx/超时/网络退避重试；401/403 自动重新执行认证步骤后重试；非幂等原子不自动重试 |
 | **报告** | `report/` | JSON（机器）/ 自包含 HTML（人看）/ JUnit XML（CI）；**密钥按值打码，有测试守着** |
 | **沉淀** | `axe/memory.py` | 跑通的用例 `seal` 成回归原子；失败与自愈沉淀成经验 `lessons.jsonl` |
-| **进化** | `apply_lessons_to_plan` | 下次规划自动把经验里的重试策略补进计划（并在计划备注里说明来源） |
+| **进化** | `apply_lessons_to_plan` | 下次规划命中同一作用对象时自动补强计划（并在备注里说明来源） |
 | **组合** | `Molecule.seal()` | 分子即原子：登录流程 seal 后可当步骤用在更大的流程里，层级无限 |
 
-细节文档：[docs/api-testing.md](./docs/api-testing.md)（场景语法 / 原子清单 / 报告 / 扩展自定义原子 / FAQ）。
+细节文档：[docs/platform-architecture.md](./docs/platform-architecture.md)（平台架构与路线图）、
+[docs/api-testing.md](./docs/api-testing.md)（场景语法 / 原子清单 / 报告 / 扩展自定义原子 / FAQ）。
+
+---
+
+## 🧩 平台通用能力：换行业 = 加一个包
+
+API 测试只是第一个垂直场景。平台的目标是**各行各业把自己的业务劈成原子并共享**，
+所以内核被刻意做成**领域中立**的：原子契约（类型化 I/O、副作用、能力、密钥、失败类别、恢复策略、
+作用对象标识）与领域语义由**领域包**提供，执行/自愈/记忆/报告内核不认识任何具体协议。
+
+```
+📦 core        v0.1.0  领域=core        原子  8 个  能力 -            语义 generic
+📦 api_testing v0.1.0  领域=api         原子  6 个  能力 network      语义 api_testing   意图模板 7 个
+📦 local_fs    v0.1.0  领域=filesystem  原子 10 个  能力 filesystem   语义 local_fs      意图模板 3 个
+```
+
+```bash
+panguverse packs list / show <name> / validate --strict / manifest --out platform.json
+panguverse atoms --domain filesystem          # 按领域查看原子
+
+# 非 API 领域的自然语言自动化：命中 local_fs 包的模板，内核零改动
+panguverse loop -i "备份配置文件并校验备份存在" --env FS_ROOT=./demo
+```
+
+**跨领域组合**（自带场景 `scenarios/ops_snapshot.yaml`，跑通 7/7）：
+接口取数 → 订单落盘 → 回读 → 字段断言（通用原子）→ 列目录 → 归档。
+
+**不写 Python 也能贡献原子**（纯 YAML，见 [`examples/packs/ops_kit.pack.yaml`](./examples/packs/ops_kit.pack.yaml)）：
+
+```yaml
+pack: {name: ops_kit, domain: ops, version: 0.1.0, description: 运维原子, requires: [filesystem]}
+atoms:
+  - name: snapshot_file
+    description: 复制文件并断言目标存在
+    inputs:  {source: string, target: string}
+    outputs: {target: string, exists: boolean}
+    steps:
+      - {id: copy,   use: fs_copy,            with: {source: "${source}", target: "${target}"}}
+      - {id: verify, use: assert_file_exists, with: {path: "${copy.target}"}}
+    outputs_map: {target: "${copy.target}", exists: true}
+```
+
+平台还内建了治理能力：**能力授权**（`--allow-capabilities network,filesystem`）、
+**文件沙箱**（越界即拒绝）、**静态计划校验**（引用/类型/语法糖归属/非幂等重试，`panguverse plan --json`），
+以及一条**架构守护测试**（内核文件里出现 HTTP 词汇就 fail）。
 
 ---
 
@@ -246,25 +291,30 @@ axe.run("对所有生产环境服务执行 health_monitor，汇总结果发邮�
 
 ## 核心特性 / Key Features
 
-- **🪓 盘古斧 AI 编排** — 自然语言描述意图，AI 自动拆解、选原子、编排执行（无密钥时规则模板兜底，闭环不断）
+- **🪓 盘古斧 AI 编排** — 自然语言描述意图，AI 自动拆解、选原子、编排执行（无密钥时领域包模板兜底，闭环不断）
 - **♾️ 原子递归组合** — 原子组合成分子，分子 seal 成新原子，层级无限
-- **🧩 场景化原子定义** — 不预设"万能原子"，每个领域定义自己的原语
-- **🛡️ 自愈执行** — 失败自动重试、重新认证、经验复用；语义失败给出可执行建议（全部可审计）
-- **📈 宇宙膨胀** — 跑通的用例自动沉淀回原子库，经验库驱动下次计划自动补强
+- **🧩 领域包即扩展** — 内核领域中立；换行业 = 加一个包（原子 + 领域语义 + 语法糖 + 意图模板 + 能力声明）
+- **📦 声明式原子** — 用 YAML 描述原子即可共享，不需要写 Python
+- **🛡️ 自愈执行** — 失败自动重试、重新认证、经验复用；非幂等动作不自动重试；语义失败只给可执行建议
+- **🔒 治理内建** — 能力授权、文件沙箱、密钥按值打码、静态计划校验（引用/类型/领域用错）
+- **📈 宇宙膨胀** — 跑通的用例自动沉淀回原子库，经验按中立类别复用并被下次规划自动应用
 - **🌐 多 AI 后端** — 支持 OpenAI / Anthropic 兼容接口 / 本地 LLM；核心链路零依赖、可离线
-- **✅ 已落地闭环** — API 自动化测试：场景/意图 → 计划 → 执行 → 断言 → 报告 → 自愈 → 沉淀 → 回归复用
+- **✅ 已落地闭环** — API 自动化测试 + 跨领域组合（API + 文件系统）均已端到端跑通
 
 ---
 
 ## 路线图 / Roadmap
 
 - [x] `v0.1` — **开天**：核心抽象 Atom、PanguAxe、Atom Registry
-      —— ✅ 已完成第一块落地业务：**API 自动化测试业务闭环**（规划 / 原子执行 / 断言 / 报告 / 自愈 / 沉淀 / 回归复用），
+      —— ✅ 第一块落地业务：**API 自动化测试业务闭环**（规划 / 原子执行 / 断言 / 报告 / 自愈 / 沉淀 / 回归复用），
       内置 mock 被测量与一键演示：`python -m panguverse demo e2e`，详见 [docs/api-testing.md](./docs/api-testing.md)
-- [ ] `v0.2` — **造物**：Atom Marketplace，社区共享原子
-- [ ] `v0.3` — **观天**：可视化编排面板，原子关系图谱
-- [ ] `v0.4` — **自驱**：自治循环，执行→观察→沉淀→进化
-- [ ] `v1.0` — **PanguVerse**：万物自驱，混沌终成宇宙
+- [x] `v0.1.x` — **通神**：平台通用能力 —— 原子契约、**领域包体系**（core / api_testing / local_fs）、
+      声明式（YAML）原子、静态计划校验、能力授权与沙箱、架构守护测试，
+      详见 [docs/platform-architecture.md](./docs/platform-architecture.md)
+- [ ] `v0.2` — **造物**：包注册中心 —— 版本约束与依赖求解、签名与来源校验、`packs install`、原子 Marketplace
+- [ ] `v0.3` — **观天**：可视化编排面板、原子关系图谱、断点重跑与运行回放
+- [ ] `v0.4` — **自驱**：并发/DAG、补偿回滚、审批门、自治循环（执行→观察→沉淀→进化）
+- [ ] `v1.0` — **PanguVerse**：多行业包生态 + 分布式执行，万物自驱，混沌终成宇宙
 
 ---
 

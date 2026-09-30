@@ -199,7 +199,22 @@ assert:
 
 ## 5. 内置原子一览
 
-`panguverse atoms` 可随时查看；`panguverse atoms --json` 输出结构化清单。
+原子按**领域包**组织（平台架构见 [platform-architecture.md](./platform-architecture.md)）：
+
+| 包 | 领域 | 原子 |
+| --- | --- | --- |
+| `core` | 通用（任何行业都用） | `sleep` / `log` / `fail` / `set_var` / `json_get` / `regex_extract` / `assert_json` / `assert_schema` |
+| `api_testing` | HTTP / API | `http_request` / `header_get` / `assert_status` / `assert_latency` / `assert_header` / `assert_body_contains` |
+| `local_fs` | 文件系统（非 API 领域示例） | `fs_write_text` / `fs_read_text` / `fs_write_json` / `fs_read_json` / `fs_list` / `fs_exists` / `fs_copy` / `fs_delete` / `assert_file_exists` / `assert_file_contains` |
+
+```bash
+panguverse atoms                      # 全部原子（按 领域/分类 分组，附带副作用声明）
+panguverse atoms --domain filesystem  # 只看文件系统领域
+panguverse packs list / show local_fs # 看包的清单与语义
+```
+
+**HTTP 领域专属的写法**（`assert:` 语法糖、状态码语义、认证自愈）全部来自 `api_testing` 包；
+文件系统包用的是 `expect:` 语法糖——这正是「内核领域中立」的体现。
 
 | 分类 | 原子 | 说明 |
 | --- | --- | --- |
@@ -342,15 +357,17 @@ registry.register(assert_db_row)     # 之后场景里就能 use: assert_db_row
 
 ```
 panguverse/
-├── core/       # Atom / Molecule / RunContext（模板引擎）/ Registry / 异常 / 打码
-├── atoms/      # 内置原子：http / extract / assertions / schema / flow
+├── core/       # 原子契约（contract）/ 领域包（pack）/ 静态校验 / 分子 / 模板引擎 / Registry / 打码
+├── packs/      # 领域包：core（通用）/ api_testing（HTTP）/ local_fs（文件系统）+ 意图模板
+├── atoms/      # 原子实现（被上面的包按领域登记）
 ├── http/       # 传输层：requests 优先，缺失回退 urllib
-├── engine/     # 执行引擎与结果模型（步骤/用例/运行三层）
+├── engine/     # 执行引擎与结果模型（领域中立）
 ├── axe/        # 盘古斧：规划器（spec/llm/rules）、自愈器、记忆与进化
-├── spec/       # 场景加载：零依赖 YAML 子集解析器 + 断言糖展开
+├── spec/       # 场景加载：零依赖 YAML 子集解析器（语法糖委托给领域包）
 ├── report/     # JSON / HTML / JUnit 报告
 ├── demo/       # 内置 mock API（被测量）与一键闭环演示
-└── cli.py      # 命令行
-scenarios/      # 示例场景（冒烟鉴权 / 订单闭环 / 自愈）
-tests/          # 单测 + 端到端闭环验收
+└── cli.py      # 命令行（run/loop/plan/regression/atoms/packs/status/report/init/demo）
+scenarios/      # 示例场景（冒烟鉴权 / 订单闭环 / 自愈 / 跨领域快照）
+examples/packs/ # 声明式领域包示例（纯 YAML，无需 Python）
+tests/          # 单测 + 端到端闭环 + 平台能力与架构红线
 ```

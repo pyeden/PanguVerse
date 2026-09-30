@@ -1,0 +1,65 @@
+pack:
+  name: ops_kit
+  domain: ops
+  version: 0.1.0
+  description: 示例声明式领域包：**纯数据定义**（不需要写 Python）的运维原子，可提交、可评审、可共享
+  author: PanguVerse community
+  license: Apache-2.0
+  requires: [filesystem]
+  tags: [example, declarative, ops]
+
+# 声明式原子 = 用步骤描述出来的原子。
+# 它们与用 Python 写的原子在平台上完全等价：有类型化 I/O、有副作用声明、
+# 能被别的原子/分子引用、能被 seal 成更高层的分子。
+atoms:
+  - name: snapshot_file
+    description: 把源文件复制到目标位置，并断言目标确实存在
+    category: ops
+    inputs:
+      source: string
+      target: string
+    outputs:
+      target: string
+      exists: boolean
+    steps:
+      - id: copy
+        use: fs_copy
+        with:
+          source: ${source}
+          target: ${target}
+      - id: verify
+        use: assert_file_exists
+        with:
+          path: ${copy.target}
+    outputs_map:
+      target: ${copy.target}
+      exists: true
+
+  - name: collect_metrics
+    description: 生成一份指标快照（写入 JSON）并回读校验
+    category: ops
+    inputs:
+      path: string
+      metrics: any
+    outputs:
+      path: string
+      count: integer
+    steps:
+      - id: write
+        use: fs_write_json
+        with:
+          path: ${path}
+          data: ${metrics}
+      - id: read
+        use: fs_read_json
+        with:
+          path: ${path}
+      - id: count
+        use: assert_json
+        with:
+          source: ${read.data}
+          path: count
+          gte: 0
+    outputs_map:
+      path: ${write.path}
+      count: ${read.data.count}

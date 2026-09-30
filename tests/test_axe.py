@@ -100,11 +100,13 @@ class TestPlanValidation:
             ]
         )
         problems = plan.validate(registry)
-        assert any("未知原子" in p for p in problems)
-        assert any("缺少输入" in p for p in problems)
+        assert any("原子不存在" in p for p in problems)
+        assert any("缺少必填输入" in p for p in problems)
+        assert all(problem.startswith("c1.") or problem.startswith("c2.") for problem in problems)
 
     def test_empty_plan_invalid(self, registry):
-        assert TestPlan().validate(registry) == ["计划中没有任何用例"]
+        problems = TestPlan().validate(registry)
+        assert len(problems) == 1 and "没有任何用例" in problems[0]
 
 
 class TestSpecPlanner:
@@ -288,30 +290,32 @@ cases:
         run = axe.run(axe.plan(PlanRequest(suite=suite, env=env)), env=env)
         summary = axe.evolution.evolve(run)
         retry_lessons = [item for item in summary["lessons"] if item["fix"].get("retry")]
-        assert retry_lessons and retry_lessons[0]["kind"] == "server_error"
+        # 重试成功的经验用**中立类别**记录（transient），任何领域都成立
+        assert retry_lessons and retry_lessons[0]["failure_class"] == "transient"
+        assert retry_lessons[0]["target"] == "/api/flaky"
 
     def test_apply_lessons_to_plan(self, tmp_path, registry):
         workspace = Workspace(tmp_path)
         lessons = LessonStore(workspace)
-        lessons.record(kind="server_error", atom="http_request", target="/",
-                       fix={"retry": {"attempts": 4, "delay_ms": 10, "on": ["server_error"]}})
+        lessons.record(kind="server_error", atom="http_request", target="/", failure_class="transient",
+                       fix={"retry": {"attempts": 4, "delay_ms": 10, "on": ["transient"]}})
         plan = TestPlan(
             cases=[Molecule.from_spec({"id": "c", "steps": [
                 {"id": "req", "use": "http_request", "with": {"url": "http://x"}}]})]
         )
-        applied = apply_lessons_to_plan(plan, lessons)
+        applied = apply_lessons_to_plan(plan, lessons, registry)
         assert applied and plan.cases[0].steps[0].retry.attempts == 4
         assert plan.meta["lessons_applied"] == applied
-        # 接口不同 → 不套用别人的经验
+        # 作用对象不同 → 不套用别人的经验
         other = TestPlan(cases=[Molecule.from_spec({"id": "c", "steps": [
             {"id": "req", "use": "http_request", "with": {"url": "http://x/api/other"}}]})])
-        assert apply_lessons_to_plan(other, lessons) == []
+        assert apply_lessons_to_plan(other, lessons, registry) == []
         assert other.cases[0].steps[0].retry is None
         # 已有 retry 的步骤不会被覆盖
         plan2 = TestPlan(cases=[Molecule.from_spec({"id": "c", "steps": [
             {"id": "req", "use": "http_request", "with": {"url": "http://x"},
              "retry": {"attempts": 2}}]})])
-        assert apply_lessons_to_plan(plan2, lessons) == []
+        assert apply_lessons_to_plan(plan2, lessons, registry) == []
         assert plan2.cases[0].steps[0].retry.attempts == 2
 
     def test_workspace_reports_are_isolated(self, tmp_path):

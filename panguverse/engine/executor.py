@@ -3,8 +3,12 @@
 引擎负责四件事：
 1. **上下文传递**：步骤输出自动并入上下文，``capture`` 映射成可复用的变量；
 2. **数据驱动**：``foreach`` / ``when`` 让同一份用例跑多组数据；
-3. **自愈第一层**：步骤级 ``retry``（含 5xx 软失败重试）；
+3. **自愈第一层**：步骤级 ``retry``（含领域层声明的「软失败」重试）；
 4. **自愈第二层**：把失败交给 :class:`~panguverse.axe.healer.Healer` 决策（重新认证 / 修复后重试）。
+
+**领域中立**：本文件不含任何 HTTP / 文件系统 / 数据库知识。
+「5xx 该不该重试」「401 是凭证问题」「经验标识是 URL 还是文件路径」全部由原子所属的
+领域包（:mod:`panguverse.core.contract` + :mod:`panguverse.packs`）通过 ``semantics`` 提供。
 """
 
 from __future__ import annotations
@@ -17,10 +21,10 @@ from typing import Any
 
 from ..core.atom import Atom
 from ..core.context import MISSING, RunContext, split_path, walk_path
+from ..core.contract import NEUTRAL_SEMANTICS, AtomSemantics, FailureClass, neutral_failure_class, neutral_failure_kind
 from ..core.errors import (
     PanguError,
     PlanError,
-    RequestTimeout,
     StepError,
     StepFailure,
 )
@@ -48,6 +52,9 @@ class ExecutorSettings:
     continue_on_failure: bool = False
     stop_on_first_failure: bool = False
     timeout: float = 10.0
+    #: 本次运行被授权的运行时能力（``network`` / ``filesystem`` / ``shell`` …）。
+    #: ``None`` 表示「不做限制」（向后兼容），给了列表则**严格校验**原子声明的能力。
+    capabilities: tuple[str, ...] | None = None
 
 
 class Executor:
@@ -65,6 +72,32 @@ class Executor:
         self.settings = settings or ExecutorSettings()
         self.healer = healer
         self.workspace = workspace
+        # 声明式（YAML）原子在运行期需要通过「分子执行器」回调
+        from ..core.pack import set_runner
+
+        set_runner(self)
+
+    # ------------------------------------------------------------------ #
+    # 领域语义
+    # ------------------------------------------------------------------ #
+    def semantics_for(self, atom: Atom | str) -> AtomSemantics:
+        """原子的领域语义（未登记则回退中立语义）。"""
+        try:
+            return self.registry.semantics_for(atom)
+        except Exception:  # noqa: BLE001 - 语义查询失败不应影响执行
+            return NEUTRAL_SEMANTICS
+
+    def classify(
+        self,
+        atom: Atom | None,
+        outputs: dict[str, Any] | None,
+        exc: BaseException | None,
+    ) -> tuple[str, FailureClass]:
+        """把失败翻译成 ``(领域标签, 中立类别)``——**唯一**的失败分类入口。"""
+        semantics = self.semantics_for(atom) if atom is not None else NEUTRAL_SEMANTICS
+        kind = semantics.failure_kind(atom, outputs, exc)
+        failure_class = semantics.failure_class(atom, outputs, exc)
+        return kind, failure_class
 
     # ------------------------------------------------------------------ #
     # 编排层入口
@@ -284,12 +317,15 @@ class Executor:
             try:
                 outputs = self._attempt(step, target, loop_ctx, step_result)
             except Exception as exc:  # noqa: BLE001 - 失败分类与自愈都在下面处理
+                kind, failure_class = self.classify(target, None, exc)
                 step_result.status = FAILED if isinstance(exc, StepFailure) else ERROR
-                step_result.error = _error_dict(exc)
+                step_result.error = _error_dict(exc, kind=kind, failure_class=failure_class)
                 step_result.message = str(exc)
                 step_result.duration_ms = (time.perf_counter() - started) * 1000
                 if step.foreach:
                     step_result.inputs = {"foreach": step.foreach, "failed_at_index": index}
+                # 专家经验：领域包定义的「作用对象标识」——HTTP 是接口路径，文件是路径，SQL 是表名
+                step_result.target = self.semantics_for(target).target(target, step_result.inputs)
                 # 自愈第二层：留给 Healer 决策（重新认证 / 修复重试）
                 if self.settings.heal and self.healer is not None and heal_budget > 0:
                     healed, used = self._try_heal(case, step, target, loop_ctx, step_result, exc)
@@ -307,6 +343,9 @@ class Executor:
                 ctx.vars[step.id] = outputs
             if outputs or step.id not in loop_ctx.vars:
                 loop_ctx.vars[step.id] = outputs
+            # 原子自己声明的「输出即密钥」（领域包可让 token/密钥字段自动打码）
+            for secret_name, secret_value in target.secrets_in_outputs(outputs):
+                ctx.add_secret(secret_name, secret_value)
             if step.foreach:
                 for name, value, secret in self._capture_values(step, outputs, ctx=loop_ctx):
                     capture_buckets.setdefault(name, []).append((value, secret))
@@ -344,6 +383,8 @@ class Executor:
     ) -> dict[str, Any]:
         """带重试的单次（或单次迭代）执行。"""
         policy = policy_override or step.retry or self.settings.default_retry
+        semantics = self.semantics_for(target)
+        self._check_capabilities(target)
         attempt = 0
         while True:
             attempt += 1
@@ -356,30 +397,46 @@ class Executor:
                 )
             marker = len(ctx.http_log)
             step_result.inputs = _brief(inputs)
+            step_result.target = semantics.target(target, inputs)
             try:
                 outputs = target.invoke(ctx, inputs)
             except (StepFailure, StepError, PanguError, TypeError) as exc:
-                kind = classify_exception(exc)
-                if policy and policy.should_retry(kind) and attempt < policy.attempts:
+                kind, failure_class = self.classify(target, None, exc)
+                if policy and policy.should_retry(kind, failure_class.value) and attempt < policy.attempts:
                     step_result.retries += 1
                     ctx.emit("retry", step=step.id, attempt=attempt, kind=kind, reason=str(exc))
                     _sleep(policy.delay_for(attempt))
                     continue
                 raise
             step_result.http.extend(ctx.http_log[marker:])
-            soft_kind = _soft_failure_kind(outputs)
-            if soft_kind and policy and policy.should_retry(soft_kind) and attempt < policy.attempts:
+            # 领域层声明「这次结果本身算失败」（例如 HTTP 5xx / 429）：仅在配置了重试策略时重试，
+            # 不改变「4xx 是合法被测结果」的语义——断言由 assert_* 原子负责。
+            soft = semantics.result_status(target, outputs)
+            if soft and policy and policy.should_retry(soft[0], soft[1].value) and attempt < policy.attempts:
                 step_result.retries += 1
                 ctx.emit(
                     "retry",
                     step=step.id,
                     attempt=attempt,
-                    kind=soft_kind,
-                    status_code=outputs.get("status_code"),
+                    kind=soft[0],
+                    failure_class=soft[1].value,
+                    outputs=_brief(outputs),
                 )
                 _sleep(policy.delay_for(attempt))
                 continue
             return outputs
+
+    def _check_capabilities(self, atom: Atom) -> None:
+        """能力授权校验：显式授权列表存在时，原子声明的能力必须都在里面。"""
+        granted = self.settings.capabilities
+        if granted is None or not atom.capabilities:
+            return
+        missing = [cap for cap in atom.capabilities if cap not in set(granted)]
+        if missing:
+            raise StepError(
+                f"原子 {atom.name} 需要未授权的能力: {', '.join(missing)}"
+                f"（本次已授权: {', '.join(sorted(granted)) or '无'}）"
+            )
 
     def _capture_values(
         self,
@@ -437,6 +494,9 @@ class Executor:
             exc=exc,
             ctx=ctx,
             settings=self.settings,
+            semantics=self.semantics_for(target),
+            atom=target,
+            resolved_inputs=step_result.inputs,
         )
         if decision is None or decision.kind == "none":
             if decision is not None and decision.suggestion:
@@ -519,63 +579,33 @@ class Executor:
     # 分子 → 原子（seal）
     # ------------------------------------------------------------------ #
     def seal_molecule(self, molecule: Molecule) -> Atom:
-        """把分子注册成原子，供更高层递归组合。"""
+        """把分子注册成原子，供更高层递归组合（与声明式原子共用同一套实现）。"""
+        from ..core.pack import composite_atom
+
         name = str(molecule.meta.get("atom_name") or molecule.case_id or molecule.name)
-        outputs_spec = dict(molecule.meta.get("outputs") or {})
-
-        def run_molecule(ctx: RunContext, **inputs: Any) -> dict[str, Any]:
-            holder: dict[str, Any] = {}
-            case_result = self.run_case(molecule, variables=dict(inputs), parent=ctx, out=holder)
-            if case_result.status == FAILED:
-                raise StepFailure(
-                    f"组合原子 {name} 失败: {case_result.name}",
-                    detail={"case_id": case_result.case_id, "steps": len(case_result.steps)},
-                )
-            if case_result.status == ERROR:
-                raise StepError(f"组合原子 {name} 执行异常: {case_result.name}")
-            return _collect_molecule_outputs(outputs_spec, case_result, ctx, holder.get("ctx"))
-
-        item = Atom(
+        item = composite_atom(
             name=name,
-            fn=run_molecule,
+            molecule=molecule,
             description=molecule.description or f"分子原子：{molecule.name}",
-            inputs=dict.fromkeys(molecule.meta.get("inputs") or {}, "any"),
-            outputs=dict.fromkeys(outputs_spec, "any"),
-            required=tuple(molecule.meta.get("required_inputs") or ()),
+            inputs=molecule.meta.get("inputs") or {},
+            outputs=molecule.meta.get("outputs") or {},
+            output_types=molecule.meta.get("output_types") or {},
+            required_inputs=tuple(molecule.meta.get("required_inputs") or ()),
             tags=tuple({"molecule", *molecule.tags}),
-            category="molecule",
-            source="molecule",
+            category=str(molecule.meta.get("category") or "molecule"),
+            domain=str(molecule.meta.get("domain") or "generic"),
+            pack=str(molecule.meta.get("pack") or ""),
+            effects=tuple(molecule.meta.get("effects") or ()),
+            capabilities=tuple(molecule.meta.get("capabilities") or ()),
+            secret_outputs=tuple(molecule.meta.get("secret_outputs") or ()),
+            version=str(molecule.meta.get("version") or "0.1.0"),
+            runner=self,
         )
+        item.source = "molecule"
         molecule.owner = molecule.owner or self
+        # 组合原子默认用中立语义；内部失败的性质会通过 AtomFailure 透传出来
         self.registry.register(item, replace=True)
         return item
-
-
-def _collect_molecule_outputs(
-    outputs_spec: dict[str, Any],
-    case_result: CaseResult,
-    parent_ctx: RunContext,
-    child_ctx: RunContext | None = None,
-) -> dict[str, Any]:
-    """分子对外输出：按 ``outputs`` 映射从子用例上下文里取值（优先用未打码的真实上下文）。"""
-    if not outputs_spec:
-        return {"case_id": case_result.case_id, "status": case_result.status}
-    if child_ctx is not None:
-        scope = child_ctx
-    else:  # 兜底：退化到变量快照（可能已被打码）
-        snapshot = case_result.variables or {}
-        scope = parent_ctx.isolated(**(snapshot.get("vars") or {}))
-        scope.env = {**parent_ctx.env, **(snapshot.get("env") or {})}
-    resolved: dict[str, Any] = {"status": case_result.status}
-    for name, expr in outputs_spec.items():
-        if isinstance(expr, str) and expr.startswith("${"):
-            try:
-                resolved[name] = scope.resolve(expr)
-            except PanguError:
-                resolved[name] = None
-        else:
-            resolved[name] = expr
-    return resolved
 
 
 def _case_status(steps: Iterable[StepResult]) -> str:
@@ -590,60 +620,37 @@ def _case_status(steps: Iterable[StepResult]) -> str:
 
 
 def classify_exception(exc: BaseException) -> str:
-    """失败分类：决定「能不能重试」「要不要重新认证」。"""
-    if isinstance(exc, RequestTimeout):
-        return "timeout"
-    if isinstance(exc, StepFailure):
-        actual = getattr(exc, "actual", None)
-        if isinstance(actual, int):
-            return classify_status(actual)
-        return "assertion"
-    if isinstance(exc, PlanError):
-        return "plan"
-    if isinstance(exc, StepError):
-        return "step_error"
-    if isinstance(exc, PanguError):
-        return exc.kind
-    if isinstance(exc, (TimeoutError,)):
-        return "timeout"
-    if isinstance(exc, (ConnectionError, OSError)):
-        return "network"
-    return "atom_error"
+    """中立失败标签（不含任何领域知识）。
+
+    领域标签请走 ``Executor.classify()`` / 领域包语义；
+    这里只回答「这是超时/网络/断言/计划/内部异常」这类跨领域的问题。
+    """
+    return neutral_failure_kind(exc)
 
 
-def classify_status(status_code: int) -> str:
-    if status_code in (401, 403):
-        return "auth"
-    if status_code == 404:
-        return "not_found"
-    if status_code == 409:
-        return "conflict"
-    if status_code == 429:
-        return "rate_limit"
-    if status_code >= 500:
-        return "server_error"
-    if status_code >= 400:
-        return "client_error"
-    return "ok"
+def classify_failure_class(exc: BaseException) -> FailureClass:
+    """中立失败类别（跨领域通用）。"""
+    return neutral_failure_class(exc)
 
 
-def _soft_failure_kind(outputs: dict[str, Any]) -> str | None:
-    """5xx 这类「成功返回但结果不可接受」的软失败。"""
-    status = outputs.get("status_code") if isinstance(outputs, dict) else None
-    if isinstance(status, int) and not isinstance(status, bool):
-        kind = classify_status(status)
-        if kind in {"server_error", "rate_limit"}:
-            return kind
-    return None
+def _error_dict(
+    exc: BaseException,
+    *,
+    kind: str | None = None,
+    failure_class: FailureClass | None = None,
+) -> dict[str, Any]:
+    """统一错误结构。
 
-
-def _error_dict(exc: BaseException) -> dict[str, Any]:
-    """统一错误结构：``kind`` 是异常类别，``failure_kind`` 是失败分类（401→auth、404→not_found…）。"""
+    - ``kind``：异常自身类别（``assertion`` / ``step_error`` / ``atom_not_found`` …）
+    - ``failure_kind``：**领域标签**（``server_error`` / ``file_not_found`` …）
+    - ``failure_class``：**中立类别**（``transient`` / ``credentials`` …）
+    """
     if isinstance(exc, PanguError):
         data = exc.to_dict()
     else:
         data = {"type": type(exc).__name__, "kind": "atom_error", "message": str(exc)}
-    data["failure_kind"] = classify_exception(exc)
+    data["failure_kind"] = kind or neutral_failure_kind(exc)
+    data["failure_class"] = (failure_class or neutral_failure_class(exc)).value
     return data
 
 

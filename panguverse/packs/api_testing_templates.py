@@ -1,8 +1,11 @@
-"""规则模板：把自然语言意图映射成可执行的测试计划（离线可用的「盘古斧」）。
+"""``api_testing`` 领域包的**意图模板**：自然语言 → API 测试计划（离线规则规划）。
 
 LLM 不可用（或用户不想用 AI）时，闭环不能断——这里是确定性的兜底：
-关键词 → 领域模板 → 参数化用例。模板针对 **REST 业务 API 的通用形状**：
+关键词 → 领域模板 → 参数化用例。模板覆盖 REST 业务 API 的通用形状：
 健康检查、认证链路、业务状态机、CRUD、负向鉴权、抖动自愈。
+
+设计要点：**模板属于领域包**。内核的规则规划器只负责把各包声明的模板收集起来打分，
+因此给文件系统、财务、RPA 等领域加模板时，内核无需改动。
 
 注：模板产出的接口路径默认对齐本项目内置的 mock API；接自己的系统时，
 用 ``--env`` 覆盖变量或直接写场景 YAML（见 docs/api-testing.md）。
@@ -11,22 +14,37 @@ LLM 不可用（或用户不想用 AI）时，闭环不能断——这里是确�
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any
 
+from ..core.contract import RuleTemplate
 
-@dataclass
-class Template:
-    name: str
-    description: str
-    keywords: tuple[str, ...]
-    builder: Callable[[], dict[str, Any]]
-    tags: tuple[str, ...] = ()
-    weight: int = 1
 
-    def score(self, text: str) -> int:
-        lowered = text.lower()
-        return sum(self.weight for keyword in self.keywords if keyword.lower() in lowered)
+def intent_template(
+    name: str,
+    description: str,
+    keywords: tuple[str, ...],
+    builder: Callable[[], dict[str, Any]],
+    tags: tuple[str, ...] = (),
+    weight: int = 1,
+    domain: str = "api",
+    default: bool = False,
+) -> RuleTemplate:
+    """便捷构造（保持模板定义的紧凑写法）。"""
+    return RuleTemplate(
+        name=name,
+        description=description,
+        keywords=tuple(keywords),
+        builder=builder,
+        tags=tuple(tags),
+        weight=weight,
+        domain=domain,
+        pack="api_testing",
+        default=default,
+    )
+
+
+# 兼容旧名字
+Template = RuleTemplate
 
 
 # --------------------------------------------------------------------------- #
@@ -319,44 +337,47 @@ def build_auth_self_heal() -> dict[str, Any]:
     }
 
 
-TEMPLATES: dict[str, Template] = {
-    "health_check": Template(
+API_TEMPLATES: dict[str, RuleTemplate] = {
+    "health_check": intent_template(
         name="health_check",
+        default=True,
         description="服务健康检查",
         keywords=("健康", "health", "探活", "存活", "ping", "alive", "可用性"),
         builder=build_health_check,
         tags=("smoke",),
     ),
-    "login_flow": Template(
+    "login_flow": intent_template(
         name="login_flow",
+        default=True,
         description="登录认证链路",
         keywords=("登录", "login", "认证", "signin", "sign in", "token", "鉴权成功"),
         builder=build_login_flow,
         tags=("auth",),
     ),
-    "order_flow": Template(
+    "order_flow": intent_template(
         name="order_flow",
+        default=True,
         description="订单业务闭环（状态机）",
         keywords=("订单", "下单", "order", "支付", "pay", "交易", "业务闭环", "状态机"),
         builder=build_order_flow,
         tags=("order",),
         weight=2,
     ),
-    "user_crud": Template(
+    "user_crud": intent_template(
         name="user_crud",
         description="用户 CRUD 闭环",
         keywords=("用户", "user", "crud", "增删改查", "注册", "删除"),
         builder=build_user_crud,
         tags=("crud",),
     ),
-    "auth_negative": Template(
+    "auth_negative": intent_template(
         name="auth_negative",
         description="负向鉴权用例",
         keywords=("401", "未授权", "unauthorized", "负向", "异常", "拒绝", "权限"),
         builder=build_auth_negative,
         tags=("negative",),
     ),
-    "auth_self_heal": Template(
+    "auth_self_heal": intent_template(
         name="auth_self_heal",
         description="token 失效自愈",
         keywords=("token 过期", "失效", "重新登录", "会话", "session", "401 自愈"),
@@ -364,7 +385,7 @@ TEMPLATES: dict[str, Template] = {
         tags=("selfheal",),
         weight=2,
     ),
-    "flaky_retry": Template(
+    "flaky_retry": intent_template(
         name="flaky_retry",
         description="服务抖动重试自愈",
         keywords=("重试", "retry", "自愈", "抖动", "flaky", "容错", "5xx", "故障注入"),
@@ -374,7 +395,20 @@ TEMPLATES: dict[str, Template] = {
     ),
 }
 
+#: 意图为空 / 无关键词命中时的默认冒烟组（API 领域）
 DEFAULT_TEMPLATES = ("health_check", "login_flow", "order_flow")
+
+#: 兼容旧名字
+TEMPLATES = API_TEMPLATES
+
+
+def api_intent_templates() -> list[RuleTemplate]:
+    """``api_testing`` 包声明的全部意图模板（被规则规划器统一收集）。"""
+    return list(API_TEMPLATES.values())
+
+
+def default_templates() -> list[str]:
+    return list(DEFAULT_TEMPLATES)
 
 
 def match_templates(intent: str, *, max_cases: int = 3, defaults: tuple[str, ...] = DEFAULT_TEMPLATES) -> tuple[list[str], list[str]]:

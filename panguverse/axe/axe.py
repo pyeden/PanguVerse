@@ -134,15 +134,22 @@ class PanguAxe:
                 allow_llm=kwargs.pop("allow_llm", request.allow_llm),
             )
         plan = self.planner.plan(request)
-        apply_lessons_to_plan(plan, self.lessons)
+        apply_lessons_to_plan(plan, self.lessons, self.registry)
         self.last_plan = plan
         return plan
 
     def validate(self, plan: TestPlan) -> list[str]:
-        problems = plan.validate(self.registry)
-        if problems:
-            raise PlanError("计划校验失败：\n- " + "\n- ".join(problems))
-        return problems
+        """执行前校验：error 级问题直接拒绝执行，warning 级写入计划备注（可审计）。"""
+        result = plan.check(
+            self.registry,
+            known_variables=set(plan.env),
+            capabilities=self.settings.capabilities,
+        )
+        if result.warnings:
+            plan.warnings.extend(message for message in result.messages(level="warning"))
+        if result.errors:
+            raise PlanError("计划校验失败：\n- " + "\n- ".join(result.messages(level="error")))
+        return result.messages(level="error")
 
     # ------------------------------------------------------------------ #
     # 执行
@@ -175,7 +182,7 @@ class PanguAxe:
         seal: bool = True,
         regression: bool = False,
         run_id: str | None = None,
-        title: str = "PanguVerse API 自动化测试报告",
+        title: str = "PanguVerse 自动化报告",
         env: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> LoopResult:
@@ -340,31 +347,36 @@ class PanguAxe:
 # --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #
-def apply_lessons_to_plan(plan: TestPlan, lessons: LessonStore) -> list[str]:
+def apply_lessons_to_plan(
+    plan: TestPlan, lessons: LessonStore, registry: AtomRegistry | None = None
+) -> list[str]:
     """把历史经验回灌到计划里：没写 retry 的步骤，按经验补上已验证的重试策略。
 
-    经验按 **原子 + 接口标识** 精确匹配（见 :func:`~panguverse.axe.memory.request_target`），
-    避免把一个接口的经验套到另一个接口上。
+    两条精确性保证：
+
+    - 经验按 **原子 + 作用对象标识** 匹配（HTTP 是接口路径、文件是路径、SQL 是表名…），
+      避免把 A 对象的毛病补到 B 对象上；
+    - 检索用**中立类别**（``transient``）而不是某个领域的标签，
+      因此同一套进化机制对任何行业都成立。
     """
+    from ..core.molecule import RetryPolicy
+    from ..core.registry import default_registry
+
+    reg = registry or default_registry()
     applied: list[str] = []
     for case in plan.cases:
         for step in case.steps:
             if step.retry is not None:
                 continue
-            target = step_target(step)
-            lesson = None
-            for kind in ("server_error", "rate_limit", "timeout", "network"):
-                lesson = lessons.recall(kind=kind, atom=step.use, target=target)
-                if lesson and lesson.fix.get("retry"):
-                    break
-                lesson = None
-            if not lesson:
+            semantics = reg.semantics_for(step.use) if reg.has(step.use) else None
+            target = step_target(step, semantics)
+            lesson = lessons.recall(failure_class="transient", atom=step.use, target=target)
+            if not lesson or not lesson.fix.get("retry"):
                 continue
-            from ..core.molecule import RetryPolicy
-
             step.retry = RetryPolicy.from_spec(lesson.fix["retry"])
             applied.append(
-                f"[{case.case_id}.{step.id}] 依据历史经验（{lesson.kind} @ {target or '通用'}）自动补上重试策略"
+                f"[{case.case_id}.{step.id}] 依据历史经验"
+                f"（{lesson.kind or lesson.failure_class} @ {target or '通用'}）自动补上重试策略"
             )
     if applied:
         plan.notes.extend(applied)

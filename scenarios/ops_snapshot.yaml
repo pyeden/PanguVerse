@@ -1,0 +1,107 @@
+name: 运维/数据快照
+description: 跨领域组合演示：调用接口拿数据 → 落盘成快照 → 回读校验 → 归档（文件系统原子 + API 原子 + 通用断言原子）
+tags: [ops, cross-domain]
+
+env:
+  BASE_URL: http://127.0.0.1:8899
+  # 文件系统领域包的沙箱根：默认只允许在该目录内读写，越界直接拒绝
+  FS_ROOT: .panguverse/fs-demo
+  API_USERNAME: demo
+  API_PASSWORD: demo123
+
+defaults:
+  headers:
+    Content-Type: application/json
+
+cases:
+  - id: order_snapshot
+    name: 订单快照：接口取数 → 落盘 → 回读 → 归档
+    tags: [ops, cross-domain, snapshot]
+    secrets: [token]
+    steps:
+      # ---- API 领域原子 ----
+      - id: login
+        use: http_request
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${env.API_PASSWORD}
+        capture:
+          token: body.token
+        assert:
+          status: 200
+
+      - id: create_order
+        use: http_request
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/orders
+          headers:
+            Authorization: Bearer ${token}
+          json:
+            sku: SNAPSHOT-1
+            quantity: 1
+            unit_price: 12.5
+        capture:
+          order_id: body.data.id
+          order_body: body.data
+        assert:
+          status: 201
+
+      # ---- 文件系统领域原子（注意它的语法糖是 expect:，不是 assert:）----
+      - id: write_snapshot
+        use: fs_write_json
+        with:
+          path: snapshots/${order_id}.json
+          data: ${order_body}
+        expect:
+          exists: true
+
+      - id: read_back
+        use: fs_read_json
+        with:
+          path: snapshots/${order_id}.json
+
+      # ---- 通用断言原子：不关心数据来自 HTTP 还是文件 ----
+      - id: assert_snapshot_id
+        use: assert_json
+        with:
+          path: id
+          equals: ${order_id}
+          source: ${read_back.data}
+
+      - id: assert_snapshot_status
+        use: assert_json
+        with:
+          path: status
+          equals: CREATED
+          source: ${read_back.data}
+
+      - id: list_snapshots
+        use: fs_list
+        with:
+          path: snapshots
+          pattern: "*.json"
+
+      - id: assert_snapshot_count
+        use: assert_json
+        with:
+          path: count
+          gte: 1
+          source: ${list_snapshots}
+
+      - id: archive_snapshot
+        use: fs_copy
+        with:
+          source: snapshots/${order_id}.json
+          target: archive/${order_id}.json
+        expect:
+          exists: true
+
+      - id: summary
+        use: log
+        with:
+          message: 快照完成：订单 ${order_id} 已落盘并归档（沙箱根 ${env.FS_ROOT}）

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -73,27 +74,26 @@ class TestPlan:
             planner=self.planner,
         )
 
-    def validate(self, registry: AtomRegistry) -> list[str]:
-        """校验计划：未知原子 / 缺少必填输入 —— 在执行前就把问题暴露出来。"""
-        problems: list[str] = []
-        if not self.cases:
-            problems.append("计划中没有任何用例")
-        seen_ids: set[str] = set()
-        for case in self.cases:
-            if case.case_id in seen_ids:
-                problems.append(f"用例 id 重复: {case.case_id}")
-            seen_ids.add(case.case_id)
-            for step in case.steps:
-                if not registry.has(step.use):
-                    problems.append(f"[{case.case_id}.{step.id}] 未知原子: {step.use}")
-                    continue
-                atom = registry.get(step.use)
-                missing = [name for name in atom.required if name not in step.with_]
-                if missing:
-                    problems.append(
-                        f"[{case.case_id}.{step.id}] 原子 {atom.name} 缺少输入: {', '.join(missing)}"
-                    )
-        return problems
+    def validate(self, registry: AtomRegistry, *, known_variables: Iterable[str] = ()) -> list[str]:
+        """执行前校验：返回 **error 级**问题清单（保持「字符串列表」的对外契约）。
+
+        真正的检查实现在 :mod:`panguverse.core.validation`（领域中立，可被 CLI/CI 单独使用）。
+        """
+        return self.check(registry, known_variables=known_variables).messages(level="error")
+
+    def check(
+        self,
+        registry: AtomRegistry,
+        *,
+        known_variables: Iterable[str] = (),
+        capabilities: Iterable[str] | None = None,
+    ) -> Any:
+        """完整校验（含 warning）：返回 :class:`~panguverse.core.validation.CheckResult`。"""
+        from ..core.validation import check_plan
+
+        return check_plan(
+            self, registry, known_variables=known_variables, capabilities=capabilities
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

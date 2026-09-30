@@ -22,10 +22,9 @@ from typing import Any
 from ..core.errors import PlanError
 from ..core.molecule import Molecule
 from ..core.registry import AtomRegistry
-from . import templates as tpl
 from .plan import PlanRequest, TestPlan
 
-SYSTEM_PROMPT = """你是 PanguVerse 的「盘古斧」规划器，负责把 API 测试意图拆解成原子步骤序列。
+SYSTEM_PROMPT = """你是 PanguVerse 的「盘古斧」规划器，负责把自动化意图拆解成原子步骤序列。
 你只能使用清单里给出的原子（atom），不允许发明新原子。
 输出必须是 JSON 对象，结构如下：
 {
@@ -42,20 +41,33 @@ SYSTEM_PROMPT = """你是 PanguVerse 的「盘古斧」规划器，负责把 API
           "use": "原子名",
           "name": "步骤说明",
           "with": { "参数名": "值（可含 ${env.XXX} 或 ${step_id.输出字段} 模板）" },
-          "capture": { "变量名": "步骤输出里的路径，如 body.data.id" },
+          "capture": { "变量名": "步骤输出里的路径" },
           "when": "可选的模板条件",
           "foreach": "可选的模板，解析为列表",
-          "retry": { "attempts": 3, "delay_ms": 100, "on": ["server_error","timeout","network"] }
+          "retry": { "attempts": 3, "delay_ms": 100, "on": ["transient","timeout","network"] }
         }
       ]
     }
   ]
 }
-约束：
-1. 首个用例如果需要认证，必须先有登录步骤（tags 含 "auth"），并 capture token；
-2. 后续请求用 headers.Authorization = "Bearer ${token}"；
-3. 每个会产生断言语义的请求，都要紧跟 assert_* 原子；状态码断言优选用 expect_status 参数；
-4. 只输出 JSON，不要任何解释文字。"""
+通用约束：
+1. 只使用清单里存在的原子与它们的输入名；
+2. 会产生断言语义的步骤，紧跟对应的断言原子；
+3. 只输出 JSON，不要任何解释文字。
+各领域的写法约束见下（来自对应的领域包）："""
+
+
+def _domain_hints(registry: AtomRegistry) -> list[str]:
+    """收集各领域包提供的规划提示片段（内核不硬编码任何领域惯例）。"""
+    hints: list[str] = []
+    for pack in registry.packs():
+        semantics = getattr(pack, "semantics", None)
+        provider = getattr(semantics, "planning_hints", None)
+        if not callable(provider):
+            continue
+        for hint in provider():
+            hints.append(f"[{pack.name}] {hint}")
+    return hints
 
 
 class SpecPlanner:
@@ -85,14 +97,56 @@ class RuleBasedPlanner:
 
     name = "rules"
 
-    def __init__(self, registry: AtomRegistry, *, max_cases: int = 3) -> None:
+    def __init__(
+        self,
+        registry: AtomRegistry,
+        *,
+        max_cases: int = 3,
+        templates: list[Any] | None = None,
+    ) -> None:
         self.registry = registry
         self.max_cases = max_cases
+        self._templates = templates
+
+    # ------------------------------------------------------------------ #
+    def templates(self) -> list[Any]:
+        """收集所有领域包声明的意图模板（内核不内置任何领域模板）。"""
+        if self._templates is not None:
+            return list(self._templates)
+        collected: list[Any] = []
+        for pack in self.registry.packs():
+            collected.extend(getattr(pack, "intent_templates", None) or [])
+        if not collected:
+            from ..packs.api_testing_templates import api_intent_templates
+
+            collected = api_intent_templates()
+        return collected
 
     def plan(self, request: PlanRequest) -> TestPlan:
         intent = request.intent or ""
-        selected, notes = tpl.match_templates(intent, max_cases=self.max_cases)
-        specs = tpl.build_cases(selected)
+        templates = self.templates()
+        notes: list[str] = []
+        scored = [(template.score(intent), template) for template in templates]
+        hits = [(score, template) for score, template in scored if score > 0]
+        if not intent:
+            notes.append("意图为空 → 使用领域包提供的默认模板组")
+            chosen = self._defaults(templates)
+        elif not hits:
+            notes.append("没有命中任何关键词 → 使用默认模板组；可改用场景 YAML 精确描述")
+            chosen = self._defaults(templates)
+        else:
+            hits.sort(key=lambda item: (-item[0], item[1].name))
+            chosen = [template for _score, template in hits[: self.max_cases]]
+            notes.append(
+                "命中模板: " + ", ".join(f"{t.name}({t.pack or t.domain})" for t in chosen)
+            )
+            if len(hits) > len(chosen):
+                remaining = ", ".join(t.name for _s, t in hits[len(chosen) :])
+                notes.append(f"其余候选未纳入（max_cases={self.max_cases}）: {remaining}")
+
+        from ..spec.loader import expand_case_spec
+
+        specs = [expand_case_spec(template.build(), registry=self.registry) for template in chosen]
         cases = [Molecule.from_spec(spec, source="rules") for spec in specs]
         warnings = []
         if not cases:
@@ -109,9 +163,18 @@ class RuleBasedPlanner:
                 *request.extra_notes,
             ],
             warnings=warnings,
-            meta={"templates": selected, "llm_used": False},
+            meta={
+                "templates": [template.name for template in chosen],
+                "template_packs": sorted({template.pack or template.domain for template in chosen}),
+                "llm_used": False,
+            },
         )
         return plan.filtered(tags=request.tags, case_ids=request.case_ids)
+
+    def _defaults(self, templates: list[Any]) -> list[Any]:
+        marked = [template for template in templates if getattr(template, "default", False)]
+        pool = marked or templates
+        return pool[: self.max_cases]
 
 
 class LLMPlanner:
@@ -175,12 +238,15 @@ class LLMPlanner:
 
     def _build_prompt(self, request: PlanRequest, *, repair: list[str] | None = None) -> str:
         catalog = json.dumps(self.registry.catalog(), ensure_ascii=False, indent=1)
-        env_keys = ", ".join(sorted(request.env)) or "BASE_URL"
+        env_keys = ", ".join(sorted(request.env)) or "（未提供；模板里可用 ${env.NAME} 引用）"
+        hints = _domain_hints(self.registry)
         parts = [
-            f"测试意图：{request.intent or '（未提供，按冒烟主线设计）'}",
+            f"自动化意图：{request.intent or '（未提供，按冒烟主线设计）'}",
             "环境变量（可在模板里引用 ${env.NAME}）：" + env_keys,
-            f"可用原子清单（JSON）：\n{catalog}",
+            "可用原子清单（JSON）：\n" + catalog,
         ]
+        if hints:
+            parts.append("领域写法约束：\n" + "\n".join(f"- {hint}" for hint in hints))
         if request.suite is not None:
             parts.append(f"已有场景参考：{getattr(request.suite, 'name', '')}")
         if repair:

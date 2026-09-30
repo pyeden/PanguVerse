@@ -39,10 +39,15 @@ def lookup(source: Any, path: str | None, *, in_: str | None = "body") -> Any:
     parts = split_path(str(path))
     target = source
     if in_ and in_ != "response" and (not parts or parts[0] not in _KNOWN_ROOTS):
-        if isinstance(source, dict) and in_ in source:
-            target = source.get(in_)
-        elif in_ == "body":
-            target = source if not isinstance(source, dict) else source.get("body")
+        if isinstance(source, dict):
+            if in_ in source:
+                target = source[in_]
+            elif not is_http_envelope(source):
+                target = source  # 普通对象：直接按路径寻址
+            else:
+                target = source.get(in_)
+        else:
+            target = source
     value = walk_path(target, parts)
     if value is MISSING:
         raise KeyError(path)
@@ -50,6 +55,15 @@ def lookup(source: Any, path: str | None, *, in_: str | None = "body") -> Any:
 
 
 _KNOWN_ROOTS = {"body", "headers", "status_code", "text", "elapsed_ms", "request", "ok", "reason"}
+
+
+def is_http_envelope(value: Any) -> bool:
+    """这个对象是不是 HTTP 响应信封（``http_request`` 的输出）？
+
+    只有真正的响应对象才按 ``body`` / ``headers`` 分层寻址；
+    普通对象（文件里读到的 JSON、前一步组装的数据）应当直接按路径取值。
+    """
+    return isinstance(value, dict) and "status_code" in value and "headers" in value
 
 
 @atom(

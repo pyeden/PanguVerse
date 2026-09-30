@@ -57,6 +57,9 @@ class StepResult:
     outputs: dict[str, Any] = field(default_factory=dict)
     error: dict[str, Any] | None = None
     message: str = ""
+    #: 领域包声明的「作用对象标识」：HTTP 是接口路径、文件系统是文件路径、SQL 是表名…
+    #: 经验库靠它把教训精确绑定到对象上
+    target: str = ""
     http: list[dict[str, Any]] = field(default_factory=list)
     heal: list[HealEvent] = field(default_factory=list)
     skipped_reason: str = ""
@@ -81,6 +84,8 @@ class StepResult:
             data["error"] = self.error
         if self.message:
             data["message"] = self.message
+        if self.target:
+            data["target"] = self.target
         if self.http:
             data["http"] = self.http
         if self.heal:

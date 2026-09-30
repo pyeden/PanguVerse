@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -211,6 +211,7 @@ class Lesson:
     kind: str
     atom: str = ""
     target: str = ""
+    failure_class: str = ""
     case_id: str = ""
     step_id: str = ""
     message: str = ""
@@ -225,6 +226,7 @@ class Lesson:
             "kind": self.kind,
             "atom": self.atom,
             "target": self.target,
+            "failure_class": self.failure_class,
             "case_id": self.case_id,
             "step_id": self.step_id,
             "message": self.message,
@@ -241,6 +243,7 @@ class Lesson:
             kind=str(data.get("kind", "")),
             atom=str(data.get("atom", "")),
             target=str(data.get("target", "")),
+            failure_class=str(data.get("failure_class", "")),
             case_id=str(data.get("case_id", "")),
             step_id=str(data.get("step_id", "")),
             message=str(data.get("message", "")),
@@ -252,7 +255,8 @@ class Lesson:
 
     def describe(self) -> str:
         where = f"{self.atom}@{self.target}" if self.target else (self.atom or self.case_id)
-        text = f"[{self.kind}] {where}: {self.message}"
+        label = self.kind or self.failure_class or "unknown"
+        text = f"[{label}] {where}: {self.message}"
         if self.suggestion:
             text += f" → 建议: {self.suggestion}"
         return text
@@ -285,6 +289,7 @@ class LessonStore:
         kind: str,
         atom: str = "",
         target: str = "",
+        failure_class: str = "",
         case_id: str = "",
         step_id: str = "",
         message: str = "",
@@ -297,6 +302,7 @@ class LessonStore:
             kind=kind,
             atom=atom,
             target=target,
+            failure_class=failure_class,
             case_id=case_id,
             step_id=step_id,
             message=message,
@@ -309,25 +315,35 @@ class LessonStore:
             handle.write(json.dumps(lesson.to_dict(), ensure_ascii=False) + "\n")
         return lesson
 
-    def recall(self, *, kind: str, atom: str = "", target: str | None = None) -> Lesson | None:
-        """按「原子 + 接口 + 失败类型」回忆最近一次学到的东西。
+    def recall(
+        self,
+        *,
+        kind: str | None = None,
+        failure_class: str | None = None,
+        atom: str = "",
+        target: str | None = None,
+    ) -> Lesson | None:
+        """按「原子 + 作用对象 + 失败类型/类别」回忆最近一次学到的东西。
 
-        ``target`` 指定时**必须精确命中接口**——否则会把 A 接口的经验套到 B 接口上；
-        传 ``None`` 表示「未指定接口」，允许退回同原子的任意经验。
+        - ``target`` 指定时**必须精确命中作用对象**（HTTP 接口 / 文件路径 / 表名…），
+          否则会把 A 对象的经验套到 B 对象上；传 ``None`` 表示未指定，允许退回同原子经验；
+        - ``kind`` 是领域标签，``failure_class`` 是中立类别；用中立类别检索能让经验跨领域复用
+          （``transient`` 在任何行业都成立）。
         """
         lessons = self.all()
-        if not atom:
-            generic = [lesson for lesson in lessons if lesson.kind == kind]
-            return generic[-1] if generic else None
-        key = signature_of(atom=atom, kind=kind, target=target or "")
-        exact = [lesson for lesson in lessons if lesson.signature == key]
-        if exact:
-            return exact[-1]
-        if target is None:
-            same_atom = [lesson for lesson in lessons if lesson.atom == atom and lesson.kind == kind]
-            if same_atom:
-                return same_atom[-1]
-        return None
+
+        def matches(item: Lesson) -> bool:
+            if kind is not None and item.kind != kind:
+                return False
+            if failure_class is not None and item.failure_class != failure_class:
+                return False
+            return not (atom and item.atom != atom)
+
+        candidates = [item for item in lessons if matches(item)]
+        if target is not None:
+            exact = [item for item in candidates if item.target == target]
+            return exact[-1] if exact else None
+        return candidates[-1] if candidates else None
 
     def count(self) -> int:
         return len(self.all())
@@ -335,49 +351,34 @@ class LessonStore:
     def summary(self) -> dict[str, int]:
         counts: dict[str, int] = {}
         for lesson in self.all():
-            counts[lesson.kind] = counts.get(lesson.kind, 0) + 1
+            key = lesson.kind or lesson.failure_class or "unknown"
+            counts[key] = counts.get(key, 0) + 1
         return counts
 
 
 def signature_of(*, atom: str, kind: str, target: str = "") -> str:
-    """经验签名：``原子@接口:失败类型``（接口为空时退化为 ``原子@:失败类型``）。"""
+    """经验签名：``原子@作用对象:失败类型``（对象为空时退化为 ``原子@:失败类型``）。"""
     return f"{atom or '*'}{'@' + target if target else '@'}:{kind}"
 
 
-def request_target(url: Any) -> str:
-    """从请求地址里抽出「接口标识」（路径模板），用于把经验精确绑定到接口。
+def step_target(step: Any, semantics: Any = None) -> str:
+    """取步骤的作用对象标识（由领域包语义决定：URL 路径 / 文件路径 / 表名…）。
 
-    - ``${env.BASE_URL}/api/flaky`` → ``/api/flaky``
-    - ``http://127.0.0.1:8899/api/orders/${id}/pay`` → ``/api/orders/${id}/pay``
-    - 无 url（非 HTTP 步骤）→ ``""``
+    优先用执行期已算好的 ``StepResult.target``；只有拿不到语义时返回空字符串。
     """
-    if not isinstance(url, str) or not url:
+    cached = getattr(step, "target", None)
+    if isinstance(cached, str) and cached:
+        return cached
+    if semantics is None:
         return ""
-    from urllib.parse import urlsplit
-
-    text = url.strip()
-    if text.startswith("${"):
-        closing = text.find("}")
-        if closing >= 0:
-            text = text[closing + 1 :]
-    parsed = urlsplit(text)
-    if not parsed.path and (parsed.scheme or parsed.netloc):
-        return "/"
-    return parsed.path or text
-
-
-def step_target(step: Any) -> str:
-    """从 Step 对象或步骤规格 dict 里取接口标识。"""
     with_block = getattr(step, "with_", None)
     if with_block is None and isinstance(step, dict):
         with_block = step.get("with") or {}
-    if not isinstance(with_block, dict):
+    if with_block is None and isinstance(step, dict):
+        with_block = step
+    if not isinstance(with_block, Mapping):
         return ""
-    return request_target(with_block.get("url"))
-
-
-# 这些失败类型的共同点是「再试一次可能就好了」，因此值得沉淀成重试策略
-_RETRYABLE_KINDS = {"server_error", "rate_limit", "timeout", "network"}
+    return semantics.target(None, with_block)
 
 
 # --------------------------------------------------------------------------- #
@@ -412,34 +413,30 @@ class Evolution:
                     {"name": record.name, "version": record.version, "tags": record.tags}
                 )
 
-        # 步骤 → 接口标识：经验必须绑定到具体接口，避免「A 接口的毛病补到 B 接口上」
-        targets: dict[tuple[str, str], str] = {}
-        for case_id, spec in specs.items():
-            for raw_step in spec.get("steps") or []:
-                step_id = str(raw_step.get("id") or raw_step.get("name") or "")
-                targets[(case_id, step_id)] = step_target(raw_step)
-
         for case in run.cases:
             for step in case.steps:
-                target = targets.get((case.case_id, step.step_id), "")
+                # 作用对象标识由执行期按领域语义算好（HTTP 接口路径 / 文件路径 / 表名…）
+                target = step.target or ""
+                failure_class = (step.error or {}).get("failure_class", "")
                 if step.status not in ("failed", "error"):
                     # 重试后成功的步骤同样是「观察」：把已验证的重试策略沉淀成经验，
                     # 供后续计划自动补强（见 apply_lessons_to_plan）
                     if step.status == "passed" and step.retries > 0:
                         lesson = self.lessons.record(
-                            kind="server_error",
+                            kind=(step.error or {}).get("failure_kind") or "transient",
                             atom=step.atom,
                             target=target,
+                            failure_class="transient",
                             case_id=case.case_id,
                             step_id=step.step_id,
-                            message=f"{step.atom}@{target or '-'} 在服务端 5xx 抖动后重试 {step.retries} 次成功",
-                            suggestion="历史验证过：该接口遇到 5xx 需要退避重试",
+                            message=f"{step.atom}@{target or '-'} 抖动后重试 {step.retries} 次成功",
+                            suggestion="历史验证过：该对象遇到瞬态故障需要退避重试",
                             fix={
                                 "retry": {
                                     "attempts": max(2, step.retries + 1),
                                     "delay_ms": 100,
                                     "backoff": 2.0,
-                                    "on": ["server_error", "timeout", "network"],
+                                    "on": ["transient"],
                                 }
                             },
                             run_id=run.run_id,
@@ -450,22 +447,24 @@ class Evolution:
                 suggestion = ""
                 for event in step.heal:
                     suggestion = event.suggestion or suggestion
-                # 瞬态故障的失败先给出「可验证的修复假设」，下次规划自动套用（进化闭环）
+                # 瞬态故障的失败先给出「可验证的修复假设」，下次规划自动套用（进化闭环）。
+                # 判据用**中立类别**（transient），因此对 HTTP、文件、数据库等任何领域都成立。
                 fix: dict[str, Any] = {}
-                if kind in _RETRYABLE_KINDS:
+                if failure_class == "transient":
                     fix = {
                         "retry": {
                             "attempts": 3,
                             "delay_ms": 200,
                             "backoff": 2.0,
-                            "on": [kind],
+                            "on": ["transient"],
                         }
                     }
-                    suggestion = suggestion or "瞬态故障：建议对该接口启用重试（已沉淀为待验证策略）"
+                    suggestion = suggestion or "瞬态故障：建议对该对象启用重试（已沉淀为待验证策略）"
                 lesson = self.lessons.record(
                     kind=kind,
                     atom=step.atom,
                     target=target,
+                    failure_class=failure_class,
                     case_id=case.case_id,
                     step_id=step.step_id,
                     message=step.message or (step.error or {}).get("message", ""),

@@ -15,17 +15,26 @@ from .errors import PlanError
 
 @dataclass
 class RetryPolicy:
-    """步骤级重试策略（自愈的第一层：确定性重试）。"""
+    """步骤级重试策略（自愈的第一层：确定性重试）。
+
+    ``on`` 里可以写**中立失败类别**（``transient`` / ``credentials`` …，跨领域通用）
+    或**领域标签**（``server_error`` / ``file_locked`` …，由领域包定义）。
+    判定时两者都会匹配，因此领域包换标签不会影响已有计划。
+    """
 
     attempts: int = 1
     delay_ms: int = 0
     backoff: float = 1.0
-    on: tuple[str, ...] = ("network", "timeout", "server_error")
+    on: tuple[str, ...] = ("transient", "timeout", "network")
 
-    def should_retry(self, kind: str) -> bool:
+    def should_retry(self, kind: str, failure_class: str | None = None) -> bool:
         if self.attempts <= 1:
             return False
-        return "any" in self.on or kind in self.on
+        if "any" in self.on:
+            return True
+        if kind in self.on:
+            return True
+        return bool(failure_class) and failure_class in self.on
 
     def delay_for(self, attempt: int) -> float:
         if self.delay_ms <= 0:
@@ -53,7 +62,7 @@ class RetryPolicy:
                 attempts=int(spec.get("attempts", spec.get("times", 3))),
                 delay_ms=int(spec.get("delay_ms", spec.get("delay", 200))),
                 backoff=float(spec.get("backoff", 2.0)),
-                on=tuple(spec.get("on", ("network", "timeout", "server_error"))),
+                on=tuple(spec.get("on", ("transient", "timeout", "network"))),
             )
         raise PlanError(f"非法的 retry 配置: {spec!r}")
 

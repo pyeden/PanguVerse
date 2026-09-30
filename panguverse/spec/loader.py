@@ -56,15 +56,25 @@ class TestSuite:
     path: str | None = None
 
     # ------------------------------------------------------------------ #
-    def case_specs(self) -> list[dict[str, Any]]:
-        """产出可直接交给 ``Molecule.from_spec`` 的用例规格（已套用默认值与断言糖）。"""
+    def case_specs(self, registry: Any = None) -> list[dict[str, Any]]:
+        """产出可直接交给 ``Molecule.from_spec`` 的用例规格。
+
+        默认值填充与语法糖展开都**委托给原子所属的领域包**：
+        HTTP 原子认 ``assert:``，文件系统原子认 ``expect:``，
+        第三方包可以定义自己的写法——加载器本身不知道任何领域。
+        """
+        from ..core.registry import default_registry
+
+        reg = registry if registry is not None else default_registry()
         specs: list[dict[str, Any]] = []
         for index, raw in enumerate(self.cases):
             if not isinstance(raw, dict):
                 raise SpecError(f"用例 #{index + 1} 必须是映射，实际 {type(raw).__name__}")
             spec = dict(raw)
             spec.setdefault("id", spec.get("name") or f"case_{index + 1}")
-            spec["steps"] = self._build_steps(spec.get("steps") or [], case_id=str(spec["id"]))
+            spec["steps"] = self._build_steps(
+                spec.get("steps") or [], case_id=str(spec["id"]), registry=reg
+            )
             specs.append(spec)
         return specs
 
@@ -94,14 +104,51 @@ class TestSuite:
         return [str(case.get("id") or case.get("name")) for case in self.cases]
 
     # ------------------------------------------------------------------ #
-    def _build_steps(self, raw_steps: list[Any], *, case_id: str) -> list[dict[str, Any]]:
+    def _build_steps(
+        self, raw_steps: list[Any], *, case_id: str, registry: Any = None
+    ) -> list[dict[str, Any]]:
+        from ..core.contract import NEUTRAL_SEMANTICS
+        from ..core.registry import default_registry
+
+        reg = registry if registry is not None else default_registry()
         steps: list[dict[str, Any]] = []
         for index, raw in enumerate(raw_steps):
             if not isinstance(raw, dict):
                 raise SpecError(f"[{case_id}] 第 {index + 1} 个步骤必须是映射")
-            step = _apply_defaults(raw, self.defaults)
+            step = dict(raw)
+            use = step.get("use") or step.get("atom")
+            atom = reg.get(use) if (use and reg.has(use)) else None
+            semantics = reg.semantics_for(use) if atom is not None else NEUTRAL_SEMANTICS
+
+            # 1) 领域包声明的套件级默认值（例如 API 的 headers、文件系统的 encoding）
+            extras = semantics.step_defaults(step, defaults=self.defaults) or {}
+            with_block = dict(step.get("with") or {})
+            for key, value in extras.items():
+                if key not in with_block:
+                    with_block[key] = value
+                elif isinstance(value, dict) and isinstance(with_block[key], dict):
+                    with_block[key] = {**value, **with_block[key]}  # 步骤自己的写法优先
+            if with_block:
+                step["with"] = with_block
+            # 2) 重试默认值（领域中立的步骤级属性）
+            if "retry" not in step and self.defaults.get("retry"):
+                step["retry"] = self.defaults["retry"]
+
             steps.append(step)
-            steps.extend(_expand_asserts(step))
+            # 3) 领域专属语法糖：assert:（API）/ expect:（文件系统）/ 第三方自定义
+            present = [key for key in semantics.sugar_keys() if key in step]
+            if present:
+                step_id = str(step.get("id") or step.get("name") or f"step_{index + 1}")
+                produced: list[dict[str, Any]] = []
+                for _key in present:
+                    produced.extend(semantics.sugar(step_id, step, atom=atom))
+                if not produced:
+                    allowed = sorted(getattr(semantics, "assert_keys", lambda: set)())
+                    raise SpecError(
+                        f"步骤 {step_id} 的 {present[0]} 块没有可展开的断言"
+                        f"（原子 {use} 的领域可用字段: {allowed}）"
+                    )
+                steps.extend(produced)
         return steps
 
 
@@ -130,6 +177,21 @@ def load_suite_text(
     if not isinstance(data, dict):
         raise SpecError(f"场景根节点必须是映射，实际 {type(data).__name__}")
     return load_suite_dict(data, path=path)
+
+
+def expand_case_spec(
+    spec: dict[str, Any],
+    *,
+    registry: Any = None,
+    defaults: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """对**单条**用例规格套用领域默认值与领域语法糖。
+
+    规划器（例如领域包提供的意图模板）与场景文件走的是同一套展开逻辑，
+    因此模板里也能直接写 ``assert:`` / ``expect:``，不会出现「模板里的糖没生效」这种隐蔽问题。
+    """
+    suite = TestSuite(name="<inline>", cases=[dict(spec)], defaults=dict(defaults or {}))
+    return suite.case_specs(registry)[0]
 
 
 def load_suite_dict(data: dict[str, Any], *, path: str | None = None) -> TestSuite:
@@ -183,91 +245,3 @@ def _validate_suite(suite: TestSuite) -> None:
             raise SpecError(f"用例 {case_id} 存在重复步骤 id: {sorted(dupes)}")
     # 断言糖展开也在加载阶段完成，让配置错误尽早暴露（fail fast）
     suite.case_specs()
-
-
-# --------------------------------------------------------------------------- #
-# 默认值与断言糖
-# --------------------------------------------------------------------------- #
-def _apply_defaults(step: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
-    step = dict(step)
-    use = step.get("use") or step.get("atom")
-    with_block = dict(step.get("with") or {})
-    if use == "http_request":
-        headers = dict(defaults.get("headers") or {})
-        headers.update(with_block.get("headers") or {})
-        if headers:
-            with_block["headers"] = headers
-        if "timeout" not in with_block and defaults.get("timeout") is not None:
-            with_block["timeout"] = defaults["timeout"]
-        if "retry" not in step and defaults.get("retry"):
-            step["retry"] = defaults["retry"]
-    step["with"] = with_block
-    return step
-
-
-_ASSERT_KEYS = {"status", "json", "schema", "latency_max_ms", "header", "body_contains", "message"}
-
-
-def _expand_asserts(step: dict[str, Any]) -> list[dict[str, Any]]:
-    """展开 ``assert:`` 糖为 assert_* 原子步骤。"""
-    block = step.get("assert")
-    if block is None:
-        return []
-    if not isinstance(block, dict):
-        raise SpecError(f"步骤 {step.get('id')} 的 assert 必须是映射（或列表）")
-    unknown = set(block) - _ASSERT_KEYS
-    if unknown:
-        raise SpecError(
-            f"步骤 {step.get('id')} 的 assert 含未知字段: {sorted(unknown)}；"
-            f"可用: {sorted(_ASSERT_KEYS)}"
-        )
-    step_id = str(step.get("id") or "step")
-    source = f"${{{step_id}}}"
-    expanded: list[dict[str, Any]] = []
-
-    def add(suffix: str, atom: str, with_block: dict[str, Any], name: str) -> None:
-        expanded.append(
-            {
-                "id": f"{step_id}__{suffix}",
-                "use": atom,
-                "name": name,
-                "with": {"source": source, **with_block},
-                "tags": ["assert"],
-            }
-        )
-
-    if "status" in block:
-        with_block = {"expected": block["status"]}
-        if block.get("message"):
-            with_block["message"] = block["message"]
-        add("assert_status", "assert_status", with_block, f"{step_id} 状态码断言")
-    json_checks = block.get("json")
-    if json_checks:
-        if isinstance(json_checks, dict):
-            json_checks = [json_checks]
-        for index, check in enumerate(json_checks):
-            if not isinstance(check, dict):
-                raise SpecError(f"步骤 {step_id} 的 assert.json 第 {index + 1} 项必须是映射")
-            suffix = "assert_json" if len(json_checks) == 1 else f"assert_json_{index + 1}"
-            add(suffix, "assert_json", dict(check), f"{step_id} 字段断言 {check.get('path', '<root>')}")
-    if "schema" in block:
-        add("assert_schema", "assert_schema", {"schema": block["schema"]}, f"{step_id} 结构断言")
-    if "latency_max_ms" in block:
-        add("assert_latency", "assert_latency", {"max_ms": block["latency_max_ms"]}, f"{step_id} 耗时断言")
-    if "header" in block:
-        header = block["header"]
-        if isinstance(header, str):
-            header = {"name": header}
-        if not isinstance(header, dict) or "name" not in header:
-            raise SpecError(f"步骤 {step_id} 的 assert.header 需要 name 字段，或写成 {{name: ..., contains: ...}}")
-        add("assert_header", "assert_header", dict(header), f"{step_id} 响应头断言")
-    if "body_contains" in block:
-        add(
-            "assert_body_contains",
-            "assert_body_contains",
-            {"text": block["body_contains"]},
-            f"{step_id} 原文包含断言",
-        )
-    if not expanded:
-        raise SpecError(f"步骤 {step_id} 的 assert 块没有可展开的断言")
-    return expanded

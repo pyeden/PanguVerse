@@ -131,15 +131,16 @@ cases:
 # 2) 仓库自带场景
 # --------------------------------------------------------------------------- #
 def test_shipped_scenarios_pass(tmp_path, env):
+    """仓库自带的全部场景（API 测试 + 跨领域运维快照）都要能直接跑通。"""
     suites = collect_suites(SCENARIOS)
-    assert len(suites) >= 3
+    assert len(suites) >= 4
     suite = merge_suites(suites)
-    assert len(suite.cases) == 6
+    assert len(suite.cases) == 7
 
     axe = PanguAxe(workspace=tmp_path / "ws", enable_llm=False)
-    result = _run(axe, suite, env, out_dir=tmp_path / "out")
+    result = _run(axe, suite, {**env, "FS_ROOT": str(tmp_path / "fs")}, out_dir=tmp_path / "out")
     assert result.summary["failed"] == 0 and result.summary["errored"] == 0
-    assert result.summary["passed"] == 6
+    assert result.summary["passed"] == 7
     assert result.exit_code == 0
 
 
@@ -286,7 +287,7 @@ def test_demo_e2e_command(tmp_path, capsys, monkeypatch):
     assert "闭环完成" in out and "回归复用" in out
     report = json.loads((tmp_path / "out" / "report.json").read_text(encoding="utf-8"))
     assert report["summary"]["success"] is True
-    assert report["summary"]["total"] == 6
+    assert report["summary"]["total"] == 7
     assert (tmp_path / "out" / "regression" / "report.html").exists()
 
 

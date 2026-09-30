@@ -131,8 +131,30 @@ def build_parser() -> argparse.ArgumentParser:
     atoms = sub.add_parser("atoms", help="列出原子库")
     atoms.add_argument("--category", default=None)
     atoms.add_argument("--tag", default=None)
+    atoms.add_argument("--domain", default=None, help="按领域过滤（api / filesystem / core …）")
     atoms.add_argument("--json", action="store_true")
     atoms.set_defaults(handler=_cmd_atoms)
+
+    packs = sub.add_parser("packs", help="领域包管理：列出 / 查看 / 校验 / 导出清单")
+    packs_sub = packs.add_subparsers(dest="packs_command")
+    packs_list = packs_sub.add_parser("list", help="列出已加载的领域包")
+    packs_list.add_argument("--domain", default=None)
+    packs_list.add_argument("--json", action="store_true")
+    packs_list.set_defaults(handler=_cmd_packs_list)
+
+    packs_show = packs_sub.add_parser("show", help="查看某个领域包的清单")
+    packs_show.add_argument("name")
+    packs_show.add_argument("--json", action="store_true")
+    packs_show.set_defaults(handler=_cmd_packs_show)
+
+    packs_validate = packs_sub.add_parser("validate", help="校验内置包，或校验指定的包文件/目录")
+    packs_validate.add_argument("path", nargs="?", default=None, help="*.pack.yaml 文件或目录")
+    packs_validate.add_argument("--strict", action="store_true", help="更严格的检查（版本/描述必填）")
+    packs_validate.set_defaults(handler=_cmd_packs_validate)
+
+    packs_manifest = packs_sub.add_parser("manifest", help="导出平台上所有领域包的清单（可评审/可共享）")
+    packs_manifest.add_argument("--out", default=None, help="输出 JSON 文件路径")
+    packs_manifest.set_defaults(handler=_cmd_packs_manifest)
 
     status = sub.add_parser("status", help="查看工作区、原子库、LLM 与沉淀状态")
     status.add_argument("--json", action="store_true")
@@ -180,6 +202,14 @@ def _add_common(
         parser.add_argument("--fail-fast", action="store_true", help="首个用例失败即停止")
         parser.add_argument("--retry", type=int, default=None, metavar="N", help="全局默认重试次数")
         parser.add_argument("--json", action="store_true", help="额外输出 JSON 摘要")
+        parser.add_argument(
+            "--packs", action="append", default=[], metavar="PATH",
+            help="加载声明式领域包（*.pack.yaml 文件或目录），可重复",
+        )
+        parser.add_argument(
+            "--allow-capabilities", default=None, metavar="LIST",
+            help="授权运行时能力（逗号分隔，如 network,filesystem）；给了就严格校验",
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -256,20 +286,100 @@ def _cmd_regression(args: argparse.Namespace) -> int:
 
 
 def _cmd_atoms(args: argparse.Namespace) -> int:
-    registry = default_registry()
-    items = registry.list(category=args.category, tag=args.tag)
+    registry = _registry_with_extra_packs(args)
+    items = registry.list(category=args.category, tag=args.tag, domain=getattr(args, "domain", None))
     if args.json:
         print(json.dumps([item.spec() for item in items], ensure_ascii=False, indent=2))
         return EXIT_OK
-    print(f"⚛️  原子库（{len(items)} 个）")
-    current_category = None
+    print(f"⚛️  原子库（{len(items)} 个，领域: {', '.join(registry.domains())}）")
+    current = None
     for item in items:
-        if item.category != current_category:
-            current_category = item.category
-            print(f"\n[{current_category}]")
+        group = f"{item.domain}/{item.category}"
+        if group != current:
+            current = group
+            print(f"\n[{group}]")
         required = ", ".join(item.required) or "-"
+        effects = "/".join(str(effect) for effect in item.effects) or "pure"
         print(f"  {item.name:<20} {item.description}")
-        print(f"  {'':<20} 必填: {required}")
+        print(f"  {'':<20} 必填: {required}  ·  副作用: {effects}")
+    return EXIT_OK
+
+
+def _cmd_packs_list(args: argparse.Namespace) -> int:
+    packs = _pack_registry().list(domain=args.domain)
+    if args.json:
+        print(json.dumps([pack.manifest() for pack in packs], ensure_ascii=False, indent=2))
+        return EXIT_OK
+    print(f"📦 领域包（{len(packs)} 个）")
+    for pack in packs:
+        print(f"\n  {pack.name}  v{pack.version}  领域={pack.domain}  [{pack.source}]")
+        print(f"    {pack.description}")
+        print(f"    原子 {len(pack.atoms)} 个 · 能力: {', '.join(pack.capabilities()) or '无'}")
+        print(f"    语义: {getattr(pack.semantics, 'name', 'generic')}")
+    print("\n提示: panguverse packs show <name> 查看详情；packs validate 做自检")
+    return EXIT_OK
+
+
+def _cmd_packs_show(args: argparse.Namespace) -> int:
+    try:
+        pack = _pack_registry().get(args.name)
+    except KeyError as exc:
+        print(f"❌ {exc}", file=sys.stderr)
+        return EXIT_ERROR
+    manifest = pack.manifest()
+    if args.json:
+        print(json.dumps(manifest, ensure_ascii=False, indent=2))
+        return EXIT_OK
+    print(f"📦 {manifest['name']} v{manifest['version']}（{manifest['domain']}）")
+    print(f"   {manifest['description']}")
+    print(f"   来源: {manifest['source']}  路径: {manifest['path'] or '-'}")
+    print(f"   能力需求: {', '.join(manifest['capabilities']) or '无'}")
+    semantics = pack.semantics.describe()
+    print(f"   领域语义: {json.dumps(semantics, ensure_ascii=False)}")
+    print(f"\n   原子（{len(pack.atoms)}）:")
+    for atom in pack.atoms:
+        print(f"     {atom.name:<20} {atom.description}")
+        if atom.capabilities:
+            print(f"     {'':<20} 能力: {', '.join(atom.capabilities)}  ·  副作用: {'/'.join(atom.effects) or '-'}")
+    return EXIT_OK
+
+
+def _cmd_packs_validate(args: argparse.Namespace) -> int:
+    from .core.pack import load_pack_dir, load_pack_file
+
+    problems: list[str] = []
+    if args.path:
+        target = Path(args.path)
+        try:
+            packs = load_pack_dir(target) if target.is_dir() else [load_pack_file(target)]
+        except PanguError as exc:
+            print(f"❌ 加载失败: {exc}", file=sys.stderr)
+            return EXIT_ERROR
+        print(f"🔍 校验 {len(packs)} 个包（{target}）")
+        for pack in packs:
+            problems.extend(f"[{pack.name}] {item}" for item in pack.validate())
+    else:
+        registry = _pack_registry()
+        problems = registry.validate(strict=args.strict)
+        print(f"🔍 校验内置领域包（{len(registry)} 个，strict={args.strict}）")
+    if problems:
+        print("❌ 发现问题:")
+        for problem in problems:
+            print(f"  - {problem}")
+        return EXIT_ERROR
+    print("✅ 包校验通过")
+    return EXIT_OK
+
+
+def _cmd_packs_manifest(args: argparse.Namespace) -> int:
+    manifest = _pack_registry().manifest()
+    if args.out:
+        path = Path(args.out)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"📄 已导出清单: {path}")
+        return EXIT_OK
+    print(json.dumps(manifest, ensure_ascii=False, indent=2))
     return EXIT_OK
 
 
@@ -342,20 +452,47 @@ def _cmd_demo_e2e(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #
+def _pack_registry() -> Any:
+    """内置领域包注册表（供 packs 子命令使用）。"""
+    from .core.pack import builtin_pack_registry
+
+    return builtin_pack_registry(reload=True)
+
+
+def _registry_with_extra_packs(args: argparse.Namespace, *, reload: bool = True) -> Any:
+    """内置原子库 + 命令行 ``--packs`` 指定的声明式领域包。"""
+    from .core.pack import load_pack_dir, load_pack_file
+
+    registry = default_registry(reload=reload)
+    for raw in getattr(args, "packs", []) or []:
+        path = Path(raw)
+        packs = load_pack_dir(path) if path.is_dir() else [load_pack_file(path)]
+        for pack in packs:
+            registry.register_pack(pack, replace=True)
+    return registry
+
+
 def _build_axe(args: argparse.Namespace, *, enable_llm: bool = True) -> PanguAxe:
+    granted = getattr(args, "allow_capabilities", None)
     settings = ExecutorSettings(
         heal=not getattr(args, "no_heal", False),
         stop_on_first_failure=bool(getattr(args, "fail_fast", False)),
+        capabilities=tuple(item.strip() for item in granted.split(",") if item.strip()) if granted else None,
     )
     if getattr(args, "retry", None):
         from .core.molecule import RetryPolicy
 
         settings.default_retry = RetryPolicy(
             attempts=max(1, int(args.retry)), delay_ms=200, backoff=2.0,
-            on=("network", "timeout", "server_error"),
+            on=("transient", "timeout", "network"),
         )
     workspace = getattr(args, "workspace", ".panguverse")
-    return PanguAxe(workspace=workspace, settings=settings, enable_llm=enable_llm)
+    return PanguAxe(
+        registry=_registry_with_extra_packs(args),
+        workspace=workspace,
+        settings=settings,
+        enable_llm=enable_llm,
+    )
 
 
 def _build_request(args: argparse.Namespace, env: dict[str, Any]) -> PlanRequest:

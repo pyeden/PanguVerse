@@ -150,8 +150,14 @@ class TestMolecule:
         )
         assert molecule.case_id == "case1"
         assert molecule.steps[1].retry.attempts == 3
-        assert molecule.steps[1].retry.should_retry("server_error")
-        assert not molecule.steps[1].retry.should_retry("assertion")
+        # 默认重试判据是**中立类别**（跨领域通用）：transient 命中、expectation 不命中
+        assert molecule.steps[1].retry.should_retry("whatever", "transient")
+        assert molecule.steps[1].retry.should_retry("timeout")
+        assert not molecule.steps[1].retry.should_retry("assertion", "expectation")
+        # 领域标签需要显式写进 on 才命中（保持「谁声明谁负责」）
+        explicit = RetryPolicy(attempts=3, on=("server_error",))
+        assert explicit.should_retry("server_error")
+        assert not explicit.should_retry("whatever", "transient")
 
     def test_duplicate_step_ids_rejected(self):
         with pytest.raises(PlanError):
