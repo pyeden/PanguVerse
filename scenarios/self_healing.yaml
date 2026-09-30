@@ -1,0 +1,87 @@
+name: 自愈能力验证
+description: 两条自愈路径——步骤级重试（5xx 抖动）与自愈器重新认证（token 失效）
+tags: [selfheal]
+
+env:
+  BASE_URL: http://127.0.0.1:8899
+  API_USERNAME: demo
+  API_PASSWORD: demo123
+
+defaults:
+  headers:
+    Content-Type: application/json
+
+cases:
+  - id: flaky_retry_heal
+    name: 自愈(重试层)：服务端 5xx 抖动 → 退避重试后恢复
+    tags: [selfheal, retry]
+    steps:
+      - id: flaky
+        use: http_request
+        name: 调用故障注入接口
+        retry:
+          attempts: 5
+          delay_ms: 50
+          backoff: 1.0
+          on: [server_error, timeout, network]
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/flaky
+        capture:
+          recovered_at_attempt: body.attempt
+        assert:
+          status: 200
+          json:
+            - path: status
+              equals: ok
+      - id: note_attempt
+        use: log
+        name: 记录自愈结果
+        with:
+          message: 抖动已恢复，服务端第 ${recovered_at_attempt} 次调用返回正常
+
+  - id: auth_reauth_heal
+    name: 自愈(重认证层)：token 失效 → 自动重新登录并重试
+    tags: [selfheal, auth]
+    secrets: [token]
+    steps:
+      - id: login
+        use: http_request
+        name: 首次登录
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${env.API_PASSWORD}
+        capture:
+          token: body.token
+          login_user: body.user.name
+        assert:
+          status: 200
+
+      - id: invalidate
+        use: http_request
+        name: 触发服务端使所有 token 失效
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/debug/invalidate-tokens
+          headers:
+            Authorization: Bearer ${token}
+        assert:
+          status: 200
+
+      - id: me_with_stale_token
+        use: http_request
+        name: 旧 token 访问 → 401 → 触发自愈重新认证
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/me
+          headers:
+            Authorization: Bearer ${token}
+          expect_status: 200
+        assert:
+          json:
+            - path: data.name
+              equals: ${login_user}

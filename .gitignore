@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# PanguVerse 运行时产物（工作区、沉淀的回归用例与经验库）
+.panguverse/
+.panguverse-*/

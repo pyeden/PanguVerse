@@ -1,0 +1,17 @@
+# PanguVerse 依赖
+#
+# 核心能力（原子引擎 / 执行器 / 规划器 / 报告）只用 Python 标准库，
+# 因此可以「克隆下来零安装直接跑通闭环」：
+#
+#     python -m panguverse demo e2e
+#
+# 下面是可选的增强依赖；装上不会改变行为契约，只会更好用。
+#
+# 更好的 HTTP 客户端（缺失时自动回退 urllib）
+requests>=2.28
+
+# 完整 YAML 支持（缺失时使用内置 YAML 子集解析器）
+PyYAML>=6.0
+
+# 开发/测试
+pytest>=7.0

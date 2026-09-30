@@ -1,0 +1,68 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panguverse"
+version = "0.1.0"
+description = "🪓 PanguVerse —— AI + 自动化：把世界逻辑劈成原子，让它们自组装、自运行、自进化"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+authors = [{ name = "PanguVerse Contributors" }]
+keywords = ["automation", "ai", "api-testing", "orchestration", "atoms", "rpa"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Quality Assurance",
+]
+# 核心零依赖：克隆下来即可离线跑通完整闭环
+dependencies = []
+
+[project.optional-dependencies]
+# 完整体验：性能更好的 HTTP 客户端与完整 YAML 支持（缺失时自动回退标准库）
+http = ["requests>=2.28"]
+yaml = ["PyYAML>=6.0"]
+dev = ["pytest>=7.0", "requests>=2.28", "PyYAML>=6.0"]
+
+[project.scripts]
+panguverse = "panguverse.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/pyeden/PanguVerse"
+Repository = "https://github.com/pyeden/PanguVerse"
+
+[tool.setuptools.packages.find]
+include = ["panguverse*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+extend-exclude = [".panguverse", "scenarios"]
+
+[tool.ruff.lint]
+# 显式声明本项目的 lint 契约，避免不同机器上的默认规则集漂移
+select = ["E", "F", "W", "I", "UP", "B", "BLE", "C4", "SIM", "RUF"]
+ignore = [
+    "E501",     # 行长由人判断：中文注释与文档字符串常需要更宽的版面
+    "SIM102",   # 嵌套 if 在表达「先判空再判条件」时更好读
+    "SIM114",   # 相同分支合并有时反而隐藏语义
+    "UP031",    # %-格式化在构造带变量的日志/消息时对中文更友好
+    "RUF001",   # 项目文档与报错信息以中文书写，全角标点是刻意的
+    "RUF002",
+    "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["BLE001"]  # 测试里断言异常类型时允许宽泛捕获
+

@@ -144,19 +144,64 @@
 
 ```bash
 # 克隆项目
-git clone https://github.com/your-org/panguverse.git
-cd panguverse
+git clone https://github.com/pyeden/PanguVerse.git
+cd PanguVerse
 
-# 安装依赖
-pip install -r requirements.txt
-
-# 设置 AI 后端
-export PANGUVERSE_AI_BACKEND=openai
-export OPENAI_API_KEY=your-key
-
-# 劈开混沌：用自然语言驱动自动化
-panguverse run "每天上午 9 点检查所有服务器健康状态，异常时通知钉钉群"
+# 🎯 零依赖跑通第一条业务闭环：API 自动化测试（内置被测量，无需任何外部服务）
+python -m panguverse demo e2e
 ```
+
+输出（真实运行结果）：
+
+```
+🪓 PanguVerse 闭环完成
+  运行: 6c08697153ee  计划来源: spec（spec）
+  结果: 6/6 通过，失败 0，异常 0，跳过 0，自愈 1，HTTP 19 次，耗时 0.14s
+  沉淀: 回归原子 +6，经验 +1，回归库共 6 条
+  回归复用: 6/6 通过（无需重新规划）
+  报告[html]: .panguverse/runs/6c08697153ee/report.html
+```
+
+接自己的系统：
+
+```bash
+# 用自然语言驱动（没有 AI 密钥时自动用规则模板兜底，闭环不断）
+python -m panguverse loop -i "检查服务健康状态，并验证登录下单支付闭环" \
+    --env BASE_URL=https://api.your-company.com --regression
+
+# 或用场景 YAML（推荐进版本库，作为 CI 主线）
+python -m panguverse run scenarios/order_flow.yaml --env BASE_URL=https://api.your-company.com
+```
+
+> 核心能力（原子引擎 / 执行器 / 规划器 / 报告）**只用 Python 标准库**，可离线运行；
+> 可选增强：`pip install -r requirements.txt`（`requests` 更好的 HTTP 客户端、`PyYAML` 完整 YAML、`pytest` 开发测试）。
+
+---
+
+## 🎯 第一块落地业务：API 自动化测试业务闭环
+
+把「人写测试脚本」换成 **意图 → 计划 → 执行 → 断言 → 报告 → 自愈 → 沉淀 → 复用** 的自动循环：
+
+```
+意图 / 场景规格 ──① 规划──► 测试计划（用例=分子，步骤=原子）──② 校验──► 执行引擎
+                                                                            │
+                       ⑥ 回归复用 ◄──⑤ 沉淀（回归原子 + 经验库）◄── ④ 自愈 ◄─┘
+                                        │                              （步骤级重试 + 重新认证）
+                                        └──► ③ 报告：JSON / 自包含 HTML / JUnit XML
+```
+
+| 闭环环节 | 实现 | 关键点 |
+| --- | --- | --- |
+| **拆解** | `axe/planner.py` | 场景规格 → LLM 规划（严格 JSON + 计划校验 + 一次自修复）→ 规则模板，**三层降级永不空转** |
+| **原子** | `atoms/` | `http_request`（4xx/5xx 不抛异常，404 是合法结果）/ 断言 / 提取 / 流程，共 14 个原语 |
+| **执行** | `engine/executor.py` | 变量模板 `${...}`、`capture`、`foreach` 数据驱动、`when` 条件、失败即停与 `optional` |
+| **自愈** | `engine` + `axe/healer.py` | 5xx/超时/网络退避重试；401/403 自动重新执行认证步骤后重试；语义失败只给可执行建议 |
+| **报告** | `report/` | JSON（机器）/ 自包含 HTML（人看）/ JUnit XML（CI）；**密钥按值打码，有测试守着** |
+| **沉淀** | `axe/memory.py` | 跑通的用例 `seal` 成回归原子；失败与自愈沉淀成经验 `lessons.jsonl` |
+| **进化** | `apply_lessons_to_plan` | 下次规划自动把经验里的重试策略补进计划（并在计划备注里说明来源） |
+| **组合** | `Molecule.seal()` | 分子即原子：登录流程 seal 后可当步骤用在更大的流程里，层级无限 |
+
+细节文档：[docs/api-testing.md](./docs/api-testing.md)（场景语法 / 原子清单 / 报告 / 扩展自定义原子 / FAQ）。
 
 ---
 
@@ -201,18 +246,21 @@ axe.run("对所有生产环境服务执行 health_monitor，汇总结果发邮�
 
 ## 核心特性 / Key Features
 
-- **🪓 盘古斧 AI 编排** — 自然语言描述意图，AI 自动拆解、选原子、编排执行
+- **🪓 盘古斧 AI 编排** — 自然语言描述意图，AI 自动拆解、选原子、编排执行（无密钥时规则模板兜底，闭环不断）
 - **♾️ 原子递归组合** — 原子组合成分子，分子 seal 成新原子，层级无限
 - **🧩 场景化原子定义** — 不预设"万能原子"，每个领域定义自己的原语
-- **🛡️ 自愈执行** — 失败自动重试、降级、回滚，混沌中保持有序
-- **📈 宇宙膨胀** — 原子库越用越丰富，自动化能力指数级增长
-- **🌐 多 AI 后端** — 支持 OpenAI / Claude / 本地 LLM
+- **🛡️ 自愈执行** — 失败自动重试、重新认证、经验复用；语义失败给出可执行建议（全部可审计）
+- **📈 宇宙膨胀** — 跑通的用例自动沉淀回原子库，经验库驱动下次计划自动补强
+- **🌐 多 AI 后端** — 支持 OpenAI / Anthropic 兼容接口 / 本地 LLM；核心链路零依赖、可离线
+- **✅ 已落地闭环** — API 自动化测试：场景/意图 → 计划 → 执行 → 断言 → 报告 → 自愈 → 沉淀 → 回归复用
 
 ---
 
 ## 路线图 / Roadmap
 
-- [ ] `v0.1` — **开天**：核心抽象 Atom、PanguAxe、Atom Registry
+- [x] `v0.1` — **开天**：核心抽象 Atom、PanguAxe、Atom Registry
+      —— ✅ 已完成第一块落地业务：**API 自动化测试业务闭环**（规划 / 原子执行 / 断言 / 报告 / 自愈 / 沉淀 / 回归复用），
+      内置 mock 被测量与一键演示：`python -m panguverse demo e2e`，详见 [docs/api-testing.md](./docs/api-testing.md)
 - [ ] `v0.2` — **造物**：Atom Marketplace，社区共享原子
 - [ ] `v0.3` — **观天**：可视化编排面板，原子关系图谱
 - [ ] `v0.4` — **自驱**：自治循环，执行→观察→沉淀→进化

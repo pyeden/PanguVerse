@@ -1,0 +1,127 @@
+name: API 冒烟与鉴权
+description: 健康检查 + 登录链路 + 负向鉴权；演示 assert 便捷语法
+tags: [smoke]
+
+env:
+  BASE_URL: http://127.0.0.1:8899
+  API_USERNAME: demo
+  API_PASSWORD: demo123
+  MAX_LATENCY_MS: 3000
+
+defaults:
+  headers:
+    Content-Type: application/json
+  retry:
+    attempts: 3
+    delay_ms: 100
+    on: [server_error, timeout, network]
+
+cases:
+  - id: health_check
+    name: 健康检查：服务存活且响应够快
+    tags: [smoke, health]
+    steps:
+      - id: health
+        use: http_request
+        name: 请求 /api/health
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/health
+        assert:
+          status: 200
+          latency_max_ms: ${env.MAX_LATENCY_MS|int}
+          json:
+            - path: status
+              equals: ok
+            - path: service
+              exists: true
+      - id: health_schema
+        use: assert_schema
+        name: 响应结构校验
+        with:
+          schema:
+            type: object
+            required: [status, service, time]
+            properties:
+              status:
+                type: string
+              service:
+                type: string
+                minLength: 1
+              time:
+                type: number
+
+  - id: login_flow
+    name: 认证链路：登录拿 token → 访问受保护接口
+    tags: [smoke, auth]
+    secrets: [token]
+    steps:
+      - id: login
+        use: http_request
+        name: 登录
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${env.API_PASSWORD}
+        capture:
+          token: body.token
+          login_user: body.user.name
+        assert:
+          status: 200
+          json:
+            - path: token
+              exists: true
+              type: string
+            - path: user.role
+              equals: admin
+      - id: me
+        use: http_request
+        name: 携带 token 访问 /api/me
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/me
+          headers:
+            Authorization: Bearer ${token}
+        assert:
+          status: 200
+          json:
+            - path: data.name
+              equals: ${login_user}
+      - id: logout_effect
+        use: log
+        name: 记录认证上下文
+        with:
+          message: 认证完成，user=${login_user}
+
+  - id: auth_negative
+    name: 负向鉴权：无 token / 错密码都应被拒绝
+    tags: [negative, auth]
+    steps:
+      - id: no_token
+        use: http_request
+        name: 无 token 访问受保护接口
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/users
+        assert:
+          status: 401
+          json:
+            - path: error
+              equals: unauthorized
+      - id: bad_password
+        use: http_request
+        name: 错误密码登录
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/login
+          json:
+            username: demo
+            password: definitely-wrong
+        assert:
+          status: 401
+          json:
+            - path: error
+              equals: invalid_credentials

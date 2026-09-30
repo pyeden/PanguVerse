@@ -1,0 +1,164 @@
+name: 订单业务闭环
+description: 登录 → 数据驱动批量下单 → 支付 → 回查状态机 → 负向路径（404 / 409）
+tags: [order, business]
+
+env:
+  BASE_URL: http://127.0.0.1:8899
+  API_USERNAME: demo
+  API_PASSWORD: demo123
+
+defaults:
+  headers:
+    Content-Type: application/json
+  retry:
+    attempts: 3
+    delay_ms: 100
+    on: [server_error, timeout, network]
+
+cases:
+  - id: order_flow
+    name: 订单闭环：登录 → 批量下单 → 支付首个订单 → 状态回查 → 冲突校验
+    tags: [order, smoke, regression]
+    secrets: [token]
+    steps:
+      - id: login
+        use: http_request
+        name: 登录
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${env.API_PASSWORD}
+        capture:
+          token: body.token
+          login_user: body.user.name
+        assert:
+          status: 200
+
+      - id: skus
+        use: set_var
+        name: 准备数据驱动输入
+        with:
+          name: skus
+          value: [SKU-A, SKU-B]
+
+      - id: create_orders
+        use: http_request
+        name: 数据驱动批量下单
+        foreach: ${skus}
+        as: sku
+        retry:
+          attempts: 2
+          delay_ms: 50
+          on: [server_error]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/orders
+          headers:
+            Authorization: Bearer ${token}
+          json:
+            sku: ${sku}
+            quantity: 1
+            unit_price: 9.9
+        capture:
+          order_ids: body.data.id
+          order_amounts: body.data.amount
+        assert:
+          status: 201
+          json:
+            - path: data.status
+              equals: CREATED
+            - path: data.amount
+              gt: 0
+
+      - id: pay_first_order
+        use: http_request
+        name: 支付第一个订单
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/orders/${order_ids[0]}/pay
+          headers:
+            Authorization: Bearer ${token}
+        retry:
+          attempts: 3
+          delay_ms: 100
+          on: [server_error, timeout]
+        assert:
+          status: 200
+          json:
+            - path: data.status
+              equals: PAID
+            - path: data.paid_at
+              exists: true
+
+      - id: get_first_order
+        use: http_request
+        name: 回查订单状态
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/orders/${order_ids[0]}
+          headers:
+            Authorization: Bearer ${token}
+        assert:
+          status: 200
+          json:
+            - path: data.id
+              equals: ${order_ids[0]}
+            - path: data.status
+              equals: PAID
+
+      - id: list_paid_orders
+        use: http_request
+        name: 按状态筛选订单
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/orders
+          params:
+            status: PAID
+          headers:
+            Authorization: Bearer ${token}
+        assert:
+          status: 200
+          latency_max_ms: 2000
+          json:
+            - path: total
+              gte: 1
+            - path: items
+              type: array
+              exists: true
+
+      - id: pay_again_conflict
+        use: http_request
+        name: 重复支付应返回 409 冲突
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/orders/${order_ids[0]}/pay
+          headers:
+            Authorization: Bearer ${token}
+        assert:
+          status: 409
+          json:
+            - path: error
+              equals: conflict
+
+      - id: unknown_order_404
+        use: http_request
+        name: 查询不存在的订单应 404
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/orders/ord_not_exist
+          headers:
+            Authorization: Bearer ${token}
+        assert:
+          status: 404
+          json:
+            - path: error
+              equals: not_found
+
+      - id: summary
+        use: log
+        name: 输出闭环小结
+        with:
+          message: 订单闭环完成：共下单 ${create_orders.count} 笔，首个订单 ${order_ids[0]} 已支付
