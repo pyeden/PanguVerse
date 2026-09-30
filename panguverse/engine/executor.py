@@ -302,21 +302,16 @@ class Executor:
                 return step_result, budget_used
 
             collected.append(outputs)
-            captures = self._capture_values(step, outputs)
+            # 密钥登记只有一个入口，避免「不同代码路径对声明的 secrets 处理不一致」
+            if outputs or step.id not in ctx.vars:
+                ctx.vars[step.id] = outputs
+            if outputs or step.id not in loop_ctx.vars:
+                loop_ctx.vars[step.id] = outputs
             if step.foreach:
-                for name, value, _secret in captures:
-                    capture_buckets.setdefault(name, []).append(value)
+                for name, value, secret in self._capture_values(step, outputs, ctx=loop_ctx):
+                    capture_buckets.setdefault(name, []).append((value, secret))
             else:
-                # 步骤输出写进 vars[step.id]，但**不覆盖**同名变量：
-                # 原子自己写入的同名变量更明确（例如 set_var 的 name 与步骤 id 同名）
-                if outputs or step.id not in ctx.vars:
-                    ctx.vars[step.id] = outputs
-                if outputs or step.id not in loop_ctx.vars:
-                    loop_ctx.vars[step.id] = outputs
-                for name, value, secret in captures:
-                    ctx.set(name, value)
-                    if secret:
-                        ctx.add_secret(name, value)
+                self._apply_capture(step, outputs, ctx)
         if step.foreach:
             step_result.iterations = len(iterations)
             last = collected[-1] if collected else {}
@@ -325,10 +320,10 @@ class Executor:
             merged = {**last, "count": len(collected), "items": collected, "last": last}
             ctx.vars[step.id] = merged
             step_result.outputs = merged
-            for name, values in capture_buckets.items():
-                ctx.set(name, values)
-                if name in (ctx.meta.get("_case_secrets") or set()):
-                    for value in values:
+            for name, bucket in capture_buckets.items():
+                ctx.set(name, [value for value, _secret in bucket])
+                for value, secret in bucket:
+                    if secret:
                         ctx.add_secret(name, value)
         else:
             step_result.outputs = collected[-1] if collected else {}
@@ -386,8 +381,20 @@ class Executor:
                 continue
             return outputs
 
-    def _capture_values(self, step: Step, outputs: dict[str, Any]) -> list[tuple[str, Any, bool]]:
-        """解析 ``capture``：返回值列表 ``(变量名, 值, 是否密钥)``。"""
+    def _capture_values(
+        self,
+        step: Step,
+        outputs: dict[str, Any],
+        *,
+        ctx: RunContext,
+    ) -> list[tuple[str, Any, bool]]:
+        """解析 ``capture``：返回值列表 ``(变量名, 值, 是否密钥)``。
+
+        「是否密钥」= 步骤里显式声明的 ``secret: true`` **或** 名字出现在场景的 ``secrets:`` 列表里。
+        这里必须是唯一的判定入口——否则不同执行路径（正常 / 自愈 / foreach）对密钥的处理会不一致，
+        从而把明文漏进报告（曾经的 bug）。
+        """
+        declared = ctx.meta.get("_case_secrets") or set()
         captured: list[tuple[str, Any, bool]] = []
         for name, spec in (step.capture or {}).items():
             required = True
@@ -403,14 +410,13 @@ class Executor:
                 if required:
                     raise StepError(f"步骤 {step.id} 的 capture 路径不存在: {path}")
                 continue
-            captured.append((str(name), value, secret))
+            captured.append((str(name), value, secret or str(name) in declared))
         return captured
 
     def _apply_capture(self, step: Step, outputs: dict[str, Any], ctx: RunContext) -> None:
-        declared = ctx.meta.get("_case_secrets") or set()
-        for name, value, secret in self._capture_values(step, outputs):
+        for name, value, secret in self._capture_values(step, outputs, ctx=ctx):
             ctx.set(name, value)
-            if secret or name in declared:
+            if secret:
                 ctx.add_secret(name, value)
 
     # ------------------------------------------------------------------ #

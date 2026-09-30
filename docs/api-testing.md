@@ -268,7 +268,12 @@ python -m panguverse run scenarios/self_healing.yaml --env BASE_URL=...
 `--format json --format html` 可按需裁剪；`panguverse report <run_dir>` 能从 `report.json` 重新生成 HTML。
 
 **安全**：报告只渲染打码后的数据。`secrets: [token]` 声明的变量会按值在全文替换为 `***`，
-`Authorization`/`password`/`cookie` 等敏感字段名也会被遮蔽；有专门的测试用例守着这条红线。
+`Authorization`/`password`/`cookie` 等敏感字段名也会被遮蔽。
+
+密钥登记只有**一个**判定入口（`Executor._capture_values`），因此正常步骤、`foreach`、自愈重新认证
+三条路径行为一致——包括「token 失效 → 自愈重新登录」这种**一次运行里出现两个 token** 的场景，
+两个值都会被登记并打码。`tests/test_reports_cli.py::test_secrets_masked_across_token_rotation`
+守着这条红线（它会扫描全部产物，要求零 token 明文残留）。
 
 ---
 

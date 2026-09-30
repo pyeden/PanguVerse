@@ -54,6 +54,31 @@ cases:
         with: {method: GET, url: "${env.BASE_URL}/api/orders/nope", expect_status: 200}
 """
 
+TOKEN_ROTATION_SUITE = """
+name: token 轮换
+env:
+  BASE_URL: http://x
+cases:
+  - id: rotated_token
+    name: token 失效 → 自愈重新登录
+    secrets: [token]
+    steps:
+      - id: login
+        use: http_request
+        tags: [auth]
+        with: {method: POST, url: "${env.BASE_URL}/api/login",
+               json: {username: demo, password: demo123}}
+        capture: {token: body.token}
+      - id: invalidate
+        use: http_request
+        with: {method: POST, url: "${env.BASE_URL}/api/debug/invalidate-tokens",
+               headers: {Authorization: "Bearer ${token}"}, expect_status: 200}
+      - id: me
+        use: http_request
+        with: {method: GET, url: "${env.BASE_URL}/api/me",
+               headers: {Authorization: "Bearer ${token}"}, expect_status: 200}
+"""
+
 
 @pytest.fixture()
 def run_with_secret(tmp_path, env):
@@ -88,6 +113,26 @@ class TestReports:
         assert "Bearer ***" in blob or "***" in blob
         # 请求头里的 Authorization 也要打码
         assert not re.search(r"tok_[0-9a-f]{10,}", blob)
+
+    def test_secrets_masked_across_token_rotation(self, tmp_path, env):
+        """回归：自愈「重新认证」会产生**第二个** token，两个都必须从产物里消失。
+
+        曾经的 bug：正常步骤路径漏了场景 `secrets:` 声明的检查，只有自愈路径登记密钥，
+        导致第一次登录的 token 留在响应原文（`text`）里泄漏到报告。
+        """
+        suite = load_suite_text(TOKEN_ROTATION_SUITE)
+        axe = PanguAxe(workspace=tmp_path / "ws", enable_llm=False)
+        run = axe.run(axe.plan(PlanRequest(suite=suite, env=env)), env=env)
+        assert run.cases[0].status == "passed"
+        assert run.cases[0].heal_events and run.cases[0].heal_events[0].action == "reauth"
+
+        secrets = run.cases[0].meta["secret_values"]
+        assert len(secrets) >= 2, "轮换前后的两个 token 都必须登记为密钥"
+
+        artifacts = write_all(run, tmp_path / "out")
+        blob = "".join(Path(path).read_text(encoding="utf-8") for path in artifacts.values())
+        assert [s for s in secrets if s in blob] == []
+        assert re.findall(r"tok_[0-9a-f]{16,}", blob) == []
 
     def test_html_report_contains_key_sections(self, run_with_secret, tmp_path):
         _axe, run = run_with_secret
