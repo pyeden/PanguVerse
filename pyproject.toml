@@ -28,7 +28,7 @@ dependencies = []
 # 完整体验：性能更好的 HTTP 客户端与完整 YAML 支持（缺失时自动回退标准库）
 http = ["requests>=2.28"]
 yaml = ["PyYAML>=6.0"]
-dev = ["pytest>=7.0", "requests>=2.28", "PyYAML>=6.0"]
+dev = ["pytest>=7.0", "pytest-cov>=5.0", "ruff>=0.6", "requests>=2.28", "PyYAML>=6.0"]
 
 [project.scripts]
 panguverse = "panguverse.cli:main"

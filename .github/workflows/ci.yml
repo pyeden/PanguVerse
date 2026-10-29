@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: python -m pip install --upgrade pip ruff
+      - name: Ruff check
+        run: ruff check .
+
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install dev dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Unit + end-to-end tests
+        run: python -m pytest -q
+      - name: Closed-loop demo
+        run: python -m panguverse demo e2e
+
+  zero-dependency:
+    name: Zero third-party runtime deps
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package without extras
+        run: python -m pip install .
+      - name: Verify runtime imports use stdlib only
+        run: |
+          python - <<'PY'
+          import importlib.util, sys
+          missing = [m for m in ("requests", "yaml") if importlib.util.find_spec(m) is not None]
+          if missing:
+              print(f"unexpected third-party modules present: {missing}", file=sys.stderr)
+              sys.exit(1)
+          print("ok: only stdlib available as runtime deps")
+          PY
+      - name: Run closed loop with no extras installed
+        run: python -m panguverse demo e2e
