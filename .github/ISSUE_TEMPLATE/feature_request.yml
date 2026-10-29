@@ -1,0 +1,45 @@
+name: 功能建议
+description: 提出新的能力、改进或使用场景
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 目标场景
+      description: 你想自动化的业务是什么？属于哪个领域？
+      placeholder: 例：运维巡检 —— 拉取健康检查接口 → 落盘快照 → 比对阈值 → 归档
+    validations:
+      required: true
+  - type: textarea
+    id: expectation
+    attributes:
+      label: 期望能力
+      description: 希望平台提供什么？用一句话描述理想体验。
+    validations:
+      required: true
+  - type: textarea
+    id: gap
+    attributes:
+      label: 现有原子组合为什么不够
+      description: 你试过哪些原子/组合？卡在哪一步？
+    validations:
+      required: false
+  - type: dropdown
+    id: layer
+    attributes:
+      label: 你认为这属于哪一层
+      options:
+        - 新增领域包（不改内核）
+        - 新增原子（现有领域包内）
+        - 内核能力（执行器 / 规划 / 自愈 / 报告）
+        - 不确定
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 备选方案
+      description: 有没有绕过方式或其他工具能做到？
+    validations:
+      required: false

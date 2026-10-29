@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（私密披露）
+    url: https://github.com/pyeden/PanguVerse/security/advisories/new
+    about: 请勿公开提交安全漏洞，使用 GitHub Security Advisories 私密报告。
+  - name: 使用与架构讨论
+    url: https://github.com/pyeden/PanguVerse/discussions
+    about: 想法、用法、架构取舍请先在讨论区交流。

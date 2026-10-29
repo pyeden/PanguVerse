@@ -1,0 +1,87 @@
+name: 新原子提案
+description: 提交一个可复用原子（本项目核心资产）
+title: "[atom] "
+labels: ["atom", "proposal"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        原子必须满足两条硬约束：**有固定输入/输出契约**，且**能被程序直接调用**（另一个流程可直接 import / invoke），不需要 LLM 重新解释。
+        详见 [AGENTS.md](../blob/main/AGENTS.md)。
+  - type: input
+    id: atom-name
+    attributes:
+      label: 原子名称
+      placeholder: "http_request / fs_write_text / db_query"
+    validations:
+      required: true
+  - type: input
+    id: pack
+    attributes:
+      label: 所属领域包
+      placeholder: "core / api_testing / local_fs / 新领域包名"
+    validations:
+      required: true
+  - type: dropdown
+    id: form
+    attributes:
+      label: 实现形态
+      options:
+        - Python 函数（@atom 装饰）
+        - YAML 声明式包（*.pack.yaml）
+        - 脚本（独立可执行）
+        - skill
+        - MCP / 外部工具
+    validations:
+      required: true
+  - type: textarea
+    id: contract
+    attributes:
+      label: 输入 / 输出契约
+      description: 列出字段名与类型；输出要说明成功与失败时的结构。
+      render: yaml
+      placeholder: |
+        inputs:
+          url: str
+          timeout_ms: int = 3000
+        outputs:
+          status: int
+          body: dict
+    validations:
+      required: true
+  - type: input
+    id: effects
+    attributes:
+      label: 副作用（effects）
+      description: pure / read / write / network / external，可多选
+      placeholder: "network"
+    validations:
+      required: true
+  - type: input
+    id: capabilities
+    attributes:
+      label: 所需能力（capabilities）
+      placeholder: "net.http"
+    validations:
+      required: false
+  - type: input
+    id: secrets
+    attributes:
+      label: 密钥输出（secret_outputs）
+      placeholder: "token, password；无则填 none"
+    validations:
+      required: true
+  - type: textarea
+    id: reuse
+    attributes:
+      label: 可复用场景
+      description: 至少给出两个不同流程会用它的例子，证明不是一次性逻辑。
+    validations:
+      required: true
+  - type: textarea
+    id: tests
+    attributes:
+      label: 单测与文档登记计划
+      description: 计划补哪些单测；是否会在 docs/platform-architecture.md 原子表登记。
+    validations:
+      required: true

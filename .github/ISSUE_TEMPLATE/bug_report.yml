@@ -1,0 +1,61 @@
+name: Bug 报告
+description: 报告可复现的缺陷（执行、校验、报告、自愈、治理）
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈。**请勿在 issue 中粘贴真实密钥、token、内部地址或客户数据**，敏感信息请用占位符替换。
+        安全漏洞请走 [Security Advisories](https://github.com/pyeden/PanguVerse/security/advisories/new)，不要开公开 issue。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象
+      description: 实际发生了什么？期望是什么？
+      placeholder: 期望 X，实际 Y
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: 复现步骤
+      description: 尽量给最小复现。命令、场景 YAML 或原子代码均可。
+      placeholder: |
+        1. python -m panguverse demo e2e
+        2. ...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: PanguVerse 版本
+      description: 输出 `python -m panguverse --version`
+      placeholder: "panguverse 0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 运行环境
+      description: Python 版本 + 操作系统
+      placeholder: "Python 3.12.2 / macOS 15.7"
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 报告片段
+      description: 相关输出。请先脱敏。
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 确认
+      options:
+        - label: 我已搜索过现有 issue，未发现重复
+          required: true
+        - label: 我确认内容不含真实密钥或客户隐私数据
+          required: true

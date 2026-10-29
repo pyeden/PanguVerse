@@ -1,7 +1,8 @@
 <p align="center">
+  <a href="https://github.com/pyeden/PanguVerse/actions/workflows/ci.yml"><img src="https://github.com/pyeden/PanguVerse/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="status">
-  <img src="https://img.shields.io/badge/license-Apache 2.0-blue" alt="license">
-  <img src="https://img.shields.io/badge/python-3.10+-green" alt="python">
+  <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license">
+  <img src="https://img.shields.io/badge/python-3.10%2B-green" alt="python">
 </p>
 
 <h1 align="center">🪓 PanguVerse</h1>
