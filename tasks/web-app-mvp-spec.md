@@ -1,6 +1,7 @@
 # PanguVerse Web 版 MVP 规格（开发契约）
 
 > 依据：`docs/web-app-user-stories.md`（P0 故事 US-01…US-11）
+​> 修订：v1.2（2026-10-31）intent 空 env 不回落基线，与 A8 的确定性要求对齐
 > 修订：v1.1（2026-10-30）按首轮 QA 结论补充 env 缺失处理与 workspace 边界（A8/A9/A15）
 > 目标：`panguverse serve` 起一个本机 Web 应用，覆盖「概览 → 运行 → 报告 → 原子/包浏览 → 回归」闭环。
 > 硬约束：**零新增运行时依赖**（`pyproject.toml` 的 `dependencies` 保持 `[]`），无前端构建步骤（不引入 npm）。
@@ -119,7 +120,8 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 - `env` 必须为 `string → (string|number|bool)` 的对象；非对象 400。
 - **env 解析与缺失处理（QA 补充条款，v1.1）**：
   1. `mode=regression`：以「最近一次成功运行的 env」为基线（持久化在 `<workspace>/.panguverse/web/last_env.json`），请求里的 `env` 覆盖同名键。
-  2. `mode=demo|scenario|intent`：请求 `env` 优先；缺失时回落最近一次成功运行的 env。
+  2. `mode=demo|scenario`：请求 `env` 优先；缺失键回落最近一次成功运行的 env。
+  2b. `mode=intent`：**请求 env 为空时不回落基线**——意图模式必须显式给出目标，避免对着过期的旧目标静默运行；缺失变量直接 `failed`，并在 `error` 里提示「可在表单填写，或先跑一次 demo/scenario 生成基线」。请求给了部分 env 时，缺的键仍回落基线。（v1.2 拍板项）
   3. Web 层始终注入 `FS_ROOT=<workspace>/.panguverse/fs-demo`（除非请求显式给出）。**任何运行产生的文件不得写到 workspace 之外**。
   4. 规划完成后若计划里仍存在无法解析的 `${env.X}`，job 置 `failed`，`error` 明确写出 `缺少环境变量: X`（可多个），前端提示去运行表单填写。**禁止**产出「done 但全部用例 errored」的假成功。
 
