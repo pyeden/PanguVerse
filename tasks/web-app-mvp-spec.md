@@ -1,6 +1,7 @@
 # PanguVerse Web 版 MVP 规格（开发契约）
 
 > 依据：`docs/web-app-user-stories.md`（P0 故事 US-01…US-11）
+> 修订：v1.1（2026-10-30）按首轮 QA 结论补充 env 缺失处理与 workspace 边界（A8/A9/A15）
 > 目标：`panguverse serve` 起一个本机 Web 应用，覆盖「概览 → 运行 → 报告 → 原子/包浏览 → 回归」闭环。
 > 硬约束：**零新增运行时依赖**（`pyproject.toml` 的 `dependencies` 保持 `[]`），无前端构建步骤（不引入 npm）。
 
@@ -116,6 +117,11 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 - `mode=intent`：`intent` 非空字符串（trim 后长度 ≥ 1），否则 400。
 - `mode=regression`：忽略其余字段，走已沉淀回归库。
 - `env` 必须为 `string → (string|number|bool)` 的对象；非对象 400。
+- **env 解析与缺失处理（QA 补充条款，v1.1）**：
+  1. `mode=regression`：以「最近一次成功运行的 env」为基线（持久化在 `<workspace>/.panguverse/web/last_env.json`），请求里的 `env` 覆盖同名键。
+  2. `mode=demo|scenario|intent`：请求 `env` 优先；缺失时回落最近一次成功运行的 env。
+  3. Web 层始终注入 `FS_ROOT=<workspace>/.panguverse/fs-demo`（除非请求显式给出）。**任何运行产生的文件不得写到 workspace 之外**。
+  4. 规划完成后若计划里仍存在无法解析的 `${env.X}`，job 置 `failed`，`error` 明确写出 `缺少环境变量: X`（可多个），前端提示去运行表单填写。**禁止**产出「done 但全部用例 errored」的假成功。
 
 响应：`202 Accepted`
 
@@ -197,12 +203,13 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 | A5 | `POST /api/runs {"mode":"demo"}` → 轮询 `GET /api/jobs/{id}` | 终止态 `done`；`summary.passed == summary.total` 且 `total >= 7` |
 | A6 | `GET /api/runs` | 含刚才 run；`GET /api/runs/{id}/report.html` 200 且 `<html` 存在；`junit.xml` 带 attachment 头 |
 | A7 | `POST /api/runs {"mode":"scenario","scenario":"scenarios/api_smoke.yaml"}` | `done` 且 `plan.source`（从 run 详情读）为 spec/该场景 |
-| A8 | `POST /api/runs {"mode":"intent","intent":"检查健康状态"}`（无 LLM 密钥） | `done`；`report.meta.llm_used == false`；前端标注离线规划 |
-| A9 | `POST /api/runs {"mode":"regression"}` | `done`；用例来自回归库（`plan.source` 非 spec 且总数 > 0） |
+| A8 | `POST /api/runs {"mode":"intent","intent":"检查健康状态"}`（无 LLM 密钥） | 提供 `env.BASE_URL` 时 `done` 且 `summary.passed==summary.total`、`meta.llm_used==false`；**不提供**时 job 为 `failed` 且 `error` 含 `缺少环境变量: BASE_URL`（不得出现 done+errored 的假成功） |
+| A9 | `POST /api/runs {"mode":"regression"}`（**不传 env**，前置：已成功跑过 demo） | `done` 且 `summary.passed==summary.total>=7`；`plan.source` 为回归库来源；证明 env 已随库持久化 |
 | A10 | 非法输入：`{"mode":"x"}`、`{"mode":"scenario"}`、`{"mode":"intent","intent":"  "}`、`GET /api/runs/../../etc` | 分别 400/400/400/400 或 404，均为 JSON 错误体 |
 | A11 | 目录穿越：`GET /static/../../cli.py` | 404，绝不返回源码 |
 | A12 | 代理隔离：`HTTP_PROXY=http://127.0.0.1:1` 下跑 demo | 仍 `passed == total`（证明 US-11 修复生效） |
 | A13 | 前端 | 概览/运行/历史/详情/原子/包 六个视图可达；失败步骤显示 `message`+`expected`+`actual`；无空白错误块；控制台无未捕获异常 |
+| A15 | workspace 边界 | 跑完 demo + regression + intent 后，`git status --short` 仍为空；`find <workspace> -name snapshots -o -name archive` 全部位于 workspace 内 |
 | A14 | 零依赖 | `grep -A2 '^dependencies' pyproject.toml` 仍为空；`node_modules` 不存在 |
 
 ---
