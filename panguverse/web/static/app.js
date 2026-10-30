@@ -57,7 +57,8 @@
     atomFilters: { domain: '', tag: '', category: '' },
     job: { id: null, mode: '', data: null, error: null, lost: false, startedLocal: 0, poll: null, tick: null, dismiss: false },
     controller: null,
-    lastRoute: null
+    lastRoute: null,
+    bannerRoute: null
   };
 
   /* ================================================================== */
@@ -251,6 +252,8 @@
   function showBanner(kind, html, ttl) {
     var banner = $('#globalBanner');
     if (!banner) return;
+    // 横幅只在「产生它的视图」内有效：路由一变就收，避免带着上一页的成功提示
+    APP.bannerRoute = APP.lastRoute || null;
     banner.dataset.kind = kind || 'info';
     banner.innerHTML = '<div class="banner-body">' + html + '</div>' +
       '<button type="button" class="banner-close" data-banner-close aria-label="关闭提示">✕</button>';
@@ -263,6 +266,8 @@
 
   function hideBanner() {
     var banner = $('#globalBanner');
+    APP.bannerRoute = null;
+    clearTimeout(showBanner._t);
     if (banner) { banner.hidden = true; banner.innerHTML = ''; }
   }
 
@@ -381,6 +386,12 @@
     var status = j.lost ? 'failed' : (data ? data.status : 'queued');
     var map = phaseMap(data);
     var done = data && (data.status === 'done' || data.status === 'failed');
+    // 后端可能把「跑完但没通过」记为 done；此时按失败呈现，避免绿色「已完成」误导
+    var runFailed = !!(data && data.conclusion && data.conclusion.success === false);
+    var badgeHtml = jobBadge(status);
+    if (data && data.status === 'done' && runFailed) {
+      badgeHtml = '<span class="badge bad"><span class="glyph" aria-hidden="true">✕</span>未通过</span>';
+    }
 
     var pct = done ? 100 : Math.round((completedPhases(map) / PHASES.length) * 100);
     if (!done && pct < 4) pct = 4;
@@ -399,13 +410,15 @@
       resultHtml = '<div class="error-msg">任务失败：' + esc(data.error || '未提供失败原因（请查看服务端日志）') + '</div>';
     } else if (data && data.summary) {
       var s = data.summary;
+      var verdict = data.conclusion && data.conclusion.verdict;
       resultHtml = '<div class="job-result">' +
         '<span>通过 <b>' + esc(String(s.passed)) + '/' + esc(String(s.total)) + '</b></span>' +
         '<span>失败 <b>' + esc(String(s.failed)) + '</b></span>' +
         '<span>异常 <b>' + esc(String(s.errored)) + '</b></span>' +
         '<span>自愈 <b>' + esc(String(s.healed_cases)) + '</b></span>' +
         '<span>耗时 <b>' + esc(fmtMs(s.duration_ms)) + '</b></span>' +
-        '</div>';
+        '</div>' +
+        (verdict ? '<div class="job-result"><span>结论 <b>' + esc(verdict) + '</b></span></div>' : '');
     }
 
     var actions = '';
@@ -419,14 +432,14 @@
       '<div class="job-card" data-status="' + esc(status) + '">' +
         '<div class="job-head">' +
           '<span class="job-title">任务 · ' + esc(MODE_LABEL[j.mode] || j.mode || '未知模式') + '</span>' +
-          jobBadge(status) +
+          badgeHtml +
           '<span class="job-meta">' + esc(j.id || '') + '</span>' +
           '<span class="job-spacer"></span>' +
           '<span class="job-meta">已运行 <span data-elapsed="1">' + esc(elapsedText()) + '</span></span>' +
           '<button type="button" class="btn btn-icon" data-act="job-dismiss" aria-label="收起任务面板">✕</button>' +
         '</div>' +
         '<div class="phases" aria-label="阶段进度">' + phasesHtml + '</div>' +
-        '<div class="progress-track"><div class="progress-fill ' + (status === 'failed' ? 'failed' : (status === 'done' ? 'done' : '')) +
+        '<div class="progress-track"><div class="progress-fill ' + (status === 'failed' || runFailed ? 'failed' : (status === 'done' ? 'done' : '')) +
           '" style="width:' + pct + '%"></div></div>' +
         resultHtml +
         actions +
@@ -476,7 +489,9 @@
         try { localStorage.removeItem('pv.activeJob'); } catch (e) { /* noop */ }
         if (APP.job.notified !== id) {
           APP.job.notified = id;
-          if (data.status === 'done') {
+          if (data.status === 'done' && data.conclusion && data.conclusion.success === false) {
+            toast('任务未通过：' + (data.summary ? data.summary.passed + '/' + data.summary.total + ' 通过' : '存在失败用例'), 'error');
+          } else if (data.status === 'done') {
             toast('任务完成：' + (data.summary ? data.summary.passed + '/' + data.summary.total + ' 通过' : '已生成报告'), 'ok');
           } else {
             toast('任务失败：' + (data.error || '未提供原因'), 'error');
@@ -1762,6 +1777,7 @@
     if (APP.lastRoute !== routeKey && APP.lastRoute !== null) {
       try { window.scrollTo(0, 0); } catch (e) { /* noop */ }
     }
+    if (APP.bannerRoute && APP.bannerRoute !== routeKey) hideBanner();
     APP.lastRoute = routeKey;
 
     closeDrawer();
