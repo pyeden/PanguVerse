@@ -329,9 +329,11 @@ def test_regression_without_env_uses_persisted_baseline(web: WebClient, mock_api
     _demo_against(web, mock_api)
 
     last_env_path = web.workspace / ".panguverse" / "web" / "last_env.json"
-    last_env = json.loads(last_env_path.read_text(encoding="utf-8"))
+    baseline = json.loads(last_env_path.read_text(encoding="utf-8"))
+    last_env = baseline["env"]
     assert last_env["BASE_URL"] == mock_api.base_url
     assert last_env["API_USERNAME"] == "demo"
+    assert baseline["target"] is None  # 外部目标：回放 env 本身
     fs_root = Path(last_env["FS_ROOT"])
     assert fs_root == (web.workspace / ".panguverse" / "fs-demo").resolve()
     assert web.workspace.resolve() in fs_root.parents
@@ -355,11 +357,123 @@ def test_demo_without_env_persists_declared_baseline(web: WebClient) -> None:
     job = web.wait_job(data["job_id"])
     assert job["status"] == "done", job
 
-    last_env = json.loads(
+    baseline = json.loads(
         (web.workspace / ".panguverse" / "web" / "last_env.json").read_text(encoding="utf-8")
     )
-    assert last_env["BASE_URL"] == "http://127.0.0.1:8899"
-    assert Path(last_env["FS_ROOT"]).is_relative_to(web.workspace.resolve())
+    assert baseline["target"]["kind"] == "mock"
+    assert baseline["target"]["flaky_failures"] == 2
+    assert baseline["env"]["BASE_URL"] == "http://127.0.0.1:8899"
+    assert Path(baseline["env"]["FS_ROOT"]).is_relative_to(web.workspace.resolve())
+
+
+def test_demo_then_regression_without_external_service(web: WebClient) -> None:
+    """F1（A9）：干净工作区、不预启任何外部服务，demo → regression 都必须 7/7。"""
+    status, data = web.post_json("/api/runs", {"mode": "demo"})
+    assert status == 202, data
+    demo = web.wait_job(data["job_id"])
+    assert demo["status"] == "done", demo
+    assert demo["summary"]["passed"] == demo["summary"]["total"] >= 7, demo
+
+    baseline = json.loads(
+        (web.workspace / ".panguverse" / "web" / "last_env.json").read_text(encoding="utf-8")
+    )
+    assert baseline["target"]["kind"] == "mock"
+
+    status, data = web.post_json("/api/runs", {"mode": "regression"})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "done", job
+    assert job["summary"]["passed"] == job["summary"]["total"] >= 7, job
+
+    status, detail = web.get_json(f"/api/runs/{job['run_id']}")
+    assert status == 200
+    assert detail["plan"]["source"] == "memory"
+
+
+def test_env_credentials_are_masked_in_http(web: WebClient) -> None:
+    """F2（A16）：HTTP 不回吐 env 明文，键名保留、值为 ***。"""
+    status, data = web.post_json("/api/runs", {"mode": "demo"})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "done", job
+
+    status, _headers, body = web.request("GET", f"/api/runs/{job['run_id']}")
+    assert status == 200
+    text = body.decode("utf-8")
+    assert "demo123" not in text
+    assert '"API_PASSWORD"' in text
+    assert '"***"' in text
+
+    status, _headers, body = web.request("GET", f"/api/jobs/{job['job_id']}")
+    assert status == 200
+    assert "demo123" not in body.decode("utf-8")
+
+
+def test_env_mask_recurses_nested_structures() -> None:
+    from panguverse.web.api import mask_env_payload
+
+    payload = {
+        "a": {
+            "env": {
+                "API_PASSWORD": "secret-value",
+                "outer": {"API_TOKEN": "tok", "keep": "ok"},
+            },
+            "b": 1,
+        }
+    }
+    masked = mask_env_payload(payload)
+    env = masked["a"]["env"]
+    assert env["API_PASSWORD"] == "***"
+    assert env["outer"]["API_TOKEN"] == "***"
+    assert env["outer"]["keep"] == "ok"
+    assert masked["a"]["b"] == 1
+    # 不打码原对象（磁盘数据不被改写）
+    assert payload["a"]["env"]["API_PASSWORD"] == "secret-value"
+
+
+def test_all_errored_job_is_failed(web: WebClient) -> None:
+    """F3：全部用例 errored（目标不可达）→ failed，error 给首个原因，报告仍落盘。"""
+    status, data = web.post_json(
+        "/api/runs",
+        {"mode": "intent", "intent": "检查健康状态", "env": {"BASE_URL": "http://127.0.0.1:1"}},
+    )
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "failed", job
+    assert job["error"], job
+    assert job["run_id"], job  # 报告仍写出，便于诊断
+    status, detail = web.get_json(f"/api/runs/{job['run_id']}")
+    assert status == 200
+    assert detail["report"]["summary"]["errored"] >= 1
+
+
+def test_assertion_failure_stays_done(web: WebClient) -> None:
+    """F3 反向：真实断言失败（非全 errored）仍是 done + conclusion.success=false。"""
+    scenarios = web.workspace / "scenarios"
+    scenarios.mkdir(parents=True, exist_ok=True)
+    (scenarios / "cli_fail.yaml").write_text(
+        "name: 断言失败\n"
+        "cases:\n"
+        "  - id: fail_case\n"
+        "    name: 断言失败用例\n"
+        "    steps:\n"
+        "      - id: check\n"
+        "        use: assert_json\n"
+        "        with:\n"
+        "          path: value\n"
+        "          equals: 1\n"
+        "          source:\n"
+        "            value: 2\n",
+        encoding="utf-8",
+    )
+    status, data = web.post_json(
+        "/api/runs", {"mode": "scenario", "scenario": "scenarios/cli_fail.yaml"}
+    )
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "done", job
+    assert job["summary"]["failed"] == 1
+    assert job["conclusion"]["success"] is False
 
 
 def test_scenario_from_workspace(web: WebClient) -> None:

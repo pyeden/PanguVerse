@@ -115,24 +115,58 @@ def last_env_path(root: Path) -> Path:
     return root / WEB_STATE_REL / LAST_ENV_FILENAME
 
 
-def load_last_env(root: Path) -> dict[str, Any]:
-    """最近一次成功运行的解析后 env；缺失或损坏时返回空 dict（不阻断运行）。"""
+MOCK_TARGET_KIND = "mock"
+
+
+def _read_baseline(root: Path) -> dict[str, Any]:
+    """读取基线：v2 为 ``{version, env, target}``，兼容 v1 的扁平 env。"""
     try:
         data = json.loads(last_env_path(root).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
+        return {"env": {}, "target": None}
     if not isinstance(data, dict):
-        return {}
-    return {str(key): value for key, value in data.items() if isinstance(key, str)}
+        return {"env": {}, "target": None}
+    raw_env = data.get("env")
+    if isinstance(raw_env, dict):
+        target = data.get("target")
+        return {
+            "env": {str(key): value for key, value in raw_env.items() if isinstance(key, str)},
+            "target": target if isinstance(target, dict) else None,
+        }
+    return {
+        "env": {str(key): value for key, value in data.items() if isinstance(key, str)},
+        "target": None,
+    }
 
 
-def save_last_env(root: Path, env: dict[str, Any]) -> None:
-    """原子写入 ``.panguverse/web/last_env.json``（临时文件 + rename）。"""
+def load_last_env(root: Path) -> dict[str, Any]:
+    """最近一次成功运行的解析后 env；缺失或损坏时返回空 dict（不阻断运行）。"""
+    return _read_baseline(root)["env"]
+
+
+def load_last_target(root: Path) -> dict[str, Any] | None:
+    """基线的目标标记（如 ``{"kind": "mock", ...}``）；没有则 None。"""
+    return _read_baseline(root)["target"]
+
+
+def demo_target() -> dict[str, Any]:
+    """demo 基线的可复现标记：回归时按同样参数重新拉起进程内 mock。"""
+    return {"kind": MOCK_TARGET_KIND, "flaky_failures": 2, "token_ttl": 3600.0}
+
+
+def save_last_env(
+    root: Path, env: dict[str, Any], target: dict[str, Any] | None = None
+) -> None:
+    """原子写入 ``.panguverse/web/last_env.json``（v2：env + target）。"""
     if not env:
         return
     path = last_env_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps({key: env[key] for key in sorted(env)}, ensure_ascii=False, indent=2)
+    payload = json.dumps(
+        {"version": 2, "env": {key: env[key] for key in sorted(env)}, "target": target},
+        ensure_ascii=False,
+        indent=2,
+    )
     tmp = path.with_suffix(".tmp")
     tmp.write_text(payload, encoding="utf-8")
     with contextlib.suppress(OSError):
@@ -399,8 +433,10 @@ def _demo_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any
             exec_env = apply_fs_root(
                 root, {**baseline, "BASE_URL": api.base_url, **request.env}, request.env
             )
-            # 持久化基线时不能存临时 mock 端口（进程退出即失效）：改用场景声明的 env
+            # 持久化基线不能存临时 mock 端口：改存可复现标记，回归时按同样参数重新拉起
+            uses_mock = "BASE_URL" not in request.env
             persist_env = apply_fs_root(root, {**baseline, **suite.env, **request.env}, request.env)
+            persist_target = demo_target() if uses_mock else None
             return _execute(
                 axe,
                 job,
@@ -409,6 +445,7 @@ def _demo_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any
                 request_env=request.env,
                 baseline=baseline,
                 persist_env=persist_env,
+                persist_target=persist_target,
                 evolve=True,
                 regression=regression,
                 title="PanguVerse API 自动化测试闭环报告",
@@ -472,8 +509,35 @@ def _intent_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, A
 def _regression_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
         baseline = load_last_env(root)
-        exec_env = apply_fs_root(root, {**baseline, **request.env}, request.env)
+        target = load_last_target(root)
         axe = build_axe(root, enable_llm=False)
+
+        if target and target.get("kind") == MOCK_TARGET_KIND:
+            # 基线来自 demo：按同样参数重新拉起进程内 mock，绝不复用已失效的端口
+            mock = MockAPI(
+                flaky_failures=int(target.get("flaky_failures", 2)),
+                token_ttl=float(target.get("token_ttl", 3600.0)),
+            )
+            with mock:
+                exec_env = apply_fs_root(root, {**baseline, **request.env}, request.env)
+                if "BASE_URL" not in request.env:
+                    exec_env["BASE_URL"] = mock.base_url
+                plan = axe.regression_plan(env=exec_env)
+                return _execute(
+                    axe,
+                    job,
+                    plan=plan,
+                    root=root,
+                    request_env=exec_env,
+                    baseline=baseline,
+                    persist_env=baseline,  # 不把新的临时端口写回基线
+                    persist_target=target,
+                    evolve=False,
+                    regression=False,
+                    title="PanguVerse 回归复用报告",
+                )
+
+        exec_env = apply_fs_root(root, {**baseline, **request.env}, request.env)
         plan = axe.regression_plan(env=exec_env)
         return _execute(
             axe,
@@ -502,6 +566,7 @@ def _execute(
     request_env: dict[str, Any],
     baseline: dict[str, Any] | None = None,
     persist_env: dict[str, Any] | None = None,
+    persist_target: dict[str, Any] | None = None,
     evolve: bool,
     regression: bool,
     title: str,
@@ -564,9 +629,19 @@ def _execute(
     artifacts["plan"] = str(plan_path)
     job.add_phase("report", "ok", f"产物目录 {out_dir}")
 
+    # 全部用例 errored（目标不可达等基础设施问题）不算「测试没通过」：判 failed 并给首个原因
+    if summary["passed"] == 0 and summary["errored"] == summary["total"]:
+        reason = _first_error_message(run) or "全部用例执行错误（目标服务不可达？）"
+        job.fail(reason)
+        raise RuntimeError(reason)
+
     # 只有成功的运行才更新 env 基线（失败运行可能带着错误的地址/凭据）
     if summary["success"]:
-        save_last_env(root, persist_env if persist_env is not None else effective_env)
+        save_last_env(
+            root,
+            persist_env if persist_env is not None else effective_env,
+            persist_target,
+        )
 
     if evolve:
         evolved = axe.evolution.evolve(run, seal=True)
@@ -609,6 +684,25 @@ def _execute(
         "summary": _job_summary(run),
         "conclusion": _job_conclusion(run),
     }
+
+
+def _first_error_message(run: RunResult) -> str:
+    """取第一条失败/异常步骤的可读原因（供 job.error 使用，已打码）。"""
+    for case in run.cases:
+        error = case.error or {}
+        message = error.get("message") if isinstance(error, dict) else None
+        if message:
+            return sanitize_message(message)
+        for step in case.steps:
+            if step.status not in ("failed", "error"):
+                continue
+            step_error = step.error or {}
+            message = step_error.get("message") if isinstance(step_error, dict) else None
+            if message:
+                return sanitize_message(message)
+            if step.message:
+                return sanitize_message(step.message)
+    return ""
 
 
 def _heal_detail(run: RunResult) -> str:
@@ -738,6 +832,7 @@ def run_artifact(root: Path, run_id: str, filename: str) -> Path:
 
 __all__ = [
     "BUILTIN_SCENARIOS",
+    "MOCK_TARGET_KIND",
     "REPO_ROOT",
     "STATUS_BY_CODE",
     "ApiError",
@@ -745,6 +840,7 @@ __all__ = [
     "apply_fs_root",
     "build_axe",
     "default_fs_root",
+    "demo_target",
     "get_pack",
     "get_run",
     "list_atoms",
@@ -753,6 +849,7 @@ __all__ = [
     "list_scenarios",
     "llm_enabled",
     "load_last_env",
+    "load_last_target",
     "load_scenario_suite",
     "missing_env_vars",
     "pack_registry",

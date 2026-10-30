@@ -24,6 +24,9 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - 场景路径经 `realpath` 前缀校验，只能读 `<workspace>` 或仓库内置 `scenarios/`；越界 400。
 - `run_id` 必须匹配 `^[0-9a-f]{6,32}$`，杜绝用 `..` 拼接路径。
 - 错误消息经 `core/redact.py` 打码（不出现密钥/token/Cookie 原文）；`/api/status` 只回 `llm_enabled: bool`，绝不回显密钥值。
+- **HTTP 层 env 打码（v1.3，A16）**：所有 JSON 响应里的 `env` 子树（含 `plan.env`、`report.env`）中，键名命中
+  `(?i)(password|passwd|secret|token|api[_-]?key|credential)` 的值一律替换为 `***`，键名保留；递归处理嵌套 dict/list。
+  磁盘上的 `report.json` / `plan.json` / `last_env.json` 保持原样（回归回放依赖），只在 HTTP 出口打码。
 
 ## 2. 响应约定
 
@@ -96,7 +99,7 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `env` 必须是 `string → (string|number|bool)` 的对象。
 - `regression` 模式忽略其余字段，直接读沉淀库（不重新规划，`plan.source=memory`）。
 
-#### env 解析与持久化（v1.1）
+#### env 解析与持久化（v1.3）
 
 1. **基线**：每次「成功的运行」（产出报告且 `summary.success=true`）后，把解析后的 env 原子写入
    `<workspace>/.panguverse/web/last_env.json`（权限 `0600`）。
@@ -106,8 +109,20 @@ python -m panguverse serve --port 7788 --workspace . --no-open
    提供了部分 env 时，缺失的同名键仍会回落基线。
 3. **FS_ROOT 边界**：Web 层始终注入 `FS_ROOT=<workspace>/.panguverse/fs-demo`（请求显式给出 `FS_ROOT` 时尊重请求），
    保证快照/归档等文件绝不写到 workspace 之外（`packs/local_fs.py` 缺省回退 `Path.cwd()` 的行为保持不变）。
-4. **demo 的基线特例**：demo 用进程内临时 mock 做被测目标，端口随进程消失，因此持久化的是
-   **场景声明的 env**（如 `BASE_URL=http://127.0.0.1:8899`），不是临时 mock 地址。
+4. **demo 的基线可复现（v1.3）**：demo 用进程内临时 mock 做被测目标，端口随进程消失，所以基线**不写临时端口**，
+   而是写入目标标记：
+
+   ```json
+   {
+     "version": 2,
+     "env": {"BASE_URL": "http://127.0.0.1:8899", "API_USERNAME": "demo", "API_PASSWORD": "***", "...": "..."},
+     "target": {"kind": "mock", "flaky_failures": 2, "token_ttl": 3600.0}
+   }
+   ```
+
+   `mode=regression` 读到 `target.kind == "mock"` 时，按同样参数**自动拉起进程内 mock** 并把 `BASE_URL`
+   改写为新端口后再执行（不复用旧端口）；请求显式给 `BASE_URL` 时尊重请求。因此「干净工作区 → demo（无 env）
+   → regression（无 env）」不依赖任何外部服务即可 7/7。
 5. **缺变量即失败**：规划完成后扫描计划里仍未解析的 `${env.X}`（`|default:` 兜底的除外），
    若有则 job 置 `failed`，`error="缺少环境变量: BASE_URL"`（多个逗号分隔），`validate` 阶段标 `failed`，
    **不会**产出「done 但全部用例 errored」的假成功。
@@ -137,10 +152,10 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - 单 job 超时 300s（`PANGUVERSE_WEB_JOB_TIMEOUT` 可覆盖），超时置 `failed` + `error="timeout"`；异常置 `failed` + 打码后的一行消息。
 - 未知 `job_id` → 404。
 
-**状态语义（重要）**：`done` 表示「执行完成并写出了报告」，测试结果好坏看 `conclusion.success` / `summary`；
-`failed` 用于拿不到报告的情况（规划/校验异常、超时、**缺少必需环境变量**、回归库为空等）。
-缺少 env 属于规划期错误，一律 `failed`，不允许用 `done` 掩盖。
-这样失败运行仍可从详情页读到 `message/expected/actual`（US-06），也符合验收表 A7/A8/A9 对「done」的判定。
+**状态语义（重要）**：
+- `done`：执行完成并写出了报告。真实断言失败（有 `passed` 或 `failed > 0`）仍是 `done`，结果看 `conclusion.success`。
+- `failed`：拿不到可用结果——规划/校验异常、超时、缺少必需环境变量、回归库为空，以及
+  **`summary.passed == 0` 且全部用例 `errored`**（基础设施不可达不是「测试没通过」，v1.3）。此时 `error` 给首个错误原因。
 
 ### 运行历史与报告
 

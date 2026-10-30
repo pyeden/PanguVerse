@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,42 @@ from .service import ApiError
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 MAX_BODY_BYTES = 8 * 1024 * 1024
+
+#: env 里的敏感键名（保留键名，只把值打码，方便排障）
+_SENSITIVE_ENV_KEY_RE = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?key|credential)")
+MASK = "***"
+
+
+def _mask_env_value(value: Any) -> Any:
+    """把 env 子树里的敏感键值替换成 ``***``（递归处理嵌套 dict/list）。"""
+    if isinstance(value, dict):
+        return {
+            key: (
+                MASK
+                if isinstance(key, str) and _SENSITIVE_ENV_KEY_RE.search(key)
+                else _mask_env_value(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_env_value(item) for item in value]
+    return value
+
+
+def mask_env_payload(data: Any) -> Any:
+    """HTTP 层打码：任何 ``env`` 子树中的敏感值一律替换，磁盘文件保持原样。
+
+    递归处理整个响应体；只对键名命中 ``env`` 的子树做敏感键替换，
+    不会影响 ``/api/atoms`` 这类契约字段。
+    """
+    if isinstance(data, dict):
+        return {
+            key: (_mask_env_value(value) if key == "env" else mask_env_payload(value))
+            for key, value in data.items()
+        }
+    if isinstance(data, list):
+        return [mask_env_payload(item) for item in data]
+    return data
 
 
 @dataclass
@@ -32,7 +69,7 @@ class Response:
 
 
 def json_response(data: Any, status: int = 200, *, headers: dict[str, str] | None = None) -> Response:
-    body = json.dumps(data, ensure_ascii=False, default=str).encode("utf-8")
+    body = json.dumps(mask_env_payload(data), ensure_ascii=False, default=str).encode("utf-8")
     merged = {"Cache-Control": "no-store"}
     if headers:
         merged.update(headers)
