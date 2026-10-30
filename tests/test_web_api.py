@@ -409,6 +409,40 @@ def test_env_credentials_are_masked_in_http(web: WebClient) -> None:
     assert "demo123" not in body.decode("utf-8")
 
 
+def test_report_html_and_junit_do_not_leak_env(web: WebClient) -> None:
+    """F4（A16）：report.html / junit.xml 出口同样不得出现 env 明文，磁盘文件保持原值。"""
+    status, data = web.post_json("/api/runs", {"mode": "demo"})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "done", job
+    run_id = job["run_id"]
+
+    status, headers, body = web.request("GET", f"/api/runs/{run_id}/report.html")
+    assert status == 200
+    assert headers["Content-Type"].startswith("text/html")
+    html_text = body.decode("utf-8")
+    assert "<html" in html_text.lower()
+    assert "demo123" not in html_text
+    assert "API_PASSWORD" in html_text  # 键名保留
+    assert "***" in html_text  # 值已打码（<pre> 里的引号被 HTML 转义成 &quot;）
+
+    status, headers, body = web.request("GET", f"/api/runs/{run_id}/junit.xml")
+    assert status == 200
+    assert headers["Content-Type"].startswith("application/xml")
+    assert "demo123" not in body.decode("utf-8")
+
+    status, _headers, body = web.request("GET", f"/api/runs/{run_id}")
+    assert status == 200
+    payload = json.loads(body.decode("utf-8"))
+    assert payload["report"]["plan"]["env"]["API_PASSWORD"] == "***"
+    assert "demo123" not in body.decode("utf-8")
+
+    # 磁盘产物保持原样：回归回放依赖原始 env
+    run_dir = web.workspace / "runs" / run_id
+    assert "demo123" in (run_dir / "report.json").read_text(encoding="utf-8")
+    assert "demo123" in (run_dir / "report.html").read_text(encoding="utf-8")
+
+
 def test_env_mask_recurses_nested_structures() -> None:
     from panguverse.web.api import mask_env_payload
 

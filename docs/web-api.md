@@ -24,9 +24,12 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - 场景路径经 `realpath` 前缀校验，只能读 `<workspace>` 或仓库内置 `scenarios/`；越界 400。
 - `run_id` 必须匹配 `^[0-9a-f]{6,32}$`，杜绝用 `..` 拼接路径。
 - 错误消息经 `core/redact.py` 打码（不出现密钥/token/Cookie 原文）；`/api/status` 只回 `llm_enabled: bool`，绝不回显密钥值。
-- **HTTP 层 env 打码（v1.3，A16）**：所有 JSON 响应里的 `env` 子树（含 `plan.env`、`report.env`）中，键名命中
+- **HTTP 层 env 打码（v1.3/v1.4，A16）**：所有出口共用一个 `mask_env_payload`——JSON 响应里的 `env` 子树
+  （含 `plan.env`、`report.env`、`cases[].variables.env`）中，键名命中
   `(?i)(password|passwd|secret|token|api[_-]?key|credential)` 的值一律替换为 `***`，键名保留；递归处理嵌套 dict/list。
-  磁盘上的 `report.json` / `plan.json` / `last_env.json` 保持原样（回归回放依赖），只在 HTTP 出口打码。
+  `report.html` / `junit.xml` 不再直读磁盘原文，而是用打码后的报告数据**重新渲染**（HTML 标题沿用磁盘文件），
+  因此 `<pre>` 里的 JSON 仍是合法结构、只换值不换键。磁盘上的 `report.json` / `plan.json` / HTML / XML
+  与 `last_env.json` 保持原样（回归回放依赖），只在 HTTP 出口打码。
 
 ## 2. 响应约定
 
@@ -162,8 +165,10 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `GET /api/runs?limit=50` → `[{run_id, dir, started_at, finished_at, duration_ms, summary, conclusion, meta}]`；
   扫描 `<workspace>/runs/`，不存在时退回 `<workspace>/.panguverse/runs/`；忽略没有 `report.json` 的目录，按 `started_at` 倒序。
 - `GET /api/runs/{run_id}` → `{"report": <report.json 原文>, "plan": <plan.json 或 null>}`；`run_id` 非法 400。
-- `GET /api/runs/{run_id}/report.html` → `text/html; charset=utf-8`，磁盘原文。
-- `GET /api/runs/{run_id}/junit.xml` → `application/xml` + `Content-Disposition: attachment; filename="panguverse-<run_id>.xml"`。
+- `GET /api/runs/{run_id}/report.html` → `text/html; charset=utf-8`。**服务时按同一套 env 打码规则重新渲染**
+  （标题沿用磁盘文件），磁盘 HTML 保持原样（A16，v1.4）。
+- `GET /api/runs/{run_id}/junit.xml` → `application/xml` + `Content-Disposition: attachment; filename="panguverse-<run_id>.xml"`；
+  同样从打码后的报告数据重新渲染，避免 XML 旁路。
 - 文件缺失 → 404。
 
 ### 静态资源

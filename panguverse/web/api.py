@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import html as html_lib
 import json
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote
 
+from ..report import html_report, junit
 from . import service
 from .jobs import JobManager
 from .service import ApiError
@@ -160,19 +162,26 @@ class WebAPI:
                     return json_response(service.get_run(self.root, rest[0]))
                 if len(rest) == 2:
                     run_id, filename = rest
-                    if filename == "report.html":
-                        path_obj = service.run_artifact(self.root, run_id, "report.html")
+                    if filename in ("report.html", "junit.xml"):
+                        # 磁盘文件保持原样（回归回放依赖）；出口按同一套 mask_env_payload 重新渲染，
+                        # 避免 HTML/XML 旁路泄漏 env 明文（A16，v1.4）
+                        path_obj = service.run_artifact(self.root, run_id, filename)
+                        payload = service.get_run(self.root, run_id)
+                        report = mask_env_payload(payload["report"])
+                        plan_source = str((payload.get("plan") or {}).get("source") or "unknown")
+                        if filename == "report.html":
+                            title = _html_title(_read_text(path_obj))
+                            return Response(
+                                status=200,
+                                body=html_report.render(report, title=title).encode("utf-8"),
+                                content_type="text/html; charset=utf-8",
+                                headers={"Cache-Control": "no-store"},
+                            )
                         return Response(
                             status=200,
-                            body=_read_bytes(path_obj),
-                            content_type="text/html; charset=utf-8",
-                            headers={"Cache-Control": "no-store"},
-                        )
-                    if filename == "junit.xml":
-                        path_obj = service.run_artifact(self.root, run_id, "junit.xml")
-                        return Response(
-                            status=200,
-                            body=_read_bytes(path_obj),
+                            body=junit.render(report, suite_name=f"PanguVerse.{plan_source}").encode(
+                                "utf-8"
+                            ),
                             content_type="application/xml",
                             headers={
                                 "Cache-Control": "no-store",
@@ -212,6 +221,21 @@ def _read_bytes(path: Path) -> bytes:
         return path.read_bytes()
     except OSError as exc:
         raise ApiError("internal_error", f"读取文件失败: {exc}") from exc
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ApiError("internal_error", f"读取文件失败: {exc}") from exc
+
+
+def _html_title(disk_html: str) -> str:
+    """沿用磁盘 HTML 的标题，保证打码副本与原文只差敏感值。"""
+    match = re.search(r"<title>(.*?)</title>", disk_html, re.S)
+    if not match:
+        return "PanguVerse API 自动化测试报告"
+    return html_lib.unescape(match.group(1).strip())
 
 
 __all__ = [
