@@ -1,7 +1,8 @@
 # PanguVerse Web 版 MVP 规格（开发契约）
 
 > 依据：`docs/web-app-user-stories.md`（P0 故事 US-01…US-11）
-​> 修订：v1.3（2026-10-31）demo 基线可复现（mock 标记）、全 errored 判 failed、API 层 env 打码（A16）
+​> 修订：v1.4（2026-10-31）A16 扩展到 report.html/junit.xml（QA 发现 HTML 旁路）
+> 修订：v1.3（2026-10-31）demo 基线可复现（mock 标记）、全 errored 判 failed、API 层 env 打码（A16）
 > 修订：v1.2（2026-10-31）intent 空 env 不回落基线，与 A8 的确定性要求对齐
 > 修订：v1.1（2026-10-30）按首轮 QA 结论补充 env 缺失处理与 workspace 边界（A8/A9/A15）
 > 目标：`panguverse serve` 起一个本机 Web 应用，覆盖「概览 → 运行 → 报告 → 原子/包浏览 → 回归」闭环。
@@ -209,7 +210,7 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 | A7 | `POST /api/runs {"mode":"scenario","scenario":"scenarios/api_smoke.yaml"}` | `done` 且 `plan.source`（从 run 详情读）为 spec/该场景 |
 | A8 | `POST /api/runs {"mode":"intent","intent":"检查健康状态"}`（无 LLM 密钥） | 提供 `env.BASE_URL` 时 `done` 且 `summary.passed==summary.total`、`meta.llm_used==false`；**不提供**时 job 为 `failed` 且 `error` 含 `缺少环境变量: BASE_URL`（不得出现 done+errored 的假成功） |
 | A9 | `POST /api/runs {"mode":"regression"}`（**不传 env**，前置：已成功跑过 demo；**不得**依赖外部 8899 服务） | `done` 且 `summary.passed==summary.total>=7`；`plan.source` 为回归库来源 |
-| A16 | 凭据不外泄 | `GET /api/runs/{id}` 与 `/api/jobs/{id}` 的响应正文中不出现 `demo123` 等 env 明文值；键名仍在，值为 `***` |
+| A16 | 凭据不外泄（**所有** HTTP 出口） | `GET /api/runs/{id}`、`/api/jobs/{id}`、`/api/runs/{id}/report.html`、`/api/runs/{id}/junit.xml` 的响应正文中均不出现 `demo123` 等 env 明文值；JSON 中键名仍在、值为 `***` |
 | A10 | 非法输入：`{"mode":"x"}`、`{"mode":"scenario"}`、`{"mode":"intent","intent":"  "}`、`GET /api/runs/../../etc` | 分别 400/400/400/400 或 404，均为 JSON 错误体 |
 | A11 | 目录穿越：`GET /static/../../cli.py` | 404，绝不返回源码 |
 | A12 | 代理隔离：`HTTP_PROXY=http://127.0.0.1:1` 下跑 demo | 仍 `passed == total`（证明 US-11 修复生效） |
@@ -222,7 +223,7 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 ## 7. 安全与打码
 
 - 报告中所有输出走 `core/redact.py` 打码；API 错误消息不得包含密钥、token、Cookie 原文。
-- **新增（v1.3，QA F2）**：`GET /api/runs/{id}`、`/api/jobs/{id}` 等任何 HTTP 响应里，`env` / `plan.env` 中键名命中 `(?i)(password|passwd|secret|token|api[_-]?key|credential)` 的值必须打码为 `***`（保留键名，便于排障）；磁盘上的 `report.json`/`plan.json` 保持原样（本地文件、回归回放依赖），但不得经 HTTP 原样回吐。
+- **新增（v1.3/v1.4，QA F2/F4）**：`GET /api/runs/{id}`、`/api/jobs/{id}`、`report.html`、`junit.xml` 等**任何** HTTP 响应里，`env` / `plan.env` 中键名命中 `(?i)(password|passwd|secret|token|api[_-]?key|credential)` 的值必须打码为 `***`（保留键名，便于排障）；磁盘上的 `report.json`/`plan.json` 保持原样（本地文件、回归回放依赖），但不得经 HTTP 原样回吐。
 - **新增（v1.3）**：`summary.passed == 0` 且全部用例 `errored` 时，job 必须为 `failed`（基础设施不可达不是「测试没通过」），`error` 给出首个错误原因。
 - `GET /api/runs/{id}` 返回的 `report.json` 已是打码后的结构，**不要**重新从原始运行对象序列化。
 - 默认只绑 `127.0.0.1`；不实现认证（MVP），文档须写明不可暴露公网。
