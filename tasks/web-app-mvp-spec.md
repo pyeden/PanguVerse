@@ -162,8 +162,8 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 
 - `GET /api/runs?limit=50` → `[{run_id, dir, started_at, finished_at, duration_ms, summary, conclusion, meta}]`，扫描 `<workspace>/runs/`（若不存在则退回 `<workspace>/.panguverse/runs/`），按 `started_at` 倒序，忽略无 `report.json` 的目录。
 - `GET /api/runs/{run_id}` → `{"report": <report.json 原文>, "plan": <plan.json 或 null>}`；`run_id` 必须匹配 `^[0-9a-f]{6,32}$`，否则 400。
-- `GET /api/runs/{run_id}/report.html` → `text/html; charset=utf-8`，直接回磁盘文件。
-- `GET /api/runs/{run_id}/junit.xml` → `application/xml` + `Content-Disposition: attachment; filename="panguverse-<run_id>.xml"`。
+- `GET /api/runs/{run_id}/report.html` → `text/html; charset=utf-8`；**不再直读磁盘原文**：读 `report.json` → 统一 `mask_env_payload()` 打码 → 内存重渲染返回（磁盘文件保持原值供回放）。v1.4 修正。
+- `GET /api/runs/{run_id}/junit.xml` → `application/xml` + `Content-Disposition: attachment; filename="panguverse-<run_id>.xml"`；同样走打码后重渲染路径。
 - 文件缺失 → 404 `not_found`。
 
 ### 3.8 静态资源
