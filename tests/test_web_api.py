@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import threading
 import time
 import urllib.error
@@ -20,6 +21,8 @@ from panguverse.http.client import HttpClient, HttpRequest, is_loopback_url
 from panguverse.web.api import WebAPI
 from panguverse.web.jobs import FAILED, JobManager
 from panguverse.web.server import PanguverseHTTPServer
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 测试进程自己也必须直连回环地址（macOS 系统代理会劫持 127.0.0.1 请求）
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -303,18 +306,60 @@ def test_demo_run_produces_report_artifacts(web: WebClient, demo_run: dict[str, 
     assert run_id in headers["Content-Disposition"]
 
 
-def test_regression_uses_sealed_library(web: WebClient, demo_run: dict[str, Any]) -> None:
-    assert demo_run["status"] == "done"
+def _demo_against(web: WebClient, mock_api, **overrides: Any) -> dict[str, Any]:
+    """跑 demo，并把 BASE_URL 指向外部 mock（模拟「有真实被测服务」的场景）。"""
+    env = {
+        "BASE_URL": mock_api.base_url,
+        "API_USERNAME": "demo",
+        "API_PASSWORD": "demo123",
+        "MAX_LATENCY_MS": 3000,
+        "FS_ROOT": str(web.workspace / ".panguverse" / "fs-demo"),
+    }
+    env.update(overrides)
+    status, data = web.post_json("/api/runs", {"mode": "demo", "env": env})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "done", job
+    assert job["summary"]["passed"] == job["summary"]["total"] >= 7, job
+    return job
+
+
+def test_regression_without_env_uses_persisted_baseline(web: WebClient, mock_api) -> None:
+    """P1-1：demo 成功后 env 落盘；regression 不带 env 也能 7/7。"""
+    _demo_against(web, mock_api)
+
+    last_env_path = web.workspace / ".panguverse" / "web" / "last_env.json"
+    last_env = json.loads(last_env_path.read_text(encoding="utf-8"))
+    assert last_env["BASE_URL"] == mock_api.base_url
+    assert last_env["API_USERNAME"] == "demo"
+    fs_root = Path(last_env["FS_ROOT"])
+    assert fs_root == (web.workspace / ".panguverse" / "fs-demo").resolve()
+    assert web.workspace.resolve() in fs_root.parents
+
     status, data = web.post_json("/api/runs", {"mode": "regression"})
     assert status == 202, data
     job = web.wait_job(data["job_id"])
     assert job["status"] == "done", job
-    assert job["summary"]["total"] > 0
+    assert job["summary"]["passed"] == job["summary"]["total"] >= 7, job
 
     status, detail = web.get_json(f"/api/runs/{job['run_id']}")
     assert status == 200
-    assert detail["plan"]["source"] != "spec"
-    assert detail["plan"]["case_count"] > 0
+    assert detail["plan"]["source"] == "memory"
+    assert detail["plan"]["case_count"] >= 7
+
+
+def test_demo_without_env_persists_declared_baseline(web: WebClient) -> None:
+    """demo 的临时 mock 端口不能进基线：落盘的是场景声明的 BASE_URL。"""
+    status, data = web.post_json("/api/runs", {"mode": "demo"})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "done", job
+
+    last_env = json.loads(
+        (web.workspace / ".panguverse" / "web" / "last_env.json").read_text(encoding="utf-8")
+    )
+    assert last_env["BASE_URL"] == "http://127.0.0.1:8899"
+    assert Path(last_env["FS_ROOT"]).is_relative_to(web.workspace.resolve())
 
 
 def test_scenario_from_workspace(web: WebClient) -> None:
@@ -346,18 +391,82 @@ def test_scenario_from_workspace(web: WebClient) -> None:
     assert detail["plan"]["source"] == "spec"
 
 
-def test_intent_runs_offline_without_keys(web: WebClient, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_intent_with_env_runs_offline(
+    web: WebClient, mock_api, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.delenv("PANGUVERSE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    status, data = web.post_json("/api/runs", {"mode": "intent", "intent": "检查健康状态"})
+    status, data = web.post_json(
+        "/api/runs",
+        {"mode": "intent", "intent": "检查健康状态", "env": {"BASE_URL": mock_api.base_url}},
+    )
     assert status == 202, data
     job = web.wait_job(data["job_id"])
     assert job["status"] == "done", job
+    assert job["summary"]["passed"] == job["summary"]["total"] == 1, job
 
     status, detail = web.get_json(f"/api/runs/{job['run_id']}")
     assert status == 200
     assert detail["report"]["meta"]["llm_used"] is False
     assert detail["report"]["plan"]["source"] == "rules"
+
+
+def test_intent_without_env_fails_with_missing_variable(web: WebClient) -> None:
+    """P1-2：没有基线也没有 env → failed + 明确缺变量，禁止 done/errored 假成功。"""
+    assert not (web.workspace / ".panguverse" / "web" / "last_env.json").exists()
+    status, data = web.post_json("/api/runs", {"mode": "intent", "intent": "检查健康状态"})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "failed", job
+    assert "缺少环境变量: BASE_URL" in (job["error"] or "")
+    assert job["run_id"] == ""
+    validate = [p for p in job["phases"] if p["name"] == "validate"]
+    assert validate and validate[-1]["status"] == "failed"
+    assert not (web.workspace / "runs").exists() or not list((web.workspace / "runs").iterdir())
+
+
+def _repo_untracked() -> set[str]:
+    result = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line for line in result.stdout.splitlines() if line.strip()}
+
+
+def test_intent_without_env_fails_even_after_successful_run(web: WebClient, mock_api) -> None:
+    """A8 的确定性要求：即使已有 env 基线，空 env 的 intent 也必须 failed（不静默继承目标）。"""
+    _demo_against(web, mock_api)
+    assert (web.workspace / ".panguverse" / "web" / "last_env.json").exists()
+
+    status, data = web.post_json("/api/runs", {"mode": "intent", "intent": "检查健康状态"})
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "failed", job
+    assert "缺少环境变量: BASE_URL" in (job["error"] or "")
+
+
+def test_workspace_boundary_no_repo_pollution(web: WebClient, mock_api) -> None:
+    """A15：demo + regression + intent 跑完后仓库根目录不新增未跟踪文件。"""
+    before = _repo_untracked()
+    _demo_against(web, mock_api)
+
+    status, data = web.post_json("/api/runs", {"mode": "regression"})
+    assert status == 202, data
+    assert web.wait_job(data["job_id"])["status"] == "done"
+
+    status, data = web.post_json(
+        "/api/runs",
+        {"mode": "intent", "intent": "检查健康状态", "env": {"BASE_URL": mock_api.base_url}},
+    )
+    assert status == 202, data
+    assert web.wait_job(data["job_id"])["status"] == "done"
+
+    assert _repo_untracked() == before
+    for name in ("snapshots", "archive"):
+        assert not (REPO_ROOT / name).exists(), f"{name} 被写到仓库根目录"
 
 
 # --------------------------------------------------------------------------- #

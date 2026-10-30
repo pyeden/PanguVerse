@@ -96,6 +96,22 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `env` 必须是 `string → (string|number|bool)` 的对象。
 - `regression` 模式忽略其余字段，直接读沉淀库（不重新规划，`plan.source=memory`）。
 
+#### env 解析与持久化（v1.1）
+
+1. **基线**：每次「成功的运行」（产出报告且 `summary.success=true`）后，把解析后的 env 原子写入
+   `<workspace>/.panguverse/web/last_env.json`（权限 `0600`）。
+2. **优先级**：`mode=regression` 以基线 env 为准、请求 `env` 覆盖同名键；`demo|scenario` 请求 `env` 优先、
+   缺失的同名键回落基线。执行时最终 env = 基线 < 计划 `env`（含场景 `env`） < 请求 `env`。
+   `mode=intent` 在**请求未提供任何 env** 时**不**回落基线（A8 要求确定性失败，且静默继承上一个目标可能打错服务）；
+   提供了部分 env 时，缺失的同名键仍会回落基线。
+3. **FS_ROOT 边界**：Web 层始终注入 `FS_ROOT=<workspace>/.panguverse/fs-demo`（请求显式给出 `FS_ROOT` 时尊重请求），
+   保证快照/归档等文件绝不写到 workspace 之外（`packs/local_fs.py` 缺省回退 `Path.cwd()` 的行为保持不变）。
+4. **demo 的基线特例**：demo 用进程内临时 mock 做被测目标，端口随进程消失，因此持久化的是
+   **场景声明的 env**（如 `BASE_URL=http://127.0.0.1:8899`），不是临时 mock 地址。
+5. **缺变量即失败**：规划完成后扫描计划里仍未解析的 `${env.X}`（`|default:` 兜底的除外），
+   若有则 job 置 `failed`，`error="缺少环境变量: BASE_URL"`（多个逗号分隔），`validate` 阶段标 `failed`，
+   **不会**产出「done 但全部用例 errored」的假成功。
+
 ### `GET /api/jobs` / `GET /api/jobs/{job_id}`
 
 最近 20 条（`created_at` 倒序）。字段：
@@ -122,7 +138,8 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - 未知 `job_id` → 404。
 
 **状态语义（重要）**：`done` 表示「执行完成并写出了报告」，测试结果好坏看 `conclusion.success` / `summary`；
-`failed` 只用于拿不到报告的情况（规划/校验异常、超时、回归库为空等）。
+`failed` 用于拿不到报告的情况（规划/校验异常、超时、**缺少必需环境变量**、回归库为空等）。
+缺少 env 属于规划期错误，一律 `failed`，不允许用 `done` 掩盖。
 这样失败运行仍可从详情页读到 `message/expected/actual`（US-06），也符合验收表 A7/A8/A9 对「done」的判定。
 
 ### 运行历史与报告
@@ -162,5 +179,6 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - job 表在内存：重启后历史只剩磁盘上的 `runs/`（前端应回退到「运行历史」）。
 - 无认证、无多用户、无 SSE：仅本机单人使用；实时进度靠轮询。
 - 长任务只做「超时标记」，不强行中断执行线程（线程为 daemon，进程退出即回收）。
-- 回归库/经验库是工作区文件，多个 job 并发写入时以「最后写入」为准（单用户场景可接受）。
+- 回归库/经验库/`last_env.json` 是工作区文件，多个 job 并发写入时以「最后写入」为准（单用户场景可接受）。
+- env 基线只在「成功运行」后更新；一次失败的运行不会污染下一次的默认目标。
 - `panguverse/http/client.py` 之外的出站调用（如 `axe/llm.py` 的 LLM 请求）不在此次修复范围内。

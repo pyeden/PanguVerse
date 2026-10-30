@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -99,6 +100,73 @@ def build_axe(root: Path, *, enable_llm: bool = True) -> PanguAxe:
 def llm_enabled() -> bool:
     """只判断密钥是否存在，**绝不回显任何值**。"""
     return any((os.environ.get(key) or "").strip() for key in LLM_ENV_KEYS)
+
+
+# --------------------------------------------------------------------------- #
+# env 基线与 workspace 边界
+# --------------------------------------------------------------------------- #
+WEB_STATE_REL = Path(".panguverse") / "web"
+LAST_ENV_FILENAME = "last_env.json"
+FS_ROOT_REL = Path(".panguverse") / "fs-demo"
+_ENV_TOKEN_RE = re.compile(r"\$\{env\.([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}")
+
+
+def last_env_path(root: Path) -> Path:
+    return root / WEB_STATE_REL / LAST_ENV_FILENAME
+
+
+def load_last_env(root: Path) -> dict[str, Any]:
+    """最近一次成功运行的解析后 env；缺失或损坏时返回空 dict（不阻断运行）。"""
+    try:
+        data = json.loads(last_env_path(root).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(key): value for key, value in data.items() if isinstance(key, str)}
+
+
+def save_last_env(root: Path, env: dict[str, Any]) -> None:
+    """原子写入 ``.panguverse/web/last_env.json``（临时文件 + rename）。"""
+    if not env:
+        return
+    path = last_env_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({key: env[key] for key in sorted(env)}, ensure_ascii=False, indent=2)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(payload, encoding="utf-8")
+    with contextlib.suppress(OSError):
+        tmp.chmod(0o600)  # 基线里可能含密码/token，只给当前用户读
+    tmp.replace(path)
+
+
+def default_fs_root(root: Path) -> str:
+    return str((root / FS_ROOT_REL).resolve())
+
+
+def apply_fs_root(root: Path, env: dict[str, Any], request_env: dict[str, Any]) -> dict[str, Any]:
+    """Web 层始终把 FS_ROOT 钉在 workspace 内（请求显式给出则尊重）。
+
+    ``packs/local_fs.py`` 在缺 FS_ROOT 时会回退到 ``Path.cwd()``，会污染仓库；
+    这里在 Web 层兜住边界，不改包语义。
+    """
+    resolved = dict(env)
+    if "FS_ROOT" not in (request_env or {}):
+        resolved["FS_ROOT"] = default_fs_root(root)
+    return resolved
+
+
+def missing_env_vars(plan: TestPlan, env: dict[str, Any]) -> list[str]:
+    """扫描计划里仍未解析的 ``${env.X}``（带 ``|default:`` 的视为可兜底）。"""
+    text = json.dumps(plan.to_dict(), ensure_ascii=False, default=str)
+    missing: set[str] = set()
+    for name, filters in _ENV_TOKEN_RE.findall(text):
+        if "default:" in filters:
+            continue
+        value = env.get(name)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            missing.add(name)
+    return sorted(missing)
 
 
 # --------------------------------------------------------------------------- #
@@ -324,14 +392,23 @@ def _demo_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any
 
     def task(job: Job) -> dict[str, Any]:
         suite = merge_suites(collect_suites(BUILTIN_SCENARIOS))
+        baseline = load_last_env(root)
         axe = build_axe(root, enable_llm=not request.no_llm)
         with MockAPI(flaky_failures=2) as api:
-            env = {"BASE_URL": api.base_url, **request.env}
+            # 执行目标是进程内临时 mock：请求 env > 基线 > mock 地址
+            exec_env = apply_fs_root(
+                root, {**baseline, "BASE_URL": api.base_url, **request.env}, request.env
+            )
+            # 持久化基线时不能存临时 mock 端口（进程退出即失效）：改用场景声明的 env
+            persist_env = apply_fs_root(root, {**baseline, **suite.env, **request.env}, request.env)
             return _execute(
                 axe,
                 job,
-                plan=axe.plan(PlanRequest(suite=suite, env=env)),
-                request_env=env,
+                plan=axe.plan(PlanRequest(suite=suite, env=exec_env)),
+                root=root,
+                request_env=request.env,
+                baseline=baseline,
+                persist_env=persist_env,
                 evolve=True,
                 regression=regression,
                 title="PanguVerse API 自动化测试闭环报告",
@@ -344,13 +421,17 @@ def _scenario_task(
     root: Path, request: RunRequest, suite: TestSuite
 ) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
+        baseline = load_last_env(root)
+        request_env = apply_fs_root(root, dict(request.env), request.env)
         axe = build_axe(root, enable_llm=not request.no_llm)
-        plan = axe.plan(PlanRequest(suite=suite, env=dict(request.env)))
+        plan = axe.plan(PlanRequest(suite=suite, env=request_env))
         return _execute(
             axe,
             job,
             plan=plan,
-            request_env=dict(request.env),
+            root=root,
+            request_env=request_env,
+            baseline=baseline,
             evolve=True,
             regression=bool(request.regression),
             title="PanguVerse 场景运行报告",
@@ -361,11 +442,15 @@ def _scenario_task(
 
 def _intent_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
+        # 空 env 的 intent 不回落到基线：A8 要求「不提供 env → failed + 缺少环境变量」，
+        # 静默继承上一次目标也可能把测试打到错误的服务上。给了部分 env 时才用基线补齐。
+        baseline = load_last_env(root) if request.env else {}
+        request_env = apply_fs_root(root, dict(request.env), request.env)
         axe = build_axe(root, enable_llm=not request.no_llm)
         plan = axe.plan(
             PlanRequest(
                 intent=request.intent,
-                env=dict(request.env),
+                env=request_env,
                 allow_llm=not request.no_llm,
             )
         )
@@ -373,7 +458,9 @@ def _intent_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, A
             axe,
             job,
             plan=plan,
-            request_env=dict(request.env),
+            root=root,
+            request_env=request_env,
+            baseline=baseline,
             evolve=True,
             regression=bool(request.regression),
             title="PanguVerse 意图运行报告",
@@ -384,13 +471,17 @@ def _intent_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, A
 
 def _regression_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
+        baseline = load_last_env(root)
+        exec_env = apply_fs_root(root, {**baseline, **request.env}, request.env)
         axe = build_axe(root, enable_llm=False)
-        plan = axe.regression_plan(env=dict(request.env))
+        plan = axe.regression_plan(env=exec_env)
         return _execute(
             axe,
             job,
             plan=plan,
-            request_env=dict(request.env),
+            root=root,
+            request_env=exec_env,
+            baseline=baseline,
             evolve=False,
             regression=False,
             title="PanguVerse 回归复用报告",
@@ -407,7 +498,10 @@ def _execute(
     job: Job,
     *,
     plan: TestPlan,
+    root: Path,
     request_env: dict[str, Any],
+    baseline: dict[str, Any] | None = None,
+    persist_env: dict[str, Any] | None = None,
     evolve: bool,
     regression: bool,
     title: str,
@@ -417,10 +511,21 @@ def _execute(
         job.add_phase("plan", "failed", "计划中没有任何用例")
         raise RuntimeError("计划中没有任何用例（回归库为空？先跑一次成功的闭环）")
 
+    # 执行 env = 最近一次成功基线 < 计划 env < 请求 env；FS_ROOT 永远钉在 workspace 内
+    effective_env = apply_fs_root(
+        root, {**(baseline or {}), **plan.env, **request_env}, request_env
+    )
+    missing = missing_env_vars(plan, effective_env)
+    if missing:
+        message = "缺少环境变量: " + ", ".join(missing)
+        job.add_phase("validate", "failed", message)
+        # 先落 failed，避免线程层再包一层异常类名前缀；禁止「done 但全 errored」的假成功
+        job.fail(message)
+        raise RuntimeError(message)
+
     axe.validate(plan)
     job.add_phase("validate", "ok", "计划校验通过")
 
-    effective_env = {**plan.env, **request_env}
     run_id = uuid.uuid4().hex[:12]
     job.set_run_id(run_id)
     run = axe.executor.run(
@@ -458,6 +563,10 @@ def _execute(
     )
     artifacts["plan"] = str(plan_path)
     job.add_phase("report", "ok", f"产物目录 {out_dir}")
+
+    # 只有成功的运行才更新 env 基线（失败运行可能带着错误的地址/凭据）
+    if summary["success"]:
+        save_last_env(root, persist_env if persist_env is not None else effective_env)
 
     if evolve:
         evolved = axe.evolution.evolve(run, seal=True)
@@ -633,7 +742,9 @@ __all__ = [
     "STATUS_BY_CODE",
     "ApiError",
     "RunRequest",
+    "apply_fs_root",
     "build_axe",
+    "default_fs_root",
     "get_pack",
     "get_run",
     "list_atoms",
@@ -641,7 +752,9 @@ __all__ = [
     "list_runs",
     "list_scenarios",
     "llm_enabled",
+    "load_last_env",
     "load_scenario_suite",
+    "missing_env_vars",
     "pack_registry",
     "parse_run_request",
     "registry",
@@ -650,6 +763,7 @@ __all__ = [
     "run_artifact",
     "runs_root",
     "safe_message",
+    "save_last_env",
     "status_payload",
     "submit_run",
     "validate_run_id",
