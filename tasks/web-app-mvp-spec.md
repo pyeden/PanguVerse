@@ -1,7 +1,8 @@
 # PanguVerse Web 版 MVP 规格（开发契约）
 
 > 依据：`docs/web-app-user-stories.md`（P0 故事 US-01…US-11）
-​> 修订：v1.2（2026-10-31）intent 空 env 不回落基线，与 A8 的确定性要求对齐
+​> 修订：v1.3（2026-10-31）demo 基线可复现（mock 标记）、全 errored 判 failed、API 层 env 打码（A16）
+> 修订：v1.2（2026-10-31）intent 空 env 不回落基线，与 A8 的确定性要求对齐
 > 修订：v1.1（2026-10-30）按首轮 QA 结论补充 env 缺失处理与 workspace 边界（A8/A9/A15）
 > 目标：`panguverse serve` 起一个本机 Web 应用，覆盖「概览 → 运行 → 报告 → 原子/包浏览 → 回归」闭环。
 > 硬约束：**零新增运行时依赖**（`pyproject.toml` 的 `dependencies` 保持 `[]`），无前端构建步骤（不引入 npm）。
@@ -123,6 +124,7 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
   2. `mode=demo|scenario`：请求 `env` 优先；缺失键回落最近一次成功运行的 env。
   2b. `mode=intent`：**请求 env 为空时不回落基线**——意图模式必须显式给出目标，避免对着过期的旧目标静默运行；缺失变量直接 `failed`，并在 `error` 里提示「可在表单填写，或先跑一次 demo/scenario 生成基线」。请求给了部分 env 时，缺的键仍回落基线。（v1.2 拍板项）
   3. Web 层始终注入 `FS_ROOT=<workspace>/.panguverse/fs-demo`（除非请求显式给出）。**任何运行产生的文件不得写到 workspace 之外**。
+  3b. `mode=demo` 的基线必须可复现：demo 用进程内 mock 时，基线里不能只写场景声明的 `BASE_URL`，必须写入 `target: {"kind": "mock", ...}` 标记；`mode=regression` 遇到该标记时**自动拉起同款进程内 mock** 并改写 `BASE_URL`，不得回放到已失效的端口。（v1.3 拍板，QA F1）
   4. 规划完成后若计划里仍存在无法解析的 `${env.X}`，job 置 `failed`，`error` 明确写出 `缺少环境变量: X`（可多个），前端提示去运行表单填写。**禁止**产出「done 但全部用例 errored」的假成功。
 
 响应：`202 Accepted`
@@ -206,7 +208,8 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 | A6 | `GET /api/runs` | 含刚才 run；`GET /api/runs/{id}/report.html` 200 且 `<html` 存在；`junit.xml` 带 attachment 头 |
 | A7 | `POST /api/runs {"mode":"scenario","scenario":"scenarios/api_smoke.yaml"}` | `done` 且 `plan.source`（从 run 详情读）为 spec/该场景 |
 | A8 | `POST /api/runs {"mode":"intent","intent":"检查健康状态"}`（无 LLM 密钥） | 提供 `env.BASE_URL` 时 `done` 且 `summary.passed==summary.total`、`meta.llm_used==false`；**不提供**时 job 为 `failed` 且 `error` 含 `缺少环境变量: BASE_URL`（不得出现 done+errored 的假成功） |
-| A9 | `POST /api/runs {"mode":"regression"}`（**不传 env**，前置：已成功跑过 demo） | `done` 且 `summary.passed==summary.total>=7`；`plan.source` 为回归库来源；证明 env 已随库持久化 |
+| A9 | `POST /api/runs {"mode":"regression"}`（**不传 env**，前置：已成功跑过 demo；**不得**依赖外部 8899 服务） | `done` 且 `summary.passed==summary.total>=7`；`plan.source` 为回归库来源 |
+| A16 | 凭据不外泄 | `GET /api/runs/{id}` 与 `/api/jobs/{id}` 的响应正文中不出现 `demo123` 等 env 明文值；键名仍在，值为 `***` |
 | A10 | 非法输入：`{"mode":"x"}`、`{"mode":"scenario"}`、`{"mode":"intent","intent":"  "}`、`GET /api/runs/../../etc` | 分别 400/400/400/400 或 404，均为 JSON 错误体 |
 | A11 | 目录穿越：`GET /static/../../cli.py` | 404，绝不返回源码 |
 | A12 | 代理隔离：`HTTP_PROXY=http://127.0.0.1:1` 下跑 demo | 仍 `passed == total`（证明 US-11 修复生效） |
@@ -219,6 +222,8 @@ panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
 ## 7. 安全与打码
 
 - 报告中所有输出走 `core/redact.py` 打码；API 错误消息不得包含密钥、token、Cookie 原文。
+- **新增（v1.3，QA F2）**：`GET /api/runs/{id}`、`/api/jobs/{id}` 等任何 HTTP 响应里，`env` / `plan.env` 中键名命中 `(?i)(password|passwd|secret|token|api[_-]?key|credential)` 的值必须打码为 `***`（保留键名，便于排障）；磁盘上的 `report.json`/`plan.json` 保持原样（本地文件、回归回放依赖），但不得经 HTTP 原样回吐。
+- **新增（v1.3）**：`summary.passed == 0` 且全部用例 `errored` 时，job 必须为 `failed`（基础设施不可达不是「测试没通过」），`error` 给出首个错误原因。
 - `GET /api/runs/{id}` 返回的 `report.json` 已是打码后的结构，**不要**重新从原始运行对象序列化。
 - 默认只绑 `127.0.0.1`；不实现认证（MVP），文档须写明不可暴露公网。
 
