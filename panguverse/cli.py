@@ -170,6 +170,13 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--dir", default=".", help="项目目录")
     init.set_defaults(handler=_cmd_init)
 
+    serve = sub.add_parser("serve", help="启动本机 Web 界面（零依赖，默认只监听 127.0.0.1）")
+    serve.add_argument("--host", default="127.0.0.1", help="监听地址（默认 127.0.0.1）")
+    serve.add_argument("--port", type=int, default=7788, help="监听端口（默认 7788）")
+    serve.add_argument("--workspace", default=".", help="工作区目录（默认当前目录）")
+    serve.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    serve.set_defaults(handler=_cmd_serve)
+
     return parser
 
 
@@ -436,6 +443,17 @@ def _cmd_init(args: argparse.Namespace) -> int:
     print(f"✅ 初始化完成\n  工作区: {workspace.root}\n  示例场景: {sample}")
     print("  下一步: panguverse demo e2e")
     return EXIT_OK
+
+
+def _cmd_serve(args: argparse.Namespace) -> int:
+    from .web.server import serve as serve_web
+
+    return serve_web(
+        host=args.host,
+        port=args.port,
+        workspace=args.workspace,
+        open_browser=not args.no_open,
+    )
 
 
 def _cmd_demo_e2e(args: argparse.Namespace) -> int:

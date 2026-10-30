@@ -129,12 +129,18 @@ class HttpClient:
         self.backend = backend
         self._session = _requests.Session() if self.backend == "requests" else None
         self._opener = None
+        self._direct_opener = None
         if self.backend == "urllib":
             import http.cookiejar
             import urllib.request as _urlreq
 
             jar = http.cookiejar.CookieJar()
+            # 默认 opener 尊重系统/环境代理；direct opener 用空 ProxyHandler 彻底关闭代理，
+            # 专供回环地址（127.0.0.1 / localhost / ::1）——macOS 系统代理会把本机请求打到 502。
             self._opener = _urlreq.build_opener(_urlreq.HTTPCookieProcessor(jar))
+            self._direct_opener = _urlreq.build_opener(
+                _urlreq.ProxyHandler({}), _urlreq.HTTPCookieProcessor(jar)
+            )
 
     # ------------------------------------------------------------------ #
     def send(self, request: HttpRequest) -> HttpResponse:
@@ -160,6 +166,10 @@ class HttpClient:
             "allow_redirects": request.allow_redirects,
             "verify": request.verify,
         }
+        if is_loopback_url(url):
+            # 逐请求关闭代理（显式 None 覆盖 env 代理）：不改 session.trust_env，
+            # 因为那是会话级状态，会顺带影响同一会话里后续的非回环请求。
+            kwargs["proxies"] = {"http": None, "https": None}
         if request.json is not None:
             kwargs["json"] = request.json
         elif request.form is not None:
@@ -206,7 +216,10 @@ class HttpClient:
             req.add_header(key, str(value))
 
         started = time.perf_counter()
-        opener = self._opener or _urlreq.build_opener()
+        if is_loopback_url(url):
+            opener = self._direct_opener or _urlreq.build_opener(_urlreq.ProxyHandler({}))
+        else:
+            opener = self._opener or _urlreq.build_opener()
         try:
             with opener.open(req, timeout=timeout) as resp:
                 content = resp.read()
@@ -302,3 +315,32 @@ def _truncate(text: str, limit: int = 4000) -> str:
 def backend_name() -> str:
     """当前使用的传输后端（报告里会展示，便于排查环境差异）。"""
     return "requests" if _requests is not None else "urllib"
+
+
+_LOOPBACK_HOSTS = {"localhost", "::1", "0.0.0.0", "127.0.0.1"}
+
+
+def is_loopback_url(url: str) -> bool:
+    """判断 URL 是否指向本机（回环）。
+
+    覆盖 ``127.0.0.0/8``、``::1``、``localhost`` 与 ``*.localhost``、``0.0.0.0``。
+    这类请求必须直连：macOS 的系统代理会把它们也劫持走，导致 502。
+    """
+    if not url:
+        return False
+    try:
+        host = urlsplit(url).hostname or ""
+    except ValueError:
+        return False
+    host = host.strip().strip("[]").lower()
+    if not host:
+        return False
+    if host in _LOOPBACK_HOSTS or host.endswith(".localhost"):
+        return True
+    try:
+        import ipaddress
+
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return address.is_loopback or str(address) == "0.0.0.0"

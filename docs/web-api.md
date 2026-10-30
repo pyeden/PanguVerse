@@ -1,0 +1,166 @@
+# PanguVerse Web API（MVP）
+
+> 契约来源：`tasks/web-app-mvp-spec.md` §3–§7；用户故事：`docs/web-app-user-stories.md`。
+> 实现：`panguverse/web/`（纯标准库，零运行时依赖）。
+
+## 1. 启动
+
+```bash
+panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
+# 等价
+python -m panguverse serve --port 7788 --workspace . --no-open
+```
+
+- 默认 `127.0.0.1:7788`，工作区默认当前目录；监听成功会打印 `http://127.0.0.1:<port>/`。
+- `--no-open` 不尝试拉起浏览器（CI/测试用）。
+- `--host 0.0.0.0` 允许但会打印警告：**无认证，仅限可信网络**。
+- 所有产物落 `<workspace>/runs/<run_id>/`（`report.json` / `report.html` / `junit.xml` / `plan.json`），与 CLI 完全一致。
+- 前端资源缺失时 `GET /` 返回 `503` + `前端资源未就绪…` 文案，API 不受影响。
+
+### 安全边界（务必阅读）
+
+- **只监听本机**：默认 `127.0.0.1`；本服务没有认证、没有会话，**不可暴露公网**。
+- 静态资源走白名单（`index.html` / `app.js` / `style.css` / `favicon.svg`），并用 `realpath` 前缀校验兜底，`/static/../../cli.py` 一律 404。
+- 场景路径经 `realpath` 前缀校验，只能读 `<workspace>` 或仓库内置 `scenarios/`；越界 400。
+- `run_id` 必须匹配 `^[0-9a-f]{6,32}$`，杜绝用 `..` 拼接路径。
+- 错误消息经 `core/redact.py` 打码（不出现密钥/token/Cookie 原文）；`/api/status` 只回 `llm_enabled: bool`，绝不回显密钥值。
+
+## 2. 响应约定
+
+- 统一前缀 `/api`，响应 `application/json; charset=utf-8`，`Cache-Control: no-store`。
+- 错误体固定：
+
+```json
+{"error": {"code": "not_found", "message": "run 不存在"}}
+```
+
+| code | HTTP | 场景 |
+| --- | --- | --- |
+| `bad_request` | 400 | 参数缺失/非法、路径越界、run_id 非法 |
+| `not_found` | 404 | run/job/pack/静态资源不存在 |
+| `conflict` | 409 | 预留（MVP 不排队，未启用） |
+| `internal_error` | 500 | 未捕获异常（消息已打码） |
+
+## 3. 接口
+
+### `GET /api/status`
+
+```json
+{
+  "workspace": "/abs/path",
+  "atoms": 24,
+  "packs": 3,
+  "regression_count": 7,
+  "lessons_count": 1,
+  "llm_enabled": false,
+  "http_backend": "requests",
+  "scenarios": 4,
+  "version": "0.1.0"
+}
+```
+
+### `GET /api/atoms?domain=&tag=&category=`
+
+返回数组，元素与 `panguverse atoms --json` 完全一致（`name/description/category/domain/inputs/outputs/input_ports/output_ports/required/tags/aliases/version/effects`…）。服务端过滤，无匹配返回 `[]`。
+
+### `GET /api/packs` / `GET /api/packs/{name}`
+
+列表项：`{name, version, domain, builtin, description, atom_count, capabilities, semantics}`。
+详情额外带 `atoms: [name…]` 与 `manifest`（`packs manifest` 里该包的原始 dict）。未知包 404。
+
+### `GET /api/scenarios`
+
+```json
+[{"id": "scenarios/api_smoke.yaml", "name": "API 冒烟与鉴权", "source": "builtin", "cases": 3}]
+```
+
+- `source=workspace`（`<workspace>/scenarios/**`）优先，其余 `builtin`；工作区文件 id 为工作区相对路径，可直接回传给 `POST /api/runs`。
+- 解析失败的文件仍会返回，带 `"error": "<原因>"` 且 `cases: 0`。
+
+### `POST /api/runs` → `202`
+
+```json
+{"mode": "demo | scenario | intent | regression",
+ "scenario": "scenarios/api_smoke.yaml",
+ "intent": "检查健康状态并验证登录下单",
+ "env": {"BASE_URL": "http://127.0.0.1:8899"},
+ "regression": true,
+ "no_llm": false}
+```
+
+返回 `{"job_id": "3f9c1a2b7d4e", "status": "queued"}`。校验：
+
+- `mode` 必须是四种之一；`demo` 忽略 `scenario`/`intent`（等同 `demo e2e`，默认含回归复用，`regression=false` 可关）。
+- `scenario` 模式必填且路径必须落在工作区/内置场景内（越界 400）。
+- `intent` 模式要求 trim 后非空。
+- `env` 必须是 `string → (string|number|bool)` 的对象。
+- `regression` 模式忽略其余字段，直接读沉淀库（不重新规划，`plan.source=memory`）。
+
+### `GET /api/jobs` / `GET /api/jobs/{job_id}`
+
+最近 20 条（`created_at` 倒序）。字段：
+
+```json
+{
+  "job_id": "3f9c1a2b7d4e",
+  "mode": "demo",
+  "status": "queued | running | done | failed",
+  "created_at": 1793367213.7,
+  "started_at": 1793367213.7,
+  "finished_at": null,
+  "elapsed_ms": 500,
+  "run_id": "4afa3f90737e",
+  "phases": [{"name": "plan", "status": "ok", "detail": "7 个用例来自 spec"}],
+  "summary": {"total": 7, "passed": 7, "failed": 0, "errored": 0, "skipped": 0, "healed_cases": 1, "duration_ms": 140},
+  "conclusion": {"verdict": "通过", "success": true, "exit_code": 0},
+  "error": null
+}
+```
+
+- 内存态，服务重启即清空；`phases` 在执行中逐步追加：`plan → validate → execute → heal → report → evolve → regression`。
+- 单 job 超时 300s（`PANGUVERSE_WEB_JOB_TIMEOUT` 可覆盖），超时置 `failed` + `error="timeout"`；异常置 `failed` + 打码后的一行消息。
+- 未知 `job_id` → 404。
+
+**状态语义（重要）**：`done` 表示「执行完成并写出了报告」，测试结果好坏看 `conclusion.success` / `summary`；
+`failed` 只用于拿不到报告的情况（规划/校验异常、超时、回归库为空等）。
+这样失败运行仍可从详情页读到 `message/expected/actual`（US-06），也符合验收表 A7/A8/A9 对「done」的判定。
+
+### 运行历史与报告
+
+- `GET /api/runs?limit=50` → `[{run_id, dir, started_at, finished_at, duration_ms, summary, conclusion, meta}]`；
+  扫描 `<workspace>/runs/`，不存在时退回 `<workspace>/.panguverse/runs/`；忽略没有 `report.json` 的目录，按 `started_at` 倒序。
+- `GET /api/runs/{run_id}` → `{"report": <report.json 原文>, "plan": <plan.json 或 null>}`；`run_id` 非法 400。
+- `GET /api/runs/{run_id}/report.html` → `text/html; charset=utf-8`，磁盘原文。
+- `GET /api/runs/{run_id}/junit.xml` → `application/xml` + `Content-Disposition: attachment; filename="panguverse-<run_id>.xml"`。
+- 文件缺失 → 404。
+
+### 静态资源
+
+- `GET /` → `panguverse/web/static/index.html`；资源未就绪 → 503（文案「前端资源未就绪」）。
+- `GET /static/<file>` → 只允许白名单四个文件，其余 404。
+- 前端使用 hash 路由（`#/overview`），因此只有 `/overview`、`/run`、`/history`、`/runs/<id>`、`/atoms`、`/packs` 这些深链会回落到 `index.html`；
+  其余未知路径返回 **JSON 404**。这是对规格 §3.8 的收紧：避免 `/etc`、`/cli.py` 之类路径被 200 掩盖（A10/A11 要求 404）。
+
+## 4. 代理直连（US-11）
+
+`panguverse/http/client.py` 对回环目标（`127.0.0.0/8`、`::1`、`localhost`、`*.localhost`、`0.0.0.0`）**强制直连**：
+
+- `requests`：逐请求传 `proxies={"http": None, "https": None}`（不改 `session.trust_env`，避免污染同一会话的后续非回环请求）；
+- `urllib`：使用 `build_opener(ProxyHandler({}), HTTPCookieProcessor(jar))` 的专用 opener；
+- 非回环地址行为不变，仍尊重系统/环境代理。
+
+因此 `HTTP_PROXY=http://127.0.0.1:1`（必死端口）+ `NO_PROXY` 清空时，demo 仍 `7/7`，`pytest` 无需 `NO_PROXY` 全绿。
+
+## 5. 任务模型与并发
+
+- `panguverse/web/jobs.py`：`dict[job_id] → Job` + `threading.Lock`；每个 job 一条 daemon 线程，不排队（MVP 单用户，前端限制一次只发一个）。
+- 执行顺序与 `PanguAxe.loop` 一致：`plan → validate → executor.run（含重试/自愈）→ report（json/html/junit + plan.json）→ evolve → regression`。
+- 报告一律经 `panguverse.report.write_all` 生成（内部按密钥打码）；`/api/runs/{id}` 直接回磁盘 `report.json`，不重新序列化。
+
+## 6. 已知限制
+
+- job 表在内存：重启后历史只剩磁盘上的 `runs/`（前端应回退到「运行历史」）。
+- 无认证、无多用户、无 SSE：仅本机单人使用；实时进度靠轮询。
+- 长任务只做「超时标记」，不强行中断执行线程（线程为 daemon，进程退出即回收）。
+- 回归库/经验库是工作区文件，多个 job 并发写入时以「最后写入」为准（单用户场景可接受）。
+- `panguverse/http/client.py` 之外的出站调用（如 `axe/llm.py` 的 LLM 请求）不在此次修复范围内。
