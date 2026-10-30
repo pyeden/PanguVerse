@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>PanguVerse 控制台</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f1520'/%3E%3Cpath d='M9 22l7-14 7 14z' fill='none' stroke='%2338bdf8' stroke-width='2.2' stroke-linejoin='round'/%3E%3Cpath d='M12.5 18h7' stroke='%2338bdf8' stroke-width='2.2' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<a class="skip-link" href="#view">跳到主内容</a>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
+        <path d="M7 24L16 6l9 18z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>
+        <path d="M11.5 19h9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>
+      </svg>
+      <span class="brand-text">
+        <strong>PanguVerse</strong>
+        <small>自动化编排控制台</small>
+      </span>
+    </div>
+
+    <nav class="nav" aria-label="主导航">
+      <a href="#/overview" data-nav="overview"><span class="nav-glyph" aria-hidden="true">◫</span>概览</a>
+      <a href="#/run" data-nav="run"><span class="nav-glyph" aria-hidden="true">▶</span>运行</a>
+      <a href="#/history" data-nav="history"><span class="nav-glyph" aria-hidden="true">≡</span>运行历史</a>
+      <a href="#/atoms" data-nav="atoms"><span class="nav-glyph" aria-hidden="true">◇</span>原子库</a>
+      <a href="#/packs" data-nav="packs"><span class="nav-glyph" aria-hidden="true">▤</span>领域包</a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div class="llm-badge" id="llmBadge">
+        <span class="llm-dot" id="llmDot" aria-hidden="true"></span>
+        <span id="llmText">规划方式读取中…</span>
+      </div>
+      <dl class="side-facts" id="sideFacts">
+        <div><dt>工作区</dt><dd id="factWorkspace" class="mono">—</dd></div>
+        <div><dt>版本</dt><dd id="factVersion" class="mono">—</dd></div>
+      </dl>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="crumb" id="crumb">概览</div>
+      <div class="topbar-right">
+        <span class="conn" id="connState" data-state="pending"><span class="conn-dot" aria-hidden="true"></span>连接中…</span>
+      </div>
+    </header>
+
+    <div class="banner" id="globalBanner" role="alert" hidden></div>
+
+    <main id="view" tabindex="-1" aria-live="polite"></main>
+  </div>
+</div>
+
+<div id="jobDock" class="job-dock" aria-live="polite" hidden></div>
+<div id="drawerRoot" class="drawer-root" hidden></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
