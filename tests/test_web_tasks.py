@@ -7,8 +7,10 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import stat
+import subprocess
 import threading
 import time
 import urllib.error
@@ -20,6 +22,8 @@ import pytest
 
 from panguverse.web.api import WebAPI
 from panguverse.web.server import PanguverseHTTPServer
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 # 测试进程自己也必须直连回环地址（macOS 系统代理会劫持 127.0.0.1 请求）
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
@@ -100,8 +104,12 @@ def create_task(web: Client, **overrides: Any) -> dict[str, Any]:
     return task
 
 
+def tasks_dir(web: Client) -> Path:
+    return web.workspace / ".panguverse" / "tasks"
+
+
 def task_file(web: Client, task_id: str) -> Path:
-    return web.workspace / "tasks" / f"{task_id}.json"
+    return tasks_dir(web) / f"{task_id}.json"
 
 
 # --------------------------------------------------------------------------- #
@@ -116,7 +124,9 @@ def test_a17_create_task_writes_private_file(web: Client) -> None:
     path = task_file(web, task["task_id"])
     assert path.is_file()
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
-    assert stat.S_IMODE((web.workspace / "tasks").stat().st_mode) == 0o700
+    assert stat.S_IMODE(tasks_dir(web).stat().st_mode) == 0o700
+    # 不落到 <workspace>/tasks：仓库里那是契约文档目录，--workspace . 时会撞名
+    assert not (web.workspace / "tasks").exists()
 
     disk = json.loads(path.read_text(encoding="utf-8"))
     assert disk["task_id"] == task["task_id"]
@@ -124,7 +134,7 @@ def test_a17_create_task_writes_private_file(web: Client) -> None:
     assert task["env"]["API_PASSWORD"] == "***"  # HTTP 出口打码
 
     # 目录里只允许 id 形如 t-xxxx 的任务文件；临时文件不会残留
-    assert {p.name for p in (web.workspace / "tasks").iterdir()} == {path.name}
+    assert {p.name for p in tasks_dir(web).iterdir()} == {path.name}
 
 
 def test_a17_task_id_is_server_generated(web: Client) -> None:
@@ -133,7 +143,7 @@ def test_a17_task_id_is_server_generated(web: Client) -> None:
     assert task["created_at"] != 1.0
     assert task["last_status"] == ""
     # 客户端指定的 id 不得被当成路径使用
-    assert not (web.workspace / "tasks" / "t-deadbeef.json").exists()
+    assert not task_file(web, "t-deadbeef").exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -473,7 +483,7 @@ def test_a24_create_rejects_invalid_bodies(web: Client, payload: dict[str, Any])
     status, body = web.json("POST", "/api/tasks", payload)
     assert status == 400, body
     assert_error(body, "bad_request")
-    assert not (web.workspace / "tasks").exists() or not list((web.workspace / "tasks").iterdir())
+    assert not tasks_dir(web).exists() or not list(tasks_dir(web).iterdir())
 
 
 @pytest.mark.parametrize(
@@ -513,3 +523,49 @@ def test_a24_create_does_not_accept_traversal_scenario(web: Client) -> None:
     )
     assert status == 400
     assert_error(body, "bad_request")
+
+
+# --------------------------------------------------------------------------- #
+# 存储位置：只在 <workspace>/.panguverse/tasks 落盘（repo 根为 workspace 也不脏 git）
+# --------------------------------------------------------------------------- #
+def _untracked_files() -> set[str]:
+    completed = subprocess.run(
+        ["git", "ls-files", "--others", "--exclude-standard"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return {line for line in completed.stdout.splitlines() if line}
+
+
+def test_task_storage_is_git_clean_under_repo_workspace() -> None:
+    """仓库里 ``tasks/`` 是契约文档目录：任务必须落到被 gitignore 的 .panguverse 下。"""
+    before = _untracked_files()
+    api = WebAPI(REPO_ROOT)
+    response = api.handle(
+        "POST",
+        "/api/tasks",
+        "",
+        json.dumps(
+            {"name": "repo 根工作区任务", "mode": "demo", "env": {"API_PASSWORD": "demo123"}}
+        ).encode("utf-8"),
+    )
+    assert response.status == 201, response.body
+    task_id = json.loads(response.body)["task_id"]
+    path = REPO_ROOT / ".panguverse" / "tasks" / f"{task_id}.json"
+    try:
+        assert path.is_file()
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+        assert stat.S_IMODE(path.parent.stat().st_mode) == 0o700
+        # 绝不写进仓库的契约文档目录
+        assert not (REPO_ROOT / "tasks" / f"{task_id}.json").exists()
+        after = _untracked_files()
+        assert after == before
+        assert not any(item.startswith(".panguverse") for item in after)
+    finally:
+        with contextlib.suppress(OSError):
+            path.unlink()
+        for directory in (path.parent, path.parent.parent):
+            with contextlib.suppress(OSError):
+                directory.rmdir()  # 只删空目录；仓库已有 .panguverse 时保持原状

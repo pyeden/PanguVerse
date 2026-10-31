@@ -173,9 +173,12 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 
 ### 任务定义 CRUD（v2.0，契约 `tasks/web-tasks-crud-spec.md` §2–§3.3）
 
-任务定义落盘 `<workspace>/tasks/<task_id>.json`：目录 `0700`、文件 `0600`（含 env 明文，与 `last_env.json`
-同策略），写文件走「临时文件 + `os.replace`」原子替换。`task_id` **只能由服务端生成**（`^t-[0-9a-f]{6,12}$`），
-所有路径拼接前都先做格式校验，客户端字符串永远不会被当成路径。
+任务定义落盘 `<workspace>/.panguverse/tasks/<task_id>.json`（目录 `0700`、文件 `0600`，含 env 明文，
+与 `last_env.json` 同策略），写文件走「临时文件 + `os.replace`」原子替换；目录不存在时自动创建。
+**刻意不放 `<workspace>/tasks/`**：仓库里 `tasks/` 是契约文档目录，`--workspace .` 时会撞名，
+而 `.panguverse/` 已被 `.gitignore` 覆盖，运行时数据集中存放。
+`task_id` **只能由服务端生成**（`^t-[0-9a-f]{6,12}$`），所有路径拼接前都先做格式校验，
+客户端字符串永远不会被当成路径。
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -223,7 +226,8 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 | 其他 string/number/bool | 覆盖/新增 |
 
 **运行任务**：`POST /api/tasks/{id}/run` 等价于用任务里保存的 `mode/scenario/intent/env/regression/no_llm`
-提交 `/api/runs`；body 里的 `env` 只作用于本次运行，**不写回任务定义**。运行结束后服务端只在 job 进入
+提交 `/api/runs`；body 里的 `env` 只作用于本次运行，**不写回任务定义**。覆盖值里 `"***"`、`""`、`null`
+均表示「本次不覆盖该键」（与 PATCH 的占位语义一致，表单留空不会把已保存的值清空）。运行结束后服务端只在 job 进入
 `done`/`failed` 时回写 `last_run_id` / `last_status`（不改 `updated_at`，也不动其它字段；回调在状态切终态时同步执行，
 客户端看到终态即可读到最新值）。
 
@@ -242,8 +246,11 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 }
 ```
 
-- 数据源是磁盘 `report.json` 的 `meta.run_config`/`meta.plan_source` 与 `plan.json`（后者未打码，是重跑的真实基线）；
-  旧运行没有 `run_config` 时按 `plan_source` 推断，无法判定则 `mode="scenario"`，并在 `plan_source` 写明实际来源。
+- 数据源是磁盘 `report.json` 的 `meta.run_config`/`meta.plan_source` 与 `plan.json`（后者未打码，是重跑的真实基线）。
+  `meta.run_config` 是 v2.0 的 **additive** 字段（mode/scenario/intent/regression/no_llm/uses_mock），旧字段语义未变。
+- **旧报告的退化规则**：没有 `run_config` 时按 `plan_source` 推断（`memory` → `regression`，其余 → `scenario`），
+  并在 `plan_source` 里返回实际来源；旧 demo 运行的 `mode` 无法还原时会得到 `scenario` 且缺 `scenario`，
+  rerun 直接 400（不猜目标，避免打错服务）。
 - `env` 在 JSON 出口统一走 `mask_env_payload`（键名保留、敏感值 `***`）。
 - `error` 取**第一个非 passed 步骤**（用例名 + 步骤名 + `message/expected/actual`，消息再经 `jobs.sanitize_message`（`core/redact.py`）打码）；
   全部通过时为 `null`。缺字段给默认值，不返回 500。

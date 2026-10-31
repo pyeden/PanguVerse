@@ -21,6 +21,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+STATE_DIRNAME = ".panguverse"
 TASKS_DIRNAME = "tasks"
 TASK_ID_RE = re.compile(r"^t-[0-9a-f]{6,12}$")
 DIR_MODE = 0o700
@@ -48,7 +49,11 @@ class TaskStoreError(Exception):
 # 路径
 # --------------------------------------------------------------------------- #
 def tasks_dir(root: Path) -> Path:
-    return Path(root) / TASKS_DIRNAME
+    """``<workspace>/.panguverse/tasks``：运行时数据集中在已被 gitignore 的目录下。
+
+    不能放 ``<workspace>/tasks``：仓库里 ``tasks/`` 是契约文档目录，``--workspace .`` 时会撞名。
+    """
+    return Path(root) / STATE_DIRNAME / TASKS_DIRNAME
 
 
 def new_task_id() -> str:
@@ -71,6 +76,11 @@ def task_path(root: Path, task_id: str) -> Path:
 # 读写
 # --------------------------------------------------------------------------- #
 def _ensure_dir(directory: Path) -> None:
+    parent = directory.parent
+    if not parent.exists():
+        parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            parent.chmod(DIR_MODE)
     directory.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         directory.chmod(DIR_MODE)
@@ -168,6 +178,7 @@ def _as_float(value: Any) -> float:
 
 __all__ = [
     "FILE_MODE",
+    "STATE_DIRNAME",
     "TASKS_DIRNAME",
     "TASK_ID_RE",
     "TaskStoreError",
