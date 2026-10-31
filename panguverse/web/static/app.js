@@ -47,6 +47,8 @@
   var ROUTE_TITLE = {
     overview: '概览',
     run: '运行',
+    tasks: '任务',
+    'task-form': '任务',
     history: '运行历史',
     'run-detail': '运行详情',
     atoms: '原子库',
@@ -62,7 +64,9 @@
     job: { id: null, mode: '', data: null, error: null, lost: false, startedLocal: 0, poll: null, tick: null, dismiss: false },
     controller: null,
     lastRoute: null,
-    bannerRoute: null
+    bannerRoute: null,
+    pendingBanner: null,
+    tasksReload: null
   };
 
   /* ================================================================== */
@@ -211,6 +215,8 @@
 
   function apiGet(path) { return request(path); }
   function apiPost(path, body) { return request(path, { method: 'POST', body: body }); }
+  function apiPatch(path, body) { return request(path, { method: 'PATCH', body: body }); }
+  function apiDelete(path) { return request(path, { method: 'DELETE' }); }
 
   function errorHint(err) {
     if (!err) return '';
@@ -275,6 +281,13 @@
     if (banner) { banner.hidden = true; banner.innerHTML = ''; }
   }
 
+  /* 先切路由、再展示横幅：避免横幅带上一条路由的 key 被自动收掉 */
+  function goRoute(hash, banner) {
+    APP.pendingBanner = banner || null;
+    if (location.hash === hash) render();
+    else location.hash = hash;
+  }
+
   function toast(message, kind, ttl) {
     var host = $('#toasts');
     if (!host) return;
@@ -289,11 +302,15 @@
     }, ttl || (kind === 'error' ? 6000 : 3200));
   }
 
-  var drawerState = { opener: null };
+  var drawerState = { opener: null, ctrl: null };
 
   function openDrawer(titleHtml, bodyHtml, opener) {
     var root = $('#drawerRoot');
     if (!root) return;
+    if (drawerState.ctrl) {
+      try { drawerState.ctrl.abort(); } catch (e) { /* noop */ }
+    }
+    drawerState.ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
     drawerState.opener = opener || document.activeElement;
     root.hidden = false;
     root.innerHTML = '' +
@@ -318,6 +335,10 @@
   function closeDrawer() {
     var root = $('#drawerRoot');
     if (!root || root.hidden) return;
+    if (drawerState.ctrl) {
+      try { drawerState.ctrl.abort(); } catch (e) { /* noop */ }
+      drawerState.ctrl = null;
+    }
     root.hidden = true;
     root.innerHTML = '';
     document.body.style.overflow = '';
@@ -504,6 +525,10 @@
         refreshStatus().then(function (st) {
           if (st && parseRoute().name === 'overview') patchOverviewStats(st);
         });
+        // 任务跑完后回写 last_run_id / last_status：列表页开着就刷新一次
+        if (parseRoute().name === 'tasks' && typeof APP.tasksReload === 'function') {
+          APP.tasksReload();
+        }
       }
       renderJobPanels();
     }).catch(function (err) {
@@ -764,13 +789,17 @@
     return checked ? checked.value : 'demo';
   }
 
-  function addEnvRow(container, key, value) {
+  function addEnvRow(container, key, value, opts) {
     if (!container) return;
+    opts = opts || {};
+    var masked = !!opts.masked;
     var row = document.createElement('div');
-    row.className = 'env-row';
+    row.className = 'env-row' + (masked ? ' env-row-masked' : '');
+    if (masked) row.setAttribute('data-masked', '1');
     row.innerHTML = '' +
       '<input class="input" data-env-key aria-label="环境变量名" placeholder="BASE_URL" value="' + esc(key || '') + '" autocomplete="off" spellcheck="false">' +
-      '<input class="input" data-env-val aria-label="环境变量值" placeholder="http://127.0.0.1:8899" value="' + esc(value || '') + '" autocomplete="off" spellcheck="false">' +
+      '<input class="input" data-env-val aria-label="环境变量值" placeholder="' + (masked ? '***（留空沿用）' : 'http://127.0.0.1:8899') + '" value="' + esc(value || '') + '" autocomplete="off" spellcheck="false"' +
+        (masked ? ' title="已保存的值；保持 *** 或留空表示沿用，删除整行表示移除该键"' : '') + '>' +
       '<button type="button" class="btn btn-icon btn-danger-ghost" data-remove-env aria-label="删除该环境变量">✕</button>';
     container.appendChild(row);
   }
@@ -962,7 +991,7 @@
     });
   }
 
-  function loadScenarios(select, note, ctx) {
+  function loadScenarios(select, note, ctx, desired) {
     if (!select) return;
     apiGet(API + 'scenarios').then(function (list) {
       if (!ctx.alive() || !select.isConnected) return;
@@ -988,9 +1017,14 @@
         }
         return '<option value="' + esc(item.id) + '"' + (isBad ? ' disabled' : '') + '>' + esc(label) + '</option>';
       });
+      // 已保存/原运行的场景可能不在列表里（被删或改名）：补一个只读选项，避免静默丢配置
+      if (desired && !list.some(function (item) { return item && item.id === desired; })) {
+        options.push('<option value="' + esc(desired) + '">' + esc(desired) + ' · 当前配置（不在场景列表）</option>');
+      }
       select.innerHTML = options.join('');
       select.disabled = false;
-      if (firstOk) select.value = firstOk.id;
+      if (desired) select.value = desired;
+      else if (firstOk) select.value = firstOk.id;
       if (note) {
         if (bad.length) {
           note.innerHTML = bad.length + ' 个场景解析失败（已置灰不可选）：' +
@@ -1092,11 +1126,39 @@
         '<td class="num">' + esc(fmtMs(r.duration_ms)) + '</td>' +
         '<td class="tight">' + esc(caseCount) + '</td>' +
         '<td>' + esc(verdict) + '</td>' +
+        '<td class="tight"><div class="row-actions">' +
+          '<button type="button" class="btn btn-sm" data-rerun="' + esc(r.run_id) + '">重跑</button>' +
+          '<button type="button" class="btn btn-sm" data-edit-config="' + esc(r.run_id) + '">编辑配置</button>' +
+        '</div></td>' +
       '</tr>';
     }).join('');
-    return '<div class="table-wrap"><table class="data">' +
-      '<thead><tr><th>run_id</th><th>开始时间</th><th>通过率</th><th class="num">耗时</th><th>用例</th><th>结论</th></tr></thead>' +
+    return '<div class="table-wrap"><table class="data history-table">' +
+      '<thead><tr><th>run_id</th><th>开始时间</th><th>通过率</th><th class="num">耗时</th><th>用例</th><th>结论</th><th>操作</th></tr></thead>' +
       '<tbody>' + rows + '</tbody></table></div>';
+  }
+
+  function rerunRun(runId, btn) {
+    if (jobIsActive()) {
+      showBanner('warn', '<strong>已有任务在运行。</strong> 完成前不能提交新的重跑。', 8000);
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+    apiPost(API + 'runs/' + encodeURIComponent(runId) + '/rerun', {}).then(function (res) {
+      if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
+      attachJob(res.job_id, '');
+      showBanner('info', '<strong>已提交重跑：</strong>源运行 ' + esc(runId) + ' → 任务 ' + esc(res.job_id) + '。进度见右下角面板。', 6000);
+      // 拿到源运行模式后再补上任务面板标题
+      apiGet(API + 'runs/' + encodeURIComponent(runId) + '/config').then(function (cfg) {
+        if (APP.job.id === res.job_id && cfg && cfg.mode && MODE_LABEL[cfg.mode]) {
+          APP.job.mode = cfg.mode;
+          renderJobPanels();
+        }
+      }).catch(function () { /* 标题只是锦上添花 */ });
+    }).catch(function (err) {
+      showBanner('error', '<strong>重跑失败：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
+    }).then(function () {
+      if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '重跑'; }
+    });
   }
 
   function renderHistory(host, ctx) {
@@ -1126,6 +1188,22 @@
     load();
     var refreshBtn = $('[data-act="history-refresh"]', host);
     if (refreshBtn) refreshBtn.addEventListener('click', load);
+
+    host.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || !t.closest) return;
+      var rerunBtn = t.closest('[data-rerun]');
+      if (rerunBtn) {
+        e.preventDefault();
+        rerunRun(rerunBtn.getAttribute('data-rerun'), rerunBtn);
+        return;
+      }
+      var editBtn = t.closest('[data-edit-config]');
+      if (editBtn) {
+        e.preventDefault();
+        location.hash = '#/tasks/new?run=' + encodeURIComponent(editBtn.getAttribute('data-edit-config'));
+      }
+    }, ctx.signal ? { signal: ctx.signal } : false);
   }
 
   /* ================================================================== */
@@ -1162,7 +1240,9 @@
     if (failed) {
       parts.push('' +
         '<div class="failure-block">' +
-          '<div class="fb-title"><span aria-hidden="true">✕</span>失败原因</div>' +
+          '<div class="fb-title"><span aria-hidden="true">✕</span>失败原因' +
+            '<button type="button" class="btn btn-sm fb-fix" data-fix-run="1">按此配置修正并重跑</button>' +
+          '</div>' +
           '<dl class="kv-grid">' +
             '<dt>原因</dt><dd>' + valOrMissing(msg) + '</dd>' +
             '<dt>期望</dt><dd>' + valOrMissing(err.expected) + '</dd>' +
@@ -1231,7 +1311,8 @@
     var errorBlock = '';
     if (caseObj.error) {
       var ce = caseObj.error;
-      errorBlock = '<div class="failure-block"><div class="fb-title"><span aria-hidden="true">✕</span>用例级错误</div>' +
+      errorBlock = '<div class="failure-block"><div class="fb-title"><span aria-hidden="true">✕</span>用例级错误' +
+        '<button type="button" class="btn btn-sm fb-fix" data-fix-run="1">按此配置修正并重跑</button></div>' +
         '<dl class="kv-grid">' +
           '<dt>原因</dt><dd>' + valOrMissing(ce.message || '未提供') + '</dd>' +
           '<dt>类型</dt><dd class="mono">' + esc(ce.type || ce.kind || '未提供') + '</dd>' +
@@ -1285,6 +1366,64 @@
     return '<div class="panel plan-panel">' + rows + envHtml + warnHtml + '</div>';
   }
 
+  function firstFailure(report) {
+    var cases = (report && Array.isArray(report.cases)) ? report.cases : [];
+    for (var i = 0; i < cases.length; i++) {
+      var c = cases[i];
+      if (!c || (c.status !== 'failed' && c.status !== 'error')) continue;
+      var steps = Array.isArray(c.steps) ? c.steps : [];
+      for (var j = 0; j < steps.length; j++) {
+        var st = steps[j];
+        if (!st || (st.status !== 'failed' && st.status !== 'error')) continue;
+        var se = st.error || {};
+        return {
+          case: c.name || c.case_id || '',
+          step: st.step_id || st.atom || '',
+          message: st.message || se.message || '',
+          expected: se.expected,
+          actual: se.actual
+        };
+      }
+      var ce = c.error || {};
+      return {
+        case: c.name || c.case_id || '',
+        step: '',
+        message: ce.message || '用例失败（报告未提供 message）',
+        expected: ce.expected,
+        actual: ce.actual
+      };
+    }
+    var conclusion = (report && report.conclusion) || {};
+    if (conclusion.success === false) {
+      return {
+        case: '',
+        step: '',
+        message: conclusion.verdict || '运行未通过，但报告没有提供失败用例明细',
+        expected: null,
+        actual: null
+      };
+    }
+    return null;
+  }
+
+  /* 运行详情的失败修正入口：放在页头下方，先看错误再决定改什么 */
+  function fixRunPanelHtml(report, id) {
+    var f = firstFailure(report);
+    if (!f) return '';
+    var rows = fixErrorRows(f);
+    return '<div class="fix-panel fix-panel-top" role="region" aria-label="失败修正入口">' +
+      '<div class="fix-panel-main">' +
+        '<div class="fix-kicker">这次运行没有通过</div>' +
+        '<h2>先看错误，再按这套配置改完重跑</h2>' +
+        '<dl class="kv-grid compact">' + (rows || '<dt>错误</dt><dd>用例失败（报告未提供 message）</dd>') + '</dl>' +
+      '</div>' +
+      '<div class="fix-panel-actions">' +
+        '<button type="button" class="btn btn-primary" data-fix-run="' + esc(id) + '">按此配置修正并重跑</button>' +
+        '<span class="fix-panel-note">预填同一套配置，可改 env / 意图后另存为新任务。</span>' +
+      '</div>' +
+    '</div>';
+  }
+
   function detailHtml(data, id) {
     var report = data.report || {};
     var summary = report.summary || {};
@@ -1333,7 +1472,7 @@
       ? cases.map(caseCardHtml).join('')
       : '<div class="empty"><strong>该运行没有用例记录</strong><span>report.json 中 cases 为空，请查看 HTML 报告或服务端日志。</span></div>';
 
-    return header + strip +
+    return header + fixRunPanelHtml(report, id) + strip +
       '<div class="section"><div class="section-head"><h2>计划</h2><span class="hint">来自 report.plan</span></div>' +
         (Object.keys(plan).length ? planPanelHtml(report) : '<div class="empty"><strong>没有计划信息</strong><span>report.plan 为空。</span></div>') +
       '</div>' +
@@ -1403,6 +1542,12 @@
       }
       host.innerHTML = detailHtml(data, id);
       bindCaseInteractions(host, ctx.signal);
+      host.addEventListener('click', function (e) {
+        var btn = e.target.closest ? e.target.closest('[data-fix-run]') : null;
+        if (!btn) return;
+        e.preventDefault();
+        location.hash = '#/tasks/new?run=' + encodeURIComponent(id);
+      }, ctx.signal ? { signal: ctx.signal } : false);
     }).catch(function (err) {
       if (!ctx.alive()) return;
       host.innerHTML = '<div class="page-head"><div><h1>run ' + esc(id) + '</h1>' +
@@ -1731,14 +1876,789 @@
     }, ctx.signal ? { signal: ctx.signal } : false);
   }
 
+
   /* ================================================================== */
-  /* 13. 路由                                                            */
+  /* 13. 任务（CRUD）与从历史修正重跑                                    */
   /* ================================================================== */
+  var TASK_ID_RE = /^t-[0-9a-f]{6,12}$/;
+
+  var TASK_MODE_HINTS = {
+    demo: '内置演示闭环：7 个用例，适合先验证环境是否可用。',
+    scenario: '选一个场景 YAML 直接执行，配置可反复复用。',
+    intent: '用一句话描述目标，由规划层生成用例（无密钥时走离线规则）。',
+    regression: '复用已沉淀的回归库，不重新规划。'
+  };
+
+  function shortRunId(id) { return id ? String(id).slice(0, 8) : ''; }
+
+  function fileBase(path) {
+    var s = String(path || '');
+    var i = s.lastIndexOf('/');
+    return i >= 0 ? s.slice(i + 1) : s;
+  }
+
+  function stringifyMaybe(v) {
+    if (v === null || v === undefined) return '';
+    if (typeof v === 'object') {
+      try { return JSON.stringify(v); } catch (e) { return String(v); }
+    }
+    return String(v);
+  }
+
+  function taskModeBadge(mode) {
+    var label = MODE_LABEL[mode] || mode || '未知';
+    var cls = mode === 'regression' ? 'heal' : (mode === 'intent' ? 'run' : 'dim');
+    return '<span class="badge ' + cls + '">' + esc(label) + '</span>';
+  }
+
+  function taskTargetHtml(t) {
+    if (t.mode === 'scenario') {
+      var full = t.scenario || '';
+      if (!full) return '<span class="missing">未指定场景</span>';
+      return '<span class="task-target" title="' + esc(full) + '">' + esc(fileBase(full)) + '</span>';
+    }
+    if (t.mode === 'intent') {
+      var intent = (t.intent || '').trim();
+      if (!intent) return '<span class="missing">未填写意图</span>';
+      return '<span class="task-target" title="' + esc(intent) + '">' + esc(intent) + '</span>';
+    }
+    if (t.mode === 'regression') return '<span class="task-target">回归库（复用已沉淀用例）</span>';
+    return '<span class="task-target">内置演示闭环</span>';
+  }
+
+  /* ---------- 确认对话框 ---------- */
+  var confirmState = { resolve: null, opener: null };
+
+  function closeConfirm(result) {
+    var root = $('#confirmRoot');
+    if (!root || root.hidden) return;
+    root.hidden = true;
+    root.innerHTML = '';
+    var resolve = confirmState.resolve;
+    var opener = confirmState.opener;
+    confirmState.resolve = null;
+    confirmState.opener = null;
+    if (opener && typeof opener.focus === 'function') {
+      try { opener.focus(); } catch (e) { /* noop */ }
+    }
+    if (resolve) resolve(result);
+  }
+
+  function confirmDialog(opts) {
+    opts = opts || {};
+    var root = $('#confirmRoot');
+    if (!root) return Promise.resolve(false);
+    if (!root.hidden) closeConfirm(false);
+    return new Promise(function (resolve) {
+      confirmState.resolve = resolve;
+      confirmState.opener = document.activeElement;
+      root.hidden = false;
+      root.innerHTML = '' +
+        '<button type="button" class="confirm-backdrop" data-confirm-cancel tabindex="-1" aria-label="取消"></button>' +
+        '<div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMsg">' +
+          '<h2 id="confirmTitle">' + esc(opts.title || '确认操作') + '</h2>' +
+          '<p id="confirmMsg">' + esc(opts.message || '') + '</p>' +
+          '<div class="confirm-actions">' +
+            '<button type="button" class="btn" data-confirm-cancel>' + esc(opts.cancelLabel || '取消') + '</button>' +
+            '<button type="button" class="btn ' + (opts.danger ? 'btn-danger' : 'btn-primary') + '" data-confirm-ok>' +
+              esc(opts.confirmLabel || '确认') + '</button>' +
+          '</div>' +
+        '</div>';
+      var okBtn = $('[data-confirm-ok]', root);
+      var cancelBtn = $('.confirm-box [data-confirm-cancel]', root);
+      var focusTarget = opts.danger ? cancelBtn : (okBtn || cancelBtn);
+      if (focusTarget) focusTarget.focus();
+      if (okBtn) okBtn.addEventListener('click', function () { closeConfirm(true); }, { once: true });
+      $$('[data-confirm-cancel]', root).forEach(function (b) {
+        b.addEventListener('click', function () { closeConfirm(false); }, { once: true });
+      });
+    });
+  }
+
+  /* ---------- 任务列表 ---------- */
+  function taskRowHtml(t) {
+    var envKeys = Array.isArray(t.env_keys) ? t.env_keys : [];
+    var last = '<span class="missing">未运行</span>';
+    if (t.last_run_id) {
+      last = '<span class="last-run"><a class="row-link" href="#/runs/' + encodeURIComponent(t.last_run_id) + '">' +
+        esc(shortRunId(t.last_run_id)) + '</a>' +
+        (t.last_status ? ' ' + jobBadge(t.last_status) : '') + '</span>';
+    }
+    return '<tr data-task-row="' + esc(t.task_id) + '">' +
+      '<td><div class="task-name">' + esc(t.name || '(未命名任务)') + '</div>' +
+        '<div class="task-id mono">' + esc(t.task_id) + (envKeys.length ? ' · env ' + envKeys.length + ' 项' : '') + '</div></td>' +
+      '<td>' + taskModeBadge(t.mode) + '</td>' +
+      '<td>' + taskTargetHtml(t) + '</td>' +
+      '<td class="tight">' + last + '</td>' +
+      '<td class="tight">' + esc(fmtTs(t.updated_at)) + '</td>' +
+      '<td class="tight"><div class="row-actions">' +
+        '<button type="button" class="btn btn-sm" data-task-run="' + esc(t.task_id) + '" data-task-mode="' + esc(t.mode || '') +
+          '" data-task-name="' + esc(t.name || '') + '">运行</button>' +
+        '<button type="button" class="btn btn-sm" data-task-edit="' + esc(t.task_id) + '">编辑</button>' +
+        '<button type="button" class="btn btn-sm btn-danger-ghost" data-task-del="' + esc(t.task_id) +
+          '" data-task-name="' + esc(t.name || '') + '">删除</button>' +
+      '</div></td>' +
+    '</tr>';
+  }
+
+  function tasksTableHtml(tasks) {
+    return '<div class="table-wrap"><table class="data tasks-table">' +
+      '<thead><tr><th>名称</th><th>模式</th><th>目标</th><th>上次运行</th><th>更新时间</th><th>操作</th></tr></thead>' +
+      '<tbody>' + tasks.map(taskRowHtml).join('') + '</tbody></table></div>';
+  }
+
+  function tasksEmptyHtml() {
+    return '<div class="empty tasks-empty">' +
+      '<strong>还没有保存的任务</strong>' +
+      '<span>任务 = 一套可复用的运行配置（模式 / 场景或意图 / 环境变量）。建好之后一键运行，不必每次重填。</span>' +
+      '<span>也可以从运行历史里挑一条，把当时的配置存成任务再修正重跑。</span>' +
+      '<div class="empty-actions">' +
+        '<button type="button" class="btn btn-primary btn-sm" data-act="task-new">新建任务</button>' +
+        '<button type="button" class="btn btn-sm" data-act="pick-run">从历史挑一条</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function deleteTask(taskId, name, reload, btn) {
+    confirmDialog({
+      title: '删除任务「' + (name || taskId) + '」？',
+      message: '只删配置，历史运行保留：仅删除 tasks/' + taskId + '.json，所有运行记录、报告与回归库都不受影响。此操作不可撤销。',
+      confirmLabel: '删除配置',
+      danger: true
+    }).then(function (ok) {
+      if (!ok) return;
+      if (btn) { btn.disabled = true; btn.textContent = '删除中…'; }
+      apiDelete(API + 'tasks/' + encodeURIComponent(taskId)).then(function () {
+        toast('已删除任务配置：' + (name || taskId), 'ok');
+        if (typeof reload === 'function') reload();
+      }).catch(function (err) {
+        showBanner('error', '<strong>删除失败：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
+      }).then(function () {
+        if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '删除'; }
+      });
+    });
+  }
+
+  function runTaskById(taskId, mode, name, btn) {
+    if (jobIsActive()) {
+      showBanner('warn', '<strong>已有任务在运行。</strong> 完成前不能提交新任务。', 8000);
+      return;
+    }
+    if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
+    apiPost(API + 'tasks/' + encodeURIComponent(taskId) + '/run', {}).then(function (res) {
+      if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
+      attachJob(res.job_id, mode || '');
+      showBanner('info', '<strong>已提交任务：</strong>' + esc(name || taskId) + ' · ' + esc(res.job_id) + '。进度见右下角面板。', 6000);
+    }).catch(function (err) {
+      if (err && err.code === 'busy') { showBanner('warn', '<strong>已有任务在运行。</strong>', 8000); return; }
+      showBanner('error', '<strong>无法运行任务：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
+    }).then(function () {
+      if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '运行'; }
+    });
+  }
+
+  function renderTasks(host, ctx) {
+    host.innerHTML = '' +
+      '<div class="page-head">' +
+        '<div><h1>任务</h1><div class="sub">保存运行配置，一键复用；运行不会改动配置，历史运行全部保留。</div></div>' +
+        '<div class="actions">' +
+          '<button type="button" class="btn" data-act="tasks-refresh">刷新</button>' +
+          '<button type="button" class="btn btn-primary" data-act="task-new">新建任务</button>' +
+        '</div>' +
+      '</div>' +
+      '<div id="tasksError"></div>' +
+      '<div id="tasksBody"><div class="loading"><span class="spinner"></span>正在读取任务…</div></div>';
+
+    var body = $('#tasksBody', host);
+    var errHost = $('#tasksError', host);
+
+    var load = function () {
+      if (!ctx.alive()) return;
+      if (errHost) errHost.innerHTML = '';
+      body.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取任务…</div>';
+      apiGet(API + 'tasks').then(function (res) {
+        if (!ctx.alive()) return;
+        var tasks = res && Array.isArray(res.tasks) ? res.tasks : (Array.isArray(res) ? res : []);
+        body.innerHTML = tasks.length ? tasksTableHtml(tasks) : tasksEmptyHtml();
+      }).catch(function (err) {
+        if (!ctx.alive()) return;
+        body.innerHTML = '';
+        renderError(errHost, err, load, '无法读取任务列表');
+      });
+    };
+    load();
+    APP.tasksReload = load;
+
+    host.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || !t.closest) return;
+
+      if (t.closest('[data-act="tasks-refresh"]')) { load(); return; }
+      if (t.closest('[data-act="task-new"]')) { location.hash = '#/tasks/new'; return; }
+      if (t.closest('[data-act="pick-run"]')) { openRunsPicker(); return; }
+
+      var runBtn = t.closest('[data-task-run]');
+      if (runBtn) {
+        runTaskById(runBtn.getAttribute('data-task-run'), runBtn.getAttribute('data-task-mode'), runBtn.getAttribute('data-task-name'), runBtn);
+        return;
+      }
+      var editBtn = t.closest('[data-task-edit]');
+      if (editBtn) {
+        location.hash = '#/tasks/' + encodeURIComponent(editBtn.getAttribute('data-task-edit')) + '/edit';
+        return;
+      }
+      var delBtn = t.closest('[data-task-del]');
+      if (delBtn) {
+        deleteTask(delBtn.getAttribute('data-task-del'), delBtn.getAttribute('data-task-name'), load, delBtn);
+        return;
+      }
+    }, ctx.signal ? { signal: ctx.signal } : false);
+  }
+
+  /* ---------- 从历史挑一条（空态入口） ---------- */
+  function pickRunRowHtml(r) {
+    var s = r.summary || {};
+    var verdict = (r.conclusion && r.conclusion.verdict) || (s.success ? '通过' : '存在失败');
+    var ok = !!(s.success === true || (r.conclusion && r.conclusion.success === true));
+    return '<button type="button" class="pick-run" data-pick-run="' + esc(r.run_id) + '">' +
+      '<span class="pick-run-top"><span class="mono">' + esc(r.run_id) + '</span>' +
+        '<span class="badge ' + (ok ? 'ok' : 'bad') + '">' + esc(verdict) + '</span></span>' +
+      '<span class="pick-run-meta">' + esc(fmtTs(r.started_at)) + ' · ' +
+        esc(typeof s.total === 'number' ? s.total + ' 个用例' : '用例数未知') + ' · ' +
+        esc(fmtMs(r.duration_ms)) + '</span>' +
+    '</button>';
+  }
+
+  function openRunsPicker() {
+    openDrawer('从历史挑一条', '<div class="loading"><span class="spinner"></span>正在读取运行历史…</div>', document.activeElement);
+    var root = $('#drawerRoot');
+    if (!root) return;
+    apiGet(API + 'runs?limit=30').then(function (runs) {
+      if (!runs || !runs.length) {
+        setDrawerBody('<div class="empty"><strong>还没有运行记录</strong><span>先跑一次演示或场景，再回来把配置存成任务。</span><a class="btn btn-sm" href="#/history">打开运行历史</a></div>');
+        return;
+      }
+      setDrawerBody('<p class="drawer-hint">选择一条运行，用它的配置预填任务表单；密钥值会显示为 <code>***</code>。</p>' +
+        '<div class="pick-list">' + runs.map(pickRunRowHtml).join('') + '</div>');
+      root.addEventListener('click', function (e) {
+        var btn = e.target.closest ? e.target.closest('[data-pick-run]') : null;
+        if (!btn) return;
+        var runId = btn.getAttribute('data-pick-run');
+        closeDrawer();
+        location.hash = '#/tasks/new?run=' + encodeURIComponent(runId);
+      }, drawerState.ctrl ? { signal: drawerState.ctrl.signal } : false);
+    }).catch(function (err) {
+      setDrawerBody(errorHtml(err, '无法读取运行历史'));
+      var retry = $('#drawerRoot [data-retry]');
+      if (retry) retry.addEventListener('click', function () { openRunsPicker(); });
+    });
+  }
+
+  /* ---------- 任务表单（新建 / 编辑 / 从运行预填） ---------- */
+  function missingSpan() { return '<span class="missing">未提供</span>'; }
+
+  /* 契约要求原错误固定展示：用例 / 步骤 / message / expected / actual */
+  function fixErrorRows(err) {
+    if (!err) return '';
+    return '' +
+      '<dt>用例</dt><dd>' + (hasVal(err.case) ? esc(err.case) : missingSpan()) + '</dd>' +
+      '<dt>步骤</dt><dd class="mono">' + (hasVal(err.step) ? esc(err.step) : missingSpan()) + '</dd>' +
+      '<dt>错误</dt><dd class="mono">' + (hasVal(err.message) ? esc(err.message) : missingSpan()) + '</dd>' +
+      '<dt>期望</dt><dd>' + (hasVal(err.expected) ? esc(stringifyMaybe(err.expected)) : missingSpan()) + '</dd>' +
+      '<dt>实际</dt><dd>' + (hasVal(err.actual) ? esc(stringifyMaybe(err.actual)) : missingSpan()) + '</dd>';
+  }
+
+  function fixContextHtml(state) {
+    if (!state.runId) return '';
+    var cfg = state.config || {};
+    var err = cfg.error;
+    var rows = fixErrorRows(err);
+    return '<div class="fix-context" role="region" aria-label="原运行错误">' +
+      '<div class="fix-panel">' +
+        '<div class="fix-panel-main">' +
+          '<div class="fix-kicker">按原运行修正 · run <span class="mono">' + esc(state.runId) + '</span></div>' +
+          '<h2>' + (err ? '原运行失败在这里' : '原运行全部通过') + '</h2>' +
+          (rows
+            ? '<dl class="kv-grid compact">' + rows + '</dl>'
+            : '<p class="fix-empty">' + (err ? '服务端未提供更细的错误字段。' : '这条运行没有失败用例，可以直接把当前配置存成任务复用。') + '</p>') +
+          '<p class="fix-hint">改完下面的配置后点「保存并运行」；带 <code>***</code> 的密钥会沿用原运行的真实值。</p>' +
+        '</div>' +
+        '<div class="fix-panel-actions">' +
+          '<a class="btn btn-sm" href="#/runs/' + encodeURIComponent(state.runId) + '">查看原运行</a>' +
+        '</div>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function taskFormHtml(state, seed) {
+    var isEdit = state.kind === 'edit';
+    var fromRun = !!state.runId;
+    var title = isEdit ? '编辑任务' : (fromRun ? '按运行配置新建任务' : '新建任务');
+    var sub = isEdit
+      ? '保存后立即生效；不会改动任何历史运行。'
+      : (fromRun ? '预填自运行 ' + state.runId + '；保存会创建一条新任务。' : '任务保存后可在列表里一键运行。');
+    var modes = ['demo', 'scenario', 'intent', 'regression'].map(function (m) {
+      return '<label><input type="radio" name="mode" value="' + m + '"' +
+        (seed.mode === m ? ' checked' : '') + '><span>' + esc(MODE_LABEL[m]) + '</span></label>';
+    }).join('');
+
+    var envNote = isEdit
+      ? '带 <code>***</code> 的是已保存的密钥：留空或保持 <code>***</code> 表示沿用已保存值；删除整行表示移除该键。'
+      : (fromRun
+        ? '带 <code>***</code> 的值来自原运行，服务端不回传明文：「保存并运行」会沿用真实值；仅保存时会跳过这些键。'
+        : '键值对会作为运行时环境传入（如 BASE_URL、API_USERNAME）。留空的行会被忽略。');
+
+    return '' +
+      '<div class="page-head">' +
+        '<div><h1>' + esc(title) + '</h1><div class="sub">' + esc(sub) + '</div></div>' +
+        '<div class="actions"><a class="btn btn-sm btn-ghost" href="#/tasks">返回任务列表</a></div>' +
+      '</div>' +
+      fixContextHtml(state) +
+      '<form class="form-grid task-form" id="taskForm" novalidate>' +
+        '<div class="field">' +
+          '<label for="taskName">任务名称</label>' +
+          '<input class="input" id="taskName" maxlength="80" autocomplete="off" placeholder="例如：订单闭环冒烟" value="' + esc(seed.name || '') + '">' +
+          '<div class="field-error" data-err="name" hidden></div>' +
+          '<div class="field-hint">1–80 个字符；同名任务允许存在，用 task id 区分。</div>' +
+        '</div>' +
+        '<div class="field">' +
+          '<span class="field-label" id="taskModeLabel">运行模式</span>' +
+          '<div class="segmented" role="radiogroup" aria-labelledby="taskModeLabel">' + modes + '</div>' +
+          '<div class="field-hint" id="taskModeHint"></div>' +
+        '</div>' +
+        '<div class="field" data-when="scenario" hidden>' +
+          '<label for="taskScenario">场景文件</label>' +
+          '<select class="select" id="taskScenario"><option value="">加载中…</option></select>' +
+          '<div class="field-hint" id="taskScenarioNote">正在读取场景列表…</div>' +
+          '<div class="field-error" data-err="scenario" hidden></div>' +
+        '</div>' +
+        '<div class="field" data-when="intent" hidden>' +
+          '<label for="taskIntent">意图描述</label>' +
+          '<textarea class="textarea" id="taskIntent" autocomplete="off" placeholder="例如：检查健康状态并验证登录下单">' + esc(seed.intent || '') + '</textarea>' +
+          '<div class="field-hint">一句话目标；无模型密钥时由离线规则生成计划。</div>' +
+          '<div class="field-error" data-err="intent" hidden></div>' +
+        '</div>' +
+        '<div class="field">' +
+          '<span class="field-label">环境变量</span>' +
+          '<div class="env-rows" id="taskEnvRows"></div>' +
+          '<div><button type="button" class="btn btn-sm" id="taskAddEnv">+ 添加环境变量</button></div>' +
+          '<div class="field-hint">' + envNote + '</div>' +
+          '<div class="field-error" data-err="env" hidden></div>' +
+        '</div>' +
+        '<div class="field">' +
+          '<label class="checkbox"><input type="checkbox" id="taskRegression"' + (seed.regression ? ' checked' : '') + '><span>运行后执行回归（regression）</span></label>' +
+          '<label class="checkbox"><input type="checkbox" id="taskNoLlm"' + (seed.no_llm ? ' checked' : '') + '><span>强制离线规则规划（no_llm）</span></label>' +
+        '</div>' +
+        '<div class="form-actions">' +
+          '<button type="submit" class="btn btn-primary" id="taskSave">保存</button>' +
+          '<button type="button" class="btn" id="taskSaveRun">保存并运行</button>' +
+          '<button type="button" class="btn btn-ghost" id="taskCancel">取消</button>' +
+          '<span class="form-note" id="taskNote">保存后可在任务列表一键运行。</span>' +
+        '</div>' +
+        '<div id="taskFormError" aria-live="assertive"></div>' +
+      '</form>';
+  }
+
+  function taskSeed(state) {
+    if (state.task) {
+      var t = state.task;
+      return {
+        name: t.name || '',
+        mode: MODE_LABEL[t.mode] ? t.mode : 'demo',
+        scenario: t.scenario || '',
+        intent: t.intent || '',
+        env: t.env && typeof t.env === 'object' ? t.env : {},
+        regression: !!t.regression,
+        no_llm: !!t.no_llm
+      };
+    }
+    if (state.config) {
+      var c = state.config;
+      return {
+        name: '修正重跑 · ' + shortRunId(state.runId),
+        mode: MODE_LABEL[c.mode] ? c.mode : 'scenario',
+        scenario: c.scenario || '',
+        intent: c.intent || '',
+        env: c.env && typeof c.env === 'object' ? c.env : {},
+        regression: !!c.regression,
+        no_llm: !!c.no_llm
+      };
+    }
+    return { name: '', mode: 'demo', scenario: '', intent: '', env: {}, regression: false, no_llm: false };
+  }
+
+  function clearTaskErrors(form) {
+    $$('[data-err]', form).forEach(function (el) { el.textContent = ''; el.hidden = true; });
+    var host = $('#taskFormError', form);
+    if (host) host.innerHTML = '';
+  }
+
+  function setTaskFieldError(form, key, msg) {
+    var el = $('[data-err="' + key + '"]', form);
+    if (el) { el.textContent = msg || ''; el.hidden = !msg; }
+    if (!msg) return;
+    var target = key === 'name' ? $('#taskName', form)
+      : key === 'scenario' ? $('#taskScenario', form)
+      : key === 'intent' ? $('#taskIntent', form)
+      : key === 'env' ? $('[data-env-key]', form) : null;
+    if (target && typeof target.focus === 'function') target.focus();
+  }
+
+  function collectTaskPayload(form) {
+    var nameEl = $('#taskName', form);
+    var name = nameEl ? nameEl.value.trim() : '';
+    if (!name) return { error: '任务名称不能为空。', field: 'name' };
+    if (name.length > 80) return { error: '任务名称最长 80 个字符。', field: 'name' };
+
+    var mode = getMode(form);
+    var scenario = '';
+    var intent = '';
+    if (mode === 'scenario') {
+      var sel = $('#taskScenario', form);
+      scenario = sel ? sel.value : '';
+      if (!scenario) return { error: '场景模式必须选择一个场景文件。', field: 'scenario' };
+    }
+    if (mode === 'intent') {
+      var intentEl = $('#taskIntent', form);
+      intent = intentEl ? intentEl.value.trim() : '';
+      if (!intent) return { error: '意图模式必须填写一句话目标。', field: 'intent' };
+    }
+
+    var envResult = collectEnv(form);
+    if (envResult.errors.length) return { error: envResult.errors.join('；'), field: 'env' };
+
+    return {
+      payload: {
+        name: name,
+        mode: mode,
+        scenario: scenario,
+        intent: intent,
+        env: envResult.env,
+        regression: !!($('#taskRegression', form) && $('#taskRegression', form).checked),
+        no_llm: !!($('#taskNoLlm', form) && $('#taskNoLlm', form).checked)
+      }
+    };
+  }
+
+  function taskBodyFromPayload(payload) {
+    return {
+      name: payload.name,
+      mode: payload.mode,
+      scenario: payload.scenario,
+      intent: payload.intent,
+      env: payload.env,
+      regression: payload.regression,
+      no_llm: payload.no_llm
+    };
+  }
+
+  function mergeEnvForPatch(env, originalEnv) {
+    var out = {};
+    Object.keys(env).forEach(function (k) { out[k] = env[k]; });
+    Object.keys(originalEnv || {}).forEach(function (k) {
+      if (!Object.prototype.hasOwnProperty.call(env, k)) out[k] = null;
+    });
+    return out;
+  }
+
+  function runTaskAfterSave(saved, mode) {
+    var id = saved && saved.task_id;
+    if (!id) return Promise.reject(new ApiError('服务端未返回 task_id，无法提交运行', 500, 'bad_response'));
+    return apiPost(API + 'tasks/' + encodeURIComponent(id) + '/run', {}).then(function (res) {
+      if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
+      attachJob(res.job_id, mode || (saved && saved.mode) || '');
+      return res.job_id;
+    });
+  }
+
+  function setTaskBusy(form, busy) {
+    if (!form) return;
+    ['#taskSave', '#taskSaveRun', '#taskCancel'].forEach(function (sel) {
+      var b = $(sel, form);
+      if (b) b.disabled = busy;
+    });
+    var save = $('#taskSave', form);
+    var saveRun = $('#taskSaveRun', form);
+    if (save) save.textContent = busy ? '提交中…' : '保存';
+    if (saveRun) saveRun.textContent = busy ? '提交中…' : '保存并运行';
+    var note = $('#taskNote', form);
+    if (note) note.textContent = busy ? '正在提交，请勿重复点击。' : '保存后可在任务列表一键运行。';
+  }
+
+  function submitTaskForm(form, state, thenRun) {
+    if (state.busy) return;
+    clearTaskErrors(form);
+
+    var collected = collectTaskPayload(form);
+    if (collected.error) {
+      setTaskFieldError(form, collected.field, collected.error);
+      return;
+    }
+
+    if (thenRun && jobIsActive()) {
+      showBanner('warn', '<strong>已有任务在运行。</strong> 完成前不能提交新任务；可以先只保存配置。', 8000);
+      return;
+    }
+
+    var payload = collected.payload;
+    state.busy = true;
+    setTaskBusy(form, true);
+
+    var done = function (saved, opts) {
+      opts = opts || {};
+      state.busy = false;
+      setTaskBusy(form, false);
+      var name = (saved && saved.name) || payload.name;
+      if (opts.job) {
+        var jobExtra = '';
+        if (opts.skipped && opts.skipped.length) {
+          jobExtra = ' 注意：' + esc(opts.skipped.join('、')) + ' 的值不会回传前端，新任务里需要重新填写。';
+        }
+        goRoute('#/tasks', {
+          kind: 'info',
+          html: '<strong>' + (opts.rerun ? '已按原配置修正并提交运行：' : '任务已保存并提交运行：') + '</strong>' +
+            esc(name) + ' · ' + esc(opts.job) + jobExtra,
+          ttl: 8000
+        });
+      } else {
+        var extra = '';
+        if (opts.skipped && opts.skipped.length) {
+          extra = ' 注意：' + esc(opts.skipped.join('、')) + ' 的值不会回传前端，未写入新任务，请在编辑页补齐。';
+        }
+        goRoute('#/tasks', { kind: 'info', html: '<strong>任务已保存：</strong>' + esc(name) + extra, ttl: 8000 });
+      }
+    };
+
+    var fail = function (err) {
+      state.busy = false;
+      setTaskBusy(form, false);
+      var host = $('#taskFormError', form);
+      if (host) {
+        host.innerHTML = errorHtml(err, '保存失败');
+        var retry = $('[data-retry]', host);
+        if (retry) retry.addEventListener('click', function () { submitTaskForm(form, state, thenRun); });
+      }
+      if (err && err.status === 409) {
+        showBanner('warn', '<strong>任务重复或已有运行：</strong>' + esc(err.message || ''), 8000);
+      }
+    };
+
+    /* 从运行的配置新建任务 */
+    if (state.runId && !state.task) {
+      var masked = Object.keys(payload.env).filter(function (k) { return payload.env[k] === '***'; });
+      var cfg = state.config || {};
+      var coreChanged = payload.mode !== (cfg.mode || payload.mode) ||
+        (payload.mode === 'scenario' && payload.scenario !== (cfg.scenario || '')) ||
+        (payload.mode === 'intent' && payload.intent !== (cfg.intent || ''));
+
+      if (thenRun) {
+        if (!coreChanged) {
+          // 服务端以磁盘真实 env 为基线，*** 表示沿用；顺带把本次覆盖写成任务
+          apiPost(API + 'runs/' + encodeURIComponent(state.runId) + '/rerun', {
+            env: payload.env,
+            save_as_task: true,
+            name: payload.name
+          }).then(function (res) {
+            if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
+            attachJob(res.job_id, payload.mode);
+            done({ name: payload.name }, { job: res.job_id, rerun: true });
+          }).catch(fail);
+          return;
+        }
+        // 模式/场景/意图有改动：rerun 无法表达，只能新建任务（密钥需重新填写）
+        var runBody = taskBodyFromPayload(payload);
+        masked.forEach(function (k) { delete runBody.env[k]; });
+        apiPost(API + 'tasks', runBody).then(function (saved) {
+          return runTaskAfterSave(saved, payload.mode).then(function (jobId) {
+            done(saved, { job: jobId, skipped: masked });
+          });
+        }).catch(fail);
+        return;
+      }
+
+      var body = taskBodyFromPayload(payload);
+      masked.forEach(function (k) { delete body.env[k]; });
+      apiPost(API + 'tasks', body).then(function (saved) {
+        done(saved, { skipped: masked });
+      }).catch(fail);
+      return;
+    }
+
+    /* 编辑已有任务 */
+    if (state.task) {
+      var patchBody = taskBodyFromPayload(payload);
+      patchBody.env = mergeEnvForPatch(payload.env, state.task.env || {});
+      apiPatch(API + 'tasks/' + encodeURIComponent(state.taskId), patchBody).then(function (saved) {
+        var safeSaved = saved || { task_id: state.taskId, name: payload.name };
+        if (!thenRun) { done(safeSaved, {}); return; }
+        return runTaskAfterSave(safeSaved, payload.mode).then(function (jobId) {
+          done(safeSaved, { job: jobId });
+        });
+      }).catch(fail);
+      return;
+    }
+
+    /* 新建任务 */
+    apiPost(API + 'tasks', taskBodyFromPayload(payload)).then(function (saved) {
+      if (!thenRun) { done(saved, {}); return; }
+      return runTaskAfterSave(saved, payload.mode).then(function (jobId) {
+        done(saved, { job: jobId });
+      });
+    }).catch(fail);
+  }
+
+  function buildTaskForm(host, ctx, state, seed) {
+    host.innerHTML = taskFormHtml(state, seed);
+    var form = $('#taskForm', host);
+    if (!form) return;
+
+    var envRows = $('#taskEnvRows', form);
+    var seedKeys = Object.keys(seed.env || {});
+    if (seedKeys.length) {
+      seedKeys.forEach(function (k) {
+        var v = seed.env[k];
+        addEnvRow(envRows, k, v, { masked: v === '***' });
+      });
+      addEnvRow(envRows);
+    } else {
+      addEnvRow(envRows);
+    }
+
+    var addBtn = $('#taskAddEnv', form);
+    if (addBtn) {
+      addBtn.addEventListener('click', function () {
+        addEnvRow(envRows);
+        var inputs = $$('[data-env-key]', envRows);
+        if (inputs.length) inputs[inputs.length - 1].focus();
+      });
+    }
+    if (envRows) {
+      envRows.addEventListener('click', function (e) {
+        var btn = e.target.closest ? e.target.closest('[data-remove-env]') : null;
+        if (!btn) return;
+        var row = btn.closest('.env-row');
+        if (row && row.parentNode) row.parentNode.removeChild(row);
+      });
+    }
+
+    var applyMode = function () {
+      var mode = getMode(form);
+      $$('[data-when]', form).forEach(function (block) {
+        var modes = (block.getAttribute('data-when') || '').split(/\s+/);
+        block.hidden = modes.indexOf(mode) < 0;
+      });
+      var hint = $('#taskModeHint', form);
+      if (hint) hint.textContent = TASK_MODE_HINTS[mode] || '';
+      setTaskFieldError(form, 'scenario', '');
+      setTaskFieldError(form, 'intent', '');
+      setTaskFieldError(form, 'env', '');
+    };
+    $$('input[name="mode"]', form).forEach(function (r) { r.addEventListener('change', applyMode); });
+    applyMode();
+
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      submitTaskForm(form, state, false);
+    });
+    var saveRun = $('#taskSaveRun', form);
+    if (saveRun) saveRun.addEventListener('click', function () { submitTaskForm(form, state, true); });
+    var cancel = $('#taskCancel', form);
+    if (cancel) cancel.addEventListener('click', function () {
+      if (state.busy) return;
+      location.hash = '#/tasks';
+    });
+
+    loadScenarios($('#taskScenario', form), $('#taskScenarioNote', form), ctx, seed.scenario || '');
+
+    // 键盘优先：进入表单即把焦点放到第一个可编辑字段
+    var nameEl = $('#taskName', form);
+    if (nameEl) nameEl.focus();
+  }
+
+  function renderTaskForm(host, ctx, route) {
+    var state = {
+      kind: route.mode,
+      taskId: route.id || '',
+      runId: (route.query && route.query.run) || '',
+      task: null,
+      config: null,
+      busy: false
+    };
+
+    if (state.kind === 'edit' && !TASK_ID_RE.test(state.taskId)) {
+      renderError(host, new ApiError('task_id 不合法：应以 t- 开头并跟 6–12 位十六进制字符', 400, 'bad_request'), function () {
+        location.hash = '#/tasks';
+      }, '无法编辑任务');
+      return;
+    }
+    if (state.runId && !RUN_ID_RE.test(state.runId)) {
+      renderError(host, new ApiError('run_id 不合法，无法读取运行配置', 400, 'bad_request'), function () {
+        location.hash = '#/tasks';
+      }, '无法读取运行配置');
+      return;
+    }
+
+    host.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取任务配置…</div>';
+
+    var prepare;
+    if (state.kind === 'edit') {
+      prepare = apiGet(API + 'tasks/' + encodeURIComponent(state.taskId)).then(function (t) {
+        if (!t || typeof t !== 'object') throw new ApiError('响应缺少任务字段', 500, 'bad_response');
+        state.task = t;
+        if (t.task_id && t.task_id !== state.taskId) state.taskId = t.task_id;
+      });
+    } else if (state.runId) {
+      prepare = apiGet(API + 'runs/' + encodeURIComponent(state.runId) + '/config').then(function (cfg) {
+        if (!cfg || typeof cfg !== 'object') throw new ApiError('响应缺少运行配置', 500, 'bad_response');
+        state.config = cfg;
+      });
+    } else {
+      prepare = Promise.resolve();
+    }
+
+    prepare.then(function () {
+      if (!ctx.alive()) return;
+      buildTaskForm(host, ctx, state, taskSeed(state));
+    }).catch(function (err) {
+      if (!ctx.alive()) return;
+      host.innerHTML = '<div class="page-head"><div><h1>任务</h1><div class="sub">无法读取配置</div></div>' +
+        '<div class="actions"><a class="btn" href="#/tasks">返回任务列表</a></div></div><div id="taskLoadError"></div>';
+      renderError($('#taskLoadError', host), err, function () { render(); }, '无法读取任务配置');
+    });
+  }
+
+  /* ================================================================== */
+  /* 14. 路由                                                            */
+  /* ================================================================== */
+  function parseQuery(qs) {
+    var out = {};
+    if (!qs) return out;
+    qs.split('&').forEach(function (pair) {
+      if (!pair) return;
+      var i = pair.indexOf('=');
+      var k = i < 0 ? pair : pair.slice(0, i);
+      var v = i < 0 ? '' : pair.slice(i + 1);
+      try {
+        out[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' '));
+      } catch (e) {
+        out[k] = v;
+      }
+    });
+    return out;
+  }
+
   function parseRoute() {
-    var h = (location.hash || '').replace(/^#/, '');
+    var raw = (location.hash || '').replace(/^#/, '');
+    var qIndex = raw.indexOf('?');
+    var h = qIndex >= 0 ? raw.slice(0, qIndex) : raw;
+    var query = parseQuery(qIndex >= 0 ? raw.slice(qIndex + 1) : '');
     if (!h || h === '/') return { name: 'overview' };
     var m = /^\/runs\/([^\/?#]+)\/?$/.exec(h);
     if (m) return { name: 'run-detail', id: decodeURIComponent(m[1]) };
+    if (h === '/tasks' || h === '/tasks/') return { name: 'tasks' };
+    if (h === '/tasks/new' || h === '/tasks/new/') return { name: 'task-form', mode: 'new', query: query };
+    var mEdit = /^\/tasks\/([^\/]+)\/edit\/?$/.exec(h);
+    if (mEdit) return { name: 'task-form', mode: 'edit', id: decodeURIComponent(mEdit[1]), query: query };
     if (h === '/overview' || h === '/run' || h === '/history' || h === '/atoms' || h === '/packs') {
       return { name: h.slice(1) };
     }
@@ -1746,7 +2666,7 @@
   }
 
   function setNav(activeName) {
-    var navKey = activeName === 'run-detail' ? 'history' : activeName;
+    var navKey = activeName === 'run-detail' ? 'history' : (activeName === 'task-form' ? 'tasks' : activeName);
     $$('[data-nav]').forEach(function (a) {
       if (a.getAttribute('data-nav') === navKey) {
         a.setAttribute('aria-current', 'page');
@@ -1761,8 +2681,9 @@
       '<div class="page-head"><div><h1>页面不存在</h1>' +
         '<div class="sub">没有匹配的路由：<span class="mono">' + esc(path) + '</span></div></div></div>' +
       '<div class="empty"><strong>可用视图</strong>' +
-        '<span><a href="#/overview">#/overview</a> · <a href="#/run">#/run</a> · <a href="#/history">#/history</a> · ' +
-        '<a href="#/runs/&lt;run_id&gt;">#/runs/&lt;run_id&gt;</a> · <a href="#/atoms">#/atoms</a> · <a href="#/packs">#/packs</a></span>' +
+        '<span><a href="#/overview">#/overview</a> · <a href="#/run">#/run</a> · <a href="#/tasks">#/tasks</a> · ' +
+        '<a href="#/history">#/history</a> · <a href="#/runs/&lt;run_id&gt;">#/runs/&lt;run_id&gt;</a> · ' +
+        '<a href="#/atoms">#/atoms</a> · <a href="#/packs">#/packs</a></span>' +
       '</div>';
   }
 
@@ -1785,7 +2706,15 @@
     APP.lastRoute = routeKey;
 
     closeDrawer();
+    var confirmRoot = $('#confirmRoot');
+    if (confirmRoot && !confirmRoot.hidden) closeConfirm(false);
     setNav(route.name);
+
+    if (APP.pendingBanner) {
+      var pb = APP.pendingBanner;
+      APP.pendingBanner = null;
+      showBanner(pb.kind, pb.html, pb.ttl);
+    }
 
     var title = ROUTE_TITLE[route.name] || 'PanguVerse';
     var crumb = $('#crumb');
@@ -1798,10 +2727,13 @@
     };
 
     host.innerHTML = '<div class="loading"><span class="spinner"></span>加载中…</div>';
+    if (route.name !== 'tasks') APP.tasksReload = null;
 
     var task;
     if (route.name === 'overview') task = renderOverview(host, ctx);
     else if (route.name === 'run') task = renderRun(host, ctx);
+    else if (route.name === 'tasks') task = renderTasks(host, ctx);
+    else if (route.name === 'task-form') task = renderTaskForm(host, ctx, route);
     else if (route.name === 'history') task = renderHistory(host, ctx);
     else if (route.name === 'run-detail') task = renderDetail(host, ctx, route.id);
     else if (route.name === 'atoms') task = renderAtoms(host, ctx);
@@ -1862,7 +2794,20 @@
     });
 
     document.addEventListener('keydown', function (e) {
+      if (e.key === 'Tab') {
+        var cRoot = $('#confirmRoot');
+        if (!cRoot || cRoot.hidden) return;
+        var focusables = $$('button:not([tabindex="-1"])', cRoot);
+        if (focusables.length < 2) return;
+        var first = focusables[0];
+        var last = focusables[focusables.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        return;
+      }
       if (e.key === 'Escape') {
+        var confirmRoot = $('#confirmRoot');
+        if (confirmRoot && !confirmRoot.hidden) { closeConfirm(false); return; }
         if (!$('#drawerRoot').hidden) { closeDrawer(); return; }
         if (!$('#globalBanner').hidden) hideBanner();
       }

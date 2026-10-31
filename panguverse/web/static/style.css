@@ -955,3 +955,140 @@ select.select { appearance: none; background-image: linear-gradient(45deg, trans
 .phase[data-s="healed"] { color: #dbc7ff; border-color: rgba(195, 160, 255, 0.4); background: var(--heal-soft); }
 .phase[data-s="healed"] .p-dot { background: var(--heal); }
 .phase[data-s="skipped"] { color: var(--dim); border-style: dashed; }
+
+/* ------------------------------------------------------------------ */
+/* 20. 任务 CRUD 与「从历史修正重跑」                                   */
+/* ------------------------------------------------------------------ */
+.btn-danger {
+  background: #c8484f;
+  border-color: #c8484f;
+  color: #fff;
+  font-weight: 600;
+}
+.btn-danger:hover { background: #d95a61; border-color: #d95a61; }
+.btn-danger:focus-visible { outline-color: #ff9b9b; }
+
+.data.tasks-table { min-width: 860px; }
+.data.history-table { min-width: 900px; }
+.tasks-table td { vertical-align: top; }
+.task-name { font-size: 13px; color: var(--text); font-weight: 500; }
+.task-id { font-size: 11px; color: var(--dim); margin-top: 2px; }
+.task-target {
+  display: inline-block;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+.last-run { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.empty-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+
+/* 编辑态 / 预填态：已保存的密钥显示为 *** */
+.env-row-masked [data-env-key] { color: var(--text-2); }
+.env-row-masked [data-env-val] {
+  color: var(--warn);
+  letter-spacing: 0.12em;
+  border-style: dashed;
+}
+
+/* 失败修正面板（详情页顶部 + 预填表单常驻） */
+.fix-panel {
+  display: flex;
+  gap: 18px;
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  padding: 14px 16px;
+  border: 1px solid rgba(255, 122, 122, 0.42);
+  background: linear-gradient(180deg, rgba(255, 122, 122, 0.1), rgba(255, 122, 122, 0.045));
+  border-radius: var(--radius);
+}
+.fix-panel-top { margin-bottom: 16px; }
+.fix-panel-main { min-width: 0; flex: 1 1 420px; }
+.fix-kicker { font-size: 11.5px; letter-spacing: 0.06em; color: #ffb4b4; text-transform: uppercase; }
+.fix-panel h2 { font-size: 15px; color: #ffe1e1; margin-top: 3px; }
+.fix-panel .kv-grid { margin-top: 9px; grid-template-columns: 64px minmax(0, 1fr); }
+.fix-panel .kv-grid dd { color: #ffe4e4; }
+.fix-panel .kv-grid dd.mono { color: #ffd0d0; }
+.fix-panel .fix-empty { margin-top: 8px; font-size: 12.5px; color: #f0c0c0; }
+.fix-panel .fix-hint { margin-top: 9px; font-size: 12px; color: #eeb8b8; }
+.fix-panel .fix-hint code { color: #ffdada; }
+.fix-panel-actions { display: flex; flex-direction: column; align-items: flex-end; gap: 7px; flex: none; }
+.fix-panel-note { font-size: 11.5px; color: #e8b1b1; max-width: 230px; text-align: right; }
+
+/* 预填表单顶部固定展示原错误 */
+.fix-context { position: sticky; top: 58px; z-index: 12; }
+.fix-context .fix-panel {
+  margin-bottom: 16px;
+  background: rgba(38, 20, 24, 0.95);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow);
+}
+
+/* 失败块里的修正按钮 */
+.fb-fix { margin-left: auto; font-weight: 500; }
+
+/* 二次确认 */
+.confirm-root {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+}
+.confirm-backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  border: 0;
+  background: rgba(4, 8, 13, 0.72);
+  cursor: pointer;
+}
+.confirm-box {
+  position: relative;
+  width: min(460px, 100%);
+  background: var(--bg-elev);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 18px 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  animation: confirm-in 120ms ease-out;
+}
+@keyframes confirm-in { from { transform: scale(0.98); opacity: 0.6; } to { transform: none; opacity: 1; } }
+.confirm-box h2 { font-size: 15px; }
+.confirm-box p { font-size: 13px; color: var(--text-2); line-height: 1.65; }
+.confirm-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 4px; }
+
+/* 从历史挑一条 */
+.drawer-hint { font-size: 12.5px; color: var(--muted); margin-bottom: 10px; }
+.pick-list { display: flex; flex-direction: column; gap: 8px; }
+.pick-run {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  text-align: left;
+  background: #0c131c;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.pick-run:hover { border-color: rgba(56, 189, 248, 0.45); background: var(--panel-2); }
+.pick-run-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+.pick-run-meta { font-size: 11.5px; color: var(--dim); }
+
+@media (max-width: 900px) {
+  .fix-context { top: 46px; }
+  .fix-panel-actions { align-items: flex-start; }
+  .fix-panel-note { text-align: left; }
+}
