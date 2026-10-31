@@ -203,6 +203,9 @@ class WebAPI:
             if head == "runs" and len(rest) == 2 and rest[1] == "rerun":
                 job = service.rerun(self.jobs, self.root, rest[0], body)
                 return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
+            if head == "runs" and len(rest) == 2 and rest[1] == "save_as_task":
+                task = service.save_run_as_task(self.root, rest[0], body)
+                return json_response(task, status=201)
             if head == "tasks":
                 if not rest:
                     task = service.create_task(self.root, body)

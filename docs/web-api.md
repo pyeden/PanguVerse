@@ -190,6 +190,7 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 | `POST` | `/api/tasks/{task_id}/run` | `202 {job_id}`；可选 `{"env": {...}}` 仅本次覆盖 |
 | `GET` | `/api/runs/{run_id}/config` | 从磁盘还原该次运行的配置（env 打码） |
 | `POST` | `/api/runs/{run_id}/rerun` | `202 {job_id}`；可选 env 覆盖 / `save_as_task` |
+| `POST` | `/api/runs/{run_id}/save_as_task` | `201` 打码后的 task；**只建任务、不运行、不产生新 run** |
 
 摘要字段固定为 `task_id,name,mode,scenario,intent,updated_at,last_run_id,last_status,env_keys`
 ——**只给 env 键名，不给值**。
@@ -254,6 +255,15 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `env` 在 JSON 出口统一走 `mask_env_payload`（键名保留、敏感值 `***`）。
 - `error` 取**第一个非 passed 步骤**（用例名 + 步骤名 + `message/expected/actual`，消息再经 `jobs.sanitize_message`（`core/redact.py`）打码）；
   全部通过时为 `null`。缺字段给默认值，不返回 500。
+
+**从运行直接存为任务（不运行）**：`POST /api/runs/{run_id}/save_as_task`，body 仅 `{"name": "可选"}`
+
+- `201` 返回**打码后**的任务（`env` 值 `***`）；不产生新 run，`runs/` 目录数不变。
+- `env` 由服务端从磁盘（`plan.json` 优先）复制**真实值**，前端回传的 `"***"` 一律忽略、不会当真值；
+  demo/mock 目标继承的 `BASE_URL` 不会写进任务定义。
+- `mode/scenario/intent/regression/no_llm` 由 `meta.run_config` 推断，旧报告走上面的退化规则；
+  无法判定目标（如缺 `scenario`/`intent`）→ `400`，不猜。
+- `name` 缺省为 `重跑 <run_id>`；未知 run → `404`。
 
 **重跑**：`POST /api/runs/{run_id}/rerun`
 

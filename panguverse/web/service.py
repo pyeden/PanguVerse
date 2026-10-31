@@ -1239,6 +1239,42 @@ def rerun(jobs: JobManager, root: Path, run_id: str, payload: Any = None) -> Job
     return submit_run(jobs, root, body)
 
 
+def save_run_as_task(root: Path, run_id: str, payload: Any = None) -> dict[str, Any]:
+    """``POST /api/runs/{run_id}/save_as_task``：只建任务、不运行、不产生新 run。
+
+    env 由服务端从磁盘（``plan.json`` 优先）复制**真值**，前端即使回传 ``"***"``
+    也不会被当成值；``mode/scenario/intent/regression/no_llm`` 走 ``run_config``
+    与旧报告退化规则，目标无法判定时直接 400（不猜）。
+    """
+    config, meta = _run_config_core(root, run_id)
+    data = _as_body(payload)
+    mode = config["mode"]
+    scenario = config["scenario"]
+    intent = config["intent"]
+    if mode == "scenario" and not scenario:
+        raise ApiError("bad_request", "无法从该运行还原场景配置（缺少 scenario）")
+    if mode == "intent" and not intent:
+        raise ApiError("bad_request", "无法从该运行还原意图配置（缺少 intent）")
+    env = dict(config["env"])
+    raw_config = meta.get("run_config")
+    uses_mock = bool(raw_config.get("uses_mock")) if isinstance(raw_config, dict) else False
+    if uses_mock:
+        env.pop("BASE_URL", None)  # mock 端口随进程消失，不能写进任务定义
+    name = _clean_name(data.get("name") or f"重跑 {run_id}")
+    return create_task(
+        root,
+        {
+            "name": name,
+            "mode": mode,
+            "scenario": scenario,
+            "intent": intent,
+            "env": env,
+            "regression": config["regression"],
+            "no_llm": config["no_llm"],
+        },
+    )
+
+
 __all__ = [
     "BUILTIN_SCENARIOS",
     "MOCK_TARGET_KIND",
@@ -1278,6 +1314,7 @@ __all__ = [
     "runs_root",
     "safe_message",
     "save_last_env",
+    "save_run_as_task",
     "status_payload",
     "submit_run",
     "task_summary",

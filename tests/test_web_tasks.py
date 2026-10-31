@@ -466,6 +466,78 @@ def test_a23_rerun_rejects_unresolvable_config(web: Client) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# A26a/A26b：从 run 直接存任务（不运行、密钥取磁盘真值）
+# --------------------------------------------------------------------------- #
+def test_a26a_save_as_task_uses_disk_env_and_creates_no_run(web: Client) -> None:
+    status, body = web.json("POST", "/api/runs", {"mode": "demo"})
+    assert status == 202
+    source = web.wait_job(body["job_id"])
+    assert source["status"] == "done"
+    runs_dir = web.workspace / "runs"
+    before = sorted(p.name for p in runs_dir.iterdir())
+
+    status, task = web.json(
+        "POST",
+        f"/api/runs/{source['run_id']}/save_as_task",
+        {"name": "仅保存的任务", "env": {"API_PASSWORD": "***"}},  # env 必须被忽略
+    )
+    assert status == 201, task
+    assert task["name"] == "仅保存的任务"
+    assert task["mode"] == "demo"
+    assert task["env"]["API_PASSWORD"] == "***"  # HTTP 出口仍打码
+    assert "demo123" not in json.dumps(task, ensure_ascii=False)
+
+    disk = json.loads(task_file(web, task["task_id"]).read_text(encoding="utf-8"))
+    assert disk["env"]["API_PASSWORD"] == "demo123"  # 磁盘真值，不是 ***
+    assert "BASE_URL" not in disk["env"]  # mock 端口不入库
+
+    # 只建任务：不产生新 run
+    assert sorted(p.name for p in runs_dir.iterdir()) == before
+
+
+def test_a26a_save_as_task_default_name_and_unknown_run(web: Client) -> None:
+    status, body = web.json("POST", "/api/runs", {"mode": "demo"})
+    source = web.wait_job(body["job_id"])
+    status, task = web.json("POST", f"/api/runs/{source['run_id']}/save_as_task", {})
+    assert status == 201, task
+    assert task["name"] == f"重跑 {source['run_id']}"
+
+    status, body = web.json("POST", "/api/runs/abcdef123456/save_as_task", {})
+    assert status == 404
+    assert_error(body, "not_found")
+
+
+def test_a26a_save_as_task_refuses_unknown_target(web: Client) -> None:
+    """旧报告无法判定目标：400，不猜一个场景出来。"""
+    run_dir = web.workspace / "runs" / "abcdef123456"
+    run_dir.mkdir(parents=True)
+    (run_dir / "report.json").write_text(
+        json.dumps({"run_id": "abcdef123456", "meta": {"plan_source": "spec"}, "cases": []}),
+        encoding="utf-8",
+    )
+    status, body = web.json("POST", "/api/runs/abcdef123456/save_as_task", {})
+    assert status == 400
+    assert_error(body, "bad_request")
+
+
+def test_a26b_saved_task_runs_without_losing_secret(web: Client) -> None:
+    status, body = web.json("POST", "/api/runs", {"mode": "demo"})
+    source = web.wait_job(body["job_id"])
+    status, task = web.json("POST", f"/api/runs/{source['run_id']}/save_as_task", {})
+    assert status == 201, task
+
+    status, body = web.json("POST", f"/api/tasks/{task['task_id']}/run", {})
+    assert status == 202, body
+    job = web.wait_job(body["job_id"])
+    assert job["status"] == "done", job  # 密钥没丢才能 7/7
+    assert job["summary"]["total"] == 7
+    assert job["summary"]["passed"] == 7
+
+    disk = json.loads(task_file(web, task["task_id"]).read_text(encoding="utf-8"))
+    assert disk["env"]["API_PASSWORD"] == "demo123"
+
+
+# --------------------------------------------------------------------------- #
 # A24：非法输入
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize(
