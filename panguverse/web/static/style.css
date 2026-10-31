@@ -1092,3 +1092,16 @@ select.select { appearance: none; background-image: linear-gradient(45deg, trans
   .fix-panel-actions { align-items: flex-start; }
   .fix-panel-note { text-align: left; }
 }
+
+/* v2.0.2：从历史直存端点缺失时的降级警告（常驻，不自动消失） */
+.form-warning {
+  border: 1px solid rgba(245, 192, 74, 0.45);
+  background: var(--warn-soft);
+  color: #ffe0a3;
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  font-size: 12.5px;
+  line-height: 1.65;
+}
+.form-warning code { color: #ffe9bd; }
+.form-warning b { color: #fff0c4; }

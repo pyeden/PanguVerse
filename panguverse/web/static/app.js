@@ -66,7 +66,8 @@
     lastRoute: null,
     bannerRoute: null,
     pendingBanner: null,
-    tasksReload: null
+    tasksReload: null,
+    saveAsTaskSupported: null
   };
 
   /* ================================================================== */
@@ -2216,8 +2217,12 @@
     var envNote = isEdit
       ? '带 <code>***</code> 的是已保存的密钥：留空或保持 <code>***</code> 表示沿用已保存值；删除整行表示移除该键。'
       : (fromRun
-        ? '带 <code>***</code> 的值来自原运行，服务端不回传明文：「保存并运行」会沿用真实值；仅保存时会跳过这些键。'
+        ? (APP.saveAsTaskSupported === false
+          ? '当前后端不支持从历史直存（<code>save_as_task</code> 返回 404）：<strong>「仅保存配置」会跳过带 <code>***</code> 的密钥，保存后直接运行会因缺密钥失败</strong>；请改用「保存并运行」，或保存后手动补齐。'
+          : '带 <code>***</code> 的值来自原运行：「仅保存配置」由服务端复制真实值并应用上方修改（不运行），「保存并运行」会沿用原值。')
         : '键值对会作为运行时环境传入（如 BASE_URL、API_USERNAME）。留空的行会被忽略。');
+
+    var saveLabel = fromRun ? '仅保存配置' : '保存';
 
     return '' +
       '<div class="page-head">' +
@@ -2261,7 +2266,7 @@
           '<label class="checkbox"><input type="checkbox" id="taskNoLlm"' + (seed.no_llm ? ' checked' : '') + '><span>强制离线规则规划（no_llm）</span></label>' +
         '</div>' +
         '<div class="form-actions">' +
-          '<button type="submit" class="btn btn-primary" id="taskSave">保存</button>' +
+          '<button type="submit" class="btn btn-primary" id="taskSave" data-label="' + esc(saveLabel) + '">' + esc(saveLabel) + '</button>' +
           '<button type="button" class="btn" id="taskSaveRun">保存并运行</button>' +
           '<button type="button" class="btn btn-ghost" id="taskCancel">取消</button>' +
           '<span class="form-note" id="taskNote">保存后可在任务列表一键运行。</span>' +
@@ -2390,7 +2395,7 @@
     });
     var save = $('#taskSave', form);
     var saveRun = $('#taskSaveRun', form);
-    if (save) save.textContent = busy ? '提交中…' : '保存';
+    if (save) save.textContent = busy ? '提交中…' : (save.getAttribute('data-label') || '保存');
     if (saveRun) saveRun.textContent = busy ? '提交中…' : '保存并运行';
     var note = $('#taskNote', form);
     if (note) note.textContent = busy ? '正在提交，请勿重复点击。' : '保存后可在任务列表一键运行。';
@@ -2420,7 +2425,31 @@
       state.busy = false;
       setTaskBusy(form, false);
       var name = (saved && saved.name) || payload.name;
-      if (opts.job) {
+      if (opts.degraded) {
+        goRoute('#/tasks', {
+          kind: 'warn',
+          ttl: 0,
+          html: '<strong>任务已保存，但当前后端不支持从历史直存（HTTP 404）。</strong> 已跳过密钥：<b>' +
+            esc((opts.skipped || []).join('、')) +
+            '</b>。该任务直接运行会因缺密钥失败；请到编辑页补齐，或改用「保存并运行」。'
+        });
+      } else if (opts.viaEndpoint) {
+        if (opts.patchError) {
+          goRoute('#/tasks', {
+            kind: 'warn',
+            ttl: 0,
+            html: '<strong>任务已保存：</strong>' + esc(name) +
+              '（env 已从原运行复制），但表单里的修改未生效：' + esc(opts.patchError) +
+              '。请到编辑页重新保存。'
+          });
+        } else {
+          goRoute('#/tasks', {
+            kind: 'info',
+            html: '<strong>任务已保存：</strong>' + esc(name) + '（含原运行的完整环境变量）',
+            ttl: 8000
+          });
+        }
+      } else if (opts.job) {
         var jobExtra = '';
         if (opts.skipped && opts.skipped.length) {
           jobExtra = ' 注意：' + esc(opts.skipped.join('、')) + ' 的值不会回传前端，新任务里需要重新填写。';
@@ -2487,11 +2516,47 @@
         return;
       }
 
-      var body = taskBodyFromPayload(payload);
-      masked.forEach(function (k) { delete body.env[k]; });
-      apiPost(API + 'tasks', body).then(function (saved) {
-        done(saved, { skipped: masked });
-      }).catch(fail);
+      var fallbackSave = function () {
+        var body = taskBodyFromPayload(payload);
+        masked.forEach(function (k) { delete body.env[k]; });
+        apiPost(API + 'tasks', body).then(function (saved) {
+          done(saved, { skipped: masked, degraded: masked.length > 0 });
+        }).catch(fail);
+      };
+
+      // v2.0.2：优先让服务端从磁盘复制真实 env（不运行、不产生新 run）
+      if (APP.saveAsTaskSupported === false) {
+        fallbackSave();
+        return;
+      }
+      apiPost(API + 'runs/' + encodeURIComponent(state.runId) + '/save_as_task', {
+        name: payload.name
+      }).then(function (saved) {
+        APP.saveAsTaskSupported = true;
+        // 端点只收 name：把预填表单里改过的 env / 模式叠加到已复制的真实 env 上
+        var cfg = state.config || {};
+        var patch = {
+          mode: payload.mode,
+          scenario: payload.scenario,
+          intent: payload.intent,
+          regression: payload.regression,
+          no_llm: payload.no_llm,
+          env: mergeEnvForPatch(payload.env, cfg.env || {})
+        };
+        return apiPatch(API + 'tasks/' + encodeURIComponent(saved.task_id), patch).then(function (updated) {
+          done(updated || saved, { viaEndpoint: true });
+        }).catch(function (err) {
+          done(saved, { viaEndpoint: true, patchError: err && err.message ? err.message : '未知错误' });
+        });
+      }).catch(function (err) {
+        if (err && err.status === 404) {
+          // 旧后端没有该端点：退回旧行为，但用常驻横幅明确风险
+          APP.saveAsTaskSupported = false;
+          fallbackSave();
+          return;
+        }
+        fail(err);
+      });
       return;
     }
 
@@ -2533,6 +2598,20 @@
       addEnvRow(envRows);
     } else {
       addEnvRow(envRows);
+    }
+
+    if (state.runId && !state.task && APP.saveAsTaskSupported === false) {
+      var maskedKeys = seedKeys.filter(function (k) { return seed.env[k] === '***'; });
+      if (maskedKeys.length) {
+        var warn = document.createElement('div');
+        warn.className = 'form-warning';
+        warn.setAttribute('role', 'alert');
+        warn.innerHTML = '<strong>降级模式：</strong>当前后端没有 <code>save_as_task</code> 端点（HTTP 404）。' +
+          '「仅保存配置」会跳过这些密钥：<b>' + esc(maskedKeys.join('、')) + '</b>；' +
+          '保存后直接运行会因缺密钥失败。请改用「保存并运行」，或保存后到编辑页补齐。';
+        var envField = envRows && envRows.parentNode;
+        if (envField) envField.appendChild(warn);
+      }
     }
 
     var addBtn = $('#taskAddEnv', form);
