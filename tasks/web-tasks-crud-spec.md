@@ -2,6 +2,7 @@
 
 > 用户诉求：**运行的任务能增删改查**；**从运行历史点进去，按错误信息改配置再跑**。
 > 前置：`tasks/web-app-mvp-spec.md`（v1.4）已交付并验收通过；本文只描述增量。
+> 修订：v2.0.1（2026-10-31）任务落盘改为 `.panguverse/tasks/`（QA F3 文档对齐）
 
 ---
 
@@ -12,7 +13,7 @@
 
 ## 2. 数据模型：任务（Task Def）
 
-落盘：`<workspace>/tasks/<task_id>.json`，目录 `0700`、文件 `0600`（含 env 明文，与 `last_env.json` 同策略）。
+落盘：`<workspace>/.panguverse/tasks/<task_id>.json`，目录 `0700`、文件 `0600`（**不放 `<workspace>/tasks/`**：那是仓库放契约文档的目录，会撞名且把含明文 env 的文件变成 untracked）（含 env 明文，与 `last_env.json` 同策略）。
 
 ```json
 {
@@ -121,7 +122,7 @@
 
 | # | 项 | 判定 |
 | --- | --- | --- |
-| A17 | `POST /api/tasks` 合法体 | 201；`<workspace>/tasks/<id>.json` 存在、`0600`、未 git 跟踪 |
+| A17 | `POST /api/tasks` 合法体 | 201；`<workspace>/.panguverse/tasks/<id>.json` 存在、`0600`、未 git 跟踪；`<workspace>/tasks/` **不得**被创建 |
 | A18 | `GET /api/tasks` / `GET /api/tasks/{id}` | 200；列表只给 `env_keys`；详情 env 值为 `***`，`grep demo123` 零命中 |
 | A19 | `PATCH` 部分更新 | 只改出现字段；`env` 传 `"***"` 不覆盖旧值；传 `null` 删键；其余覆盖 |
 | A20 | `DELETE` | 204；任务文件消失；`runs/` 下历史目录**数量不变** |
