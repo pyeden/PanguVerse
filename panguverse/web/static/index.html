@@ -10,7 +10,7 @@
 </head>
 <body>
 <a class="skip-link" href="#view">跳到主内容</a>
-<div class="app">
+<div class="app" id="appShell" hidden>
   <aside class="sidebar">
     <div class="brand">
       <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">
@@ -48,6 +48,8 @@
     <header class="topbar">
       <div class="crumb" id="crumb">概览</div>
       <div class="topbar-right">
+        <span class="whoami" id="whoami" hidden></span>
+        <button type="button" class="btn btn-sm btn-ghost" data-act="logout" id="logoutBtn" hidden>退出登录</button>
         <span class="conn" id="connState" data-state="pending"><span class="conn-dot" aria-hidden="true"></span>连接中…</span>
       </div>
     </header>
@@ -57,6 +59,11 @@
     <main id="view" tabindex="-1" aria-live="polite"></main>
   </div>
 </div>
+
+<div id="bootRoot" class="boot-root">
+  <div class="boot-card"><span class="spinner" aria-hidden="true"></span><span>正在验证登录状态…</span></div>
+</div>
+<div id="loginRoot" class="login-root" hidden></div>
 
 <div id="jobDock" class="job-dock" aria-live="polite" hidden></div>
 <div id="drawerRoot" class="drawer-root" hidden></div>

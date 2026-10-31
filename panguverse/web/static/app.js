@@ -67,7 +67,8 @@
     bannerRoute: null,
     pendingBanner: null,
     tasksReload: null,
-    saveAsTaskSupported: null
+    saveAsTaskSupported: null,
+    auth: { authenticated: false, user: '', legacy: false, next: null, redirecting: false, loggingOut: false }
   };
 
   /* ================================================================== */
@@ -210,6 +211,10 @@
           } else if (typeof payload === 'string' && payload.trim()) {
             msg = payload.trim().slice(0, 300);
           }
+          // 会话过期：任何业务接口的 401 都统一回登录视图（auth 自身接口除外）
+          if (res.status === 401 && path.indexOf('api/auth/') !== 0) {
+            handleUnauthorized();
+          }
           throw new ApiError(msg || ('请求失败（HTTP ' + res.status + '）'), res.status, code);
         }
         if (emptyBody) return null;
@@ -272,6 +277,7 @@
   /* 4. 横幅 / Toast / 抽屉                                              */
   /* ================================================================== */
   function showBanner(kind, html, ttl) {
+    if (!APP.auth || !APP.auth.authenticated) return;
     var banner = $('#globalBanner');
     if (!banner) return;
     // 横幅只在「产生它的视图」内有效：路由一变就收，避免带着上一页的成功提示
@@ -301,6 +307,7 @@
   }
 
   function toast(message, kind, ttl) {
+    if (!APP.auth || !APP.auth.authenticated) return;
     var host = $('#toasts');
     if (!host) return;
     var node = document.createElement('div');
@@ -2717,6 +2724,271 @@
     });
   }
 
+
+  /* ================================================================== */
+  /* 13.6 登录认证                                                       */
+  /* ================================================================== */
+  function showBoot() {
+    var app = $('#appShell');
+    if (app) app.hidden = true;
+    var login = $('#loginRoot');
+    if (login) { login.hidden = true; login.innerHTML = ''; }
+    var boot = $('#bootRoot');
+    if (boot) boot.hidden = false;
+  }
+
+  function setAuthChrome() {
+    var who = $('#whoami');
+    var out = $('#logoutBtn');
+    var show = !!(APP.auth.authenticated && !APP.auth.legacy);
+    if (who) {
+      who.hidden = !show;
+      who.textContent = show ? (APP.auth.user || '') : '';
+      who.title = show && APP.auth.user ? '当前账号：' + APP.auth.user : '';
+    }
+    if (out) out.hidden = !show;
+  }
+
+  function showAppView() {
+    var boot = $('#bootRoot');
+    if (boot) boot.hidden = true;
+    var login = $('#loginRoot');
+    if (login) { login.hidden = true; login.innerHTML = ''; }
+    var app = $('#appShell');
+    if (app) app.hidden = false;
+    var skip = $('.skip-link');
+    if (skip) skip.hidden = false;
+    setAuthChrome();
+  }
+
+  function loginCardHtml(opts) {
+    opts = opts || {};
+    return '' +
+      '<div class="login-card" role="main" aria-labelledby="loginTitle">' +
+        '<div class="login-brand">' +
+          '<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">' +
+            '<path d="M7 24L16 6l9 18z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>' +
+            '<path d="M11.5 19h9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>' +
+          '</svg>' +
+          '<div><h1 id="loginTitle">登录 PanguVerse</h1><div class="sub">自动化编排控制台</div></div>' +
+        '</div>' +
+        (opts.notice ? '<div class="login-notice" role="status">' + esc(opts.notice) + '</div>' : '') +
+        '<div class="login-error" id="loginError" role="alert"' + (opts.error ? '' : ' hidden') + '>' +
+          esc(opts.error || '') + '</div>' +
+        '<form class="login-form" id="loginForm" novalidate>' +
+          '<div class="field">' +
+            '<label for="loginUser">账号</label>' +
+            '<input class="input" id="loginUser" name="username" autocomplete="username" spellcheck="false" placeholder="admin" value="' + esc(opts.user || '') + '">' +
+          '</div>' +
+          '<div class="field">' +
+            '<label for="loginPass">密码</label>' +
+            '<input class="input" id="loginPass" name="password" type="password" autocomplete="current-password" spellcheck="false" placeholder="输入密码">' +
+          '</div>' +
+          '<button type="submit" class="btn btn-primary" id="loginSubmit">登录</button>' +
+          (opts.retry ? '<button type="button" class="btn btn-sm btn-ghost" data-auth-retry>重新检测服务端</button>' : '') +
+        '</form>' +
+        '<div class="login-foot">会话有效期 12 小时；刷新页面会校验服务端会话。</div>' +
+      '</div>';
+  }
+
+  function setLoginError(message) {
+    var el = $('#loginError');
+    if (!el) return;
+    el.textContent = message || '';
+    el.hidden = !message;
+  }
+
+  function bindLoginView(root) {
+    var form = $('#loginForm', root);
+    if (form) {
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        submitLogin(form);
+      });
+    }
+    var retry = $('[data-auth-retry]', root);
+    if (retry) retry.addEventListener('click', function () { initAuth(); });
+  }
+
+  function showLoginView(opts) {
+    opts = opts || {};
+    var boot = $('#bootRoot');
+    if (boot) boot.hidden = true;
+    var app = $('#appShell');
+    if (app) app.hidden = true;
+    var skip = $('.skip-link');
+    if (skip) skip.hidden = true;
+    var root = $('#loginRoot');
+    if (!root) return;
+    root.hidden = false;
+    root.innerHTML = loginCardHtml(opts);
+    bindLoginView(root);
+    document.title = '登录 · PanguVerse';
+    var userEl = $('#loginUser', root);
+    var pwdEl = $('#loginPass', root);
+    if (userEl && !userEl.value) userEl.focus();
+    else if (pwdEl) pwdEl.focus();
+  }
+
+  function submitLogin(form) {
+    if (!form || form.dataset.busy === '1') return;
+    var userEl = $('#loginUser', form);
+    var pwdEl = $('#loginPass', form);
+    var btn = $('#loginSubmit', form);
+    var username = userEl ? userEl.value.trim() : '';
+    var password = pwdEl ? pwdEl.value : '';
+
+    if (!username || !password) {
+      setLoginError('请输入账号和密码。');
+      if (!username && userEl) userEl.focus();
+      else if (pwdEl) pwdEl.focus();
+      return;
+    }
+
+    form.dataset.busy = '1';
+    setLoginError('');
+    if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
+
+    apiPost(API + 'auth/login', { username: username, password: password }).then(function (res) {
+      if (pwdEl) pwdEl.value = '';
+      form.dataset.busy = '';
+      APP.auth.authenticated = true;
+      APP.auth.user = (res && res.user) || username;
+      APP.auth.legacy = false;
+      APP.auth.redirecting = false;
+
+      var next = APP.auth.next;
+      APP.auth.next = null;
+      if (!next || next.charAt(0) !== '#' || next === '#') next = '#/overview';
+
+      showAppView();
+      restoreJob();
+      if (location.hash !== next) location.hash = next;
+      else render();
+      refreshStatus();
+      toast('已登录：' + (APP.auth.user || username), 'ok');
+    }).catch(function (err) {
+      if (pwdEl) pwdEl.value = '';
+      form.dataset.busy = '';
+      if (btn) { btn.disabled = false; btn.textContent = '登录'; }
+      setLoginError(err && err.message ? err.message : '登录失败');
+      if (pwdEl) pwdEl.focus();
+    });
+  }
+
+  function resetClientState() {
+    stopJobTimers();
+    APP.job = { id: null, mode: '', data: null, error: null, lost: false, startedLocal: 0, poll: null, tick: null, dismiss: false, notified: null };
+    try { localStorage.removeItem('pv.activeJob'); } catch (e) { /* noop */ }
+    APP.status = null;
+    APP.atomsAll = null;
+    APP.atomFilters = { domain: '', tag: '', category: '' };
+    APP.pendingBanner = null;
+    APP.bannerRoute = null;
+    APP.lastRoute = null;
+    APP.tasksReload = null;
+    APP.saveAsTaskSupported = null;
+    APP.seq++;
+    if (APP.controller) {
+      try { APP.controller.abort(); } catch (e) { /* noop */ }
+      APP.controller = null;
+    }
+    hideBanner();
+    closeDrawer();
+    var confirmRoot = $('#confirmRoot');
+    if (confirmRoot && !confirmRoot.hidden) closeConfirm(false);
+    var dock = $('#jobDock');
+    if (dock) { dock.hidden = true; dock.innerHTML = ''; }
+    var view = $('#view');
+    if (view) view.innerHTML = '';
+    var toasts = $('#toasts');
+    if (toasts) toasts.innerHTML = '';
+  }
+
+  function handleUnauthorized() {
+    if (!APP.auth.authenticated || APP.auth.redirecting) return;
+    APP.auth.redirecting = true;
+    APP.auth.legacy = false;
+    var h = location.hash;
+    APP.auth.next = (h && h.charAt(0) === '#' && h !== '#' && h !== '#/overview') ? h : null;
+    APP.auth.authenticated = false;
+    APP.auth.user = '';
+    resetClientState();
+    showLoginView({ notice: '登录已过期，请重新登录' });
+    setTimeout(function () { APP.auth.redirecting = false; }, 0);
+  }
+
+  function doLogout(btn) {
+    if (APP.auth.loggingOut) return;
+    APP.auth.loggingOut = true;
+    if (btn) { btn.disabled = true; btn.textContent = '退出中…'; }
+    apiPost(API + 'auth/logout', {}).then(finishLogout).catch(function (err) {
+      if (err && err.status === 401) { finishLogout(); return; }
+      APP.auth.loggingOut = false;
+      if (btn) { btn.disabled = false; btn.textContent = '退出登录'; }
+      showBanner('error', '<strong>退出失败：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
+    });
+
+    function finishLogout() {
+      APP.auth.loggingOut = false;
+      APP.auth.authenticated = false;
+      APP.auth.user = '';
+      APP.auth.legacy = false;
+      APP.auth.next = null;
+      APP.auth.redirecting = false;
+      resetClientState();
+      showLoginView({ notice: '已退出登录' });
+      if (btn) { btn.disabled = false; btn.textContent = '退出登录'; }
+    }
+  }
+
+  function initAuth() {
+    showBoot();
+    apiGet(API + 'auth/status').then(function (st) {
+      var disabled = !!(st && (st.auth_disabled === true || st.auth_enabled === false));
+      if (st && (st.authenticated === true || disabled)) {
+        APP.auth.authenticated = true;
+        APP.auth.user = st.user || '';
+        APP.auth.legacy = disabled;
+        var h = location.hash;
+        APP.auth.next = (!disabled && h && h.indexOf('#/') === 0 && h !== '#/overview') ? h : null;
+        showAppView();
+        restoreJob();
+        render();
+        if (parseRoute().name !== 'overview') refreshStatus();
+        return;
+      }
+      APP.auth.authenticated = false;
+      APP.auth.user = '';
+      APP.auth.legacy = false;
+      var cur = location.hash;
+      APP.auth.next = (cur && cur.indexOf('#/') === 0 && cur !== '#/overview') ? cur : null;
+      showLoginView({});
+    }).catch(function (err) {
+      if (err && err.status === 404) {
+        // 旧后端或 --no-auth 未暴露 auth/status：按无认证模式继续
+        APP.auth.authenticated = true;
+        APP.auth.legacy = true;
+        APP.auth.user = '';
+        showAppView();
+        restoreJob();
+        render();
+        if (parseRoute().name !== 'overview') refreshStatus();
+        return;
+      }
+      if (err && err.status === 401) {
+        APP.auth.authenticated = false;
+        APP.auth.legacy = false;
+        showLoginView({});
+        return;
+      }
+      showLoginView({
+        error: '无法读取登录状态：' + (err && err.message ? err.message : '未知错误'),
+        retry: true
+      });
+    });
+  }
+
   /* ================================================================== */
   /* 14. 路由                                                            */
   /* ================================================================== */
@@ -2778,6 +3050,7 @@
   }
 
   function render() {
+    if (!APP.auth.authenticated) return;
     var seq = ++APP.seq;
     var route = parseRoute();
     var host = $('#view');
@@ -2872,6 +3145,7 @@
         else if (act === 'run-regression') { e.preventDefault(); startRegression(); }
         else if (act === 'job-dismiss') { APP.job.dismiss = true; renderJobPanels(); }
         else if (act === 'job-detail') { location.hash = '#/runs/' + actEl.getAttribute('data-run'); }
+        else if (act === 'logout') { e.preventDefault(); doLogout(actEl); }
       }
 
       if (target.closest('[data-drawer-close]')) { closeDrawer(); return; }
@@ -2917,9 +3191,7 @@
     if (!location.hash || location.hash === '#' || location.hash === '#/') {
       try { history.replaceState(null, '', '#/overview'); } catch (e) { location.hash = '#/overview'; }
     }
-    restoreJob();
-    render();
-    if (parseRoute().name !== 'overview') refreshStatus();
+    initAuth();
   }
 
   if (document.readyState === 'loading') {
