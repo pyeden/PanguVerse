@@ -186,7 +186,7 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 | `GET` | `/api/tasks/{task_id}` | 完整任务（env 值经 `mask_env_payload` 打码） |
 | `POST` | `/api/tasks` | 新建，`201` + 打码后的任务 |
 | `PATCH` | `/api/tasks/{task_id}` | 部分更新，`200`；未知 id `404` |
-| `DELETE` | `/api/tasks/{task_id}` | `204`；**只删任务定义，不删 `runs/` 产物** |
+| `DELETE` | `/api/tasks/{task_id}` | `204`，无响应体且不带 `Content-Type`；**只删任务定义，不删 `runs/` 产物** |
 | `POST` | `/api/tasks/{task_id}/run` | `202 {job_id}`；可选 `{"env": {...}}` 仅本次覆盖 |
 | `GET` | `/api/runs/{run_id}/config` | 从磁盘还原该次运行的配置（env 打码） |
 | `POST` | `/api/runs/{run_id}/rerun` | `202 {job_id}`；可选 env 覆盖 / `save_as_task` |

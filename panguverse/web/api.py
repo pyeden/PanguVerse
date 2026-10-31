@@ -216,7 +216,13 @@ class WebAPI:
         elif method == "DELETE":
             if head == "tasks" and len(rest) == 1:
                 service.delete_task(self.root, rest[0])
-                return Response(status=204, body=b"", headers={"Cache-Control": "no-store"})
+                # 204 无实体：content_type 留空，server 层也不会写 Content-Type/Content-Length
+                return Response(
+                    status=204,
+                    body=b"",
+                    content_type="",
+                    headers={"Cache-Control": "no-store"},
+                )
 
         raise ApiError("not_found", "接口不存在")
 

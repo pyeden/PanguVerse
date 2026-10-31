@@ -271,15 +271,21 @@ def test_a20_delete_task_keeps_runs(web: Client) -> None:
         (directory / "report.json").write_text("{}", encoding="utf-8")
     before = sorted(p.name for p in runs_dir.iterdir())
 
-    status, _headers, body = web.request("DELETE", f"/api/tasks/{task['task_id']}")
+    status, headers, body = web.request("DELETE", f"/api/tasks/{task['task_id']}")
     assert status == 204
     assert body == b""
+    # F1：204 无实体，不得带 Content-Type/Content-Length（否则前端 res.json() 空体 reject）
+    lowered = {key.lower(): value for key, value in headers.items()}
+    assert "content-type" not in lowered, headers
+    assert "content-length" not in lowered, headers
     assert not task_file(web, task["task_id"]).exists()
     assert sorted(p.name for p in runs_dir.iterdir()) == before
 
-    status, body = web.json("DELETE", f"/api/tasks/{task['task_id']}")
+    status, headers404, body404 = web.request("DELETE", f"/api/tasks/{task['task_id']}")
     assert status == 404
-    assert_error(body, "not_found")
+    # 错误响应仍然必须是 JSON
+    assert headers404.get("Content-Type", "").startswith("application/json"), headers404
+    assert_error(json.loads(body404.decode("utf-8")), "not_found")
 
 
 # --------------------------------------------------------------------------- #

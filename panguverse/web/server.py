@@ -135,15 +135,19 @@ class PanguverseRequestHandler(BaseHTTPRequestHandler):
         headers: dict[str, str] | None = None,
     ) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
+        # 204/304/1xx 按 HTTP 语义没有实体：不写 Content-Type，也不写 Content-Length 与 body。
+        # 只回「空体 + JSON Content-Type」会让前端 res.json() 对空体 reject（F1）。
+        bodyless = status in (204, 304) or 100 <= status < 200
+        if not bodyless:
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         if self.close_connection:
             self.send_header("Connection", "close")
         self.end_headers()
-        if self.command != "HEAD" and body:
+        if not bodyless and self.command != "HEAD" and body:
             self.wfile.write(body)
 
     def log_message(self, format: str, *args: object) -> None:
