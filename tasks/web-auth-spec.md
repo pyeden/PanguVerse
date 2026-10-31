@@ -1,5 +1,6 @@
 # /panguverse/ 登录认证 · 开发契约 v2.1
 
+> 修订：v2.1.1（2026-10-31）会话密钥启动轮换（F2）、受信代理链路取真实客户端 IP（F1）、日志口径澄清
 > 背景：端点已公网暴露（`https://seres-ai.com/panguverse/`），`serve` 无认证，知道路径就能跑任务、读报告。
 > 目标：**默认开启登录**，不依赖 nginx basic auth（省一次 root 重载），直接由应用层做。
 
@@ -11,6 +12,7 @@
   2. `<workspace>/.panguverse/web/auth.json`（`0600`）：`{algo, iterations, salt, hash, user, updated_at}`；
   3. 都没有 → **首次启动生成随机密码**（16 字符，去易混字符），把 PBKDF2 哈希写入 `auth.json`，并把明文密码打印到启动日志一行：`[auth] 初始账号 admin，初始密码 <pwd>（首次启动生成，仅显示这一次）`。
 - 算法：`pbkdf2_hmac('sha256', pwd, salt, 200_000)`，salt 32 字节随机；比较用 `hmac.compare_digest`。
+- **会话密钥轮换**：每次进程启动生成新的 `session.key`（不复用旧的），即**重启后所有既有会话失效**，彻底避免「登出黑名单只在内存、重启后旧 Cookie 复活」。（v2.1.1，QA F2）
 - 会话：Cookie `pv_session`，值 `base64url(payload).base64url(hmac_sha256(payload, session_key))`；`payload={u,exp,nonce}`；有效期 12h；密钥存 `<workspace>/.panguverse/web/session.key`（32 随机字节，`0600`，缺失则生成）。
 - Cookie 属性：`HttpOnly; Path=/; SameSite=Lax`；当 `X-Forwarded-Proto=https` 时追加 `Secure`。
 
@@ -48,6 +50,11 @@
 4. 会话签名用独立密钥，**不得**复用 env 里的任何值。
 5. Cookie 校验要检查 HMAC、`exp`、`u` 与当前账号一致；任一项不过按未认证处理（不 500）。
 6. `--host 0.0.0.0` 且未开启认证时必须打印醒目警告。
+7. **客户端 IP 解析（v2.1.1，QA F1）**：限流桶必须按**真实客户端**计数，否则 nginx 反代后所有人共用一个桶，任意一人连错 5 次即可锁死全体登录（DoS）。
+   - 直连（对端不是受信代理）→ 用 TCP 对端 IP；
+   - 对端是回环/受信代理 → 取 `X-Forwarded-For` **最右一跳**（nginx `proxy_add_x_forwarded_for` 追加的那一跳），非法/缺失时回退对端 IP；
+   - 绝不直接信任客户端可伪造的整串 `X-Forwarded-For`（只取最右，且仅当对端受信）。
+8. **日志口径澄清**：首启生成的初始密码**允许打印一次**（这是唯一的凭据交付通道，不是日志泄漏）；除此之外——用户提交的密码、请求体、响应体——任何情况下不得出现在日志里。
 
 ## 4. 前端（ui）
 
