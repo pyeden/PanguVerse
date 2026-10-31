@@ -19,7 +19,7 @@ import pytest
 from panguverse.web import auth as auth_mod
 from panguverse.web.api import WebAPI
 from panguverse.web.auth import COOKIE_NAME, AuthManager, store_password
-from panguverse.web.server import PanguverseHTTPServer, create_server
+from panguverse.web.server import PanguverseHTTPServer, create_server, resolve_client_ip
 
 _DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 PASSWORD = "correct-horse-battery"
@@ -311,3 +311,91 @@ def test_no_auth_mode_is_open(tmp_path) -> None:
     finally:
         server.shutdown()
         server.server_close()
+
+
+# --------------------------------------------------------------------------- #
+# F1（v2.1.1）：受信代理链路才读 X-Forwarded-For，且只取最右一跳
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("peer", "forwarded", "expected"),
+    [
+        ("127.0.0.1", "1.2.3.4", "1.2.3.4"),
+        ("127.0.0.1", "6.6.6.6, 1.2.3.4", "1.2.3.4"),  # 只认最右一跳
+        ("127.0.0.1", "  1.2.3.4  ", "1.2.3.4"),
+        ("::1", "1.2.3.4", "1.2.3.4"),
+        ("::ffff:127.0.0.1", "1.2.3.4", "1.2.3.4"),
+        ("127.0.0.1", None, "127.0.0.1"),
+        ("127.0.0.1", "not-an-ip", "127.0.0.1"),
+        ("127.0.0.1", "1.2.3.4, garbage", "127.0.0.1"),  # 最右非法 → 回退对端
+        ("8.8.8.8", "1.2.3.4", "8.8.8.8"),  # 非受信代理：忽略伪造
+        ("10.0.0.5", "1.2.3.4", "10.0.0.5"),
+        ("", "1.2.3.4", "unknown"),
+    ],
+)
+def test_resolve_client_ip(peer: str, forwarded: str | None, expected: str) -> None:
+    headers = {"X-Forwarded-For": forwarded} if forwarded is not None else {}
+    assert resolve_client_ip(peer, headers) == expected
+
+
+def test_a31_forwarded_ip_buckets_are_isolated(web: Client) -> None:
+    attacker = {"X-Forwarded-For": "203.0.113.7"}
+    for _ in range(5):
+        status, _headers, _body = web.request(
+            "POST",
+            "/api/auth/login",
+            {"username": "admin", "password": "wrong"},
+            headers=attacker,
+        )
+        assert status == 401
+    status, _headers, body = web.request(
+        "POST", "/api/auth/login", {"username": "admin", "password": "wrong"}, headers=attacker
+    )
+    assert status == 429 and b"too_many_attempts" in body
+
+    # 另一个真实客户端不受影响（同一 nginx 对端 127.0.0.1）
+    status, body, _headers = web.login(PASSWORD, headers={"X-Forwarded-For": "198.51.100.9"})
+    assert status == 200, body
+    status, _headers, _body = web.request("GET", "/api/status")
+    assert status == 200
+
+
+# --------------------------------------------------------------------------- #
+# F2（v2.1.1）：每次启动轮换 session.key，重启后旧 Cookie 失效
+# --------------------------------------------------------------------------- #
+def test_restart_rotates_session_key_and_rejects_old_cookie(tmp_path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    store_password(workspace, "admin", PASSWORD)
+
+    def start() -> tuple[PanguverseHTTPServer, Client]:
+        manager = AuthManager(workspace)
+        api = WebAPI(workspace, auth=manager)
+        server = PanguverseHTTPServer(("127.0.0.1", 0), api=api, quiet=True)
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        thread.start()
+        return server, Client(f"http://127.0.0.1:{server.server_address[1]}", workspace, manager, [])
+
+    key_path = auth_mod.session_key_path(workspace)
+    first_server, first_client = start()
+    try:
+        status, _body, _headers = first_client.login(PASSWORD)
+        assert status == 200
+        old_cookie = first_client.cookie
+        first_key = key_path.read_bytes()
+    finally:
+        first_server.shutdown()
+        first_server.server_close()
+
+    second_server, second_client = start()
+    try:
+        assert key_path.read_bytes() != first_key  # 启动即轮换
+        status, _headers, body = second_client.request("GET", "/api/status", cookie=old_cookie)
+        assert status == 401
+        assert json.loads(body.decode("utf-8"))["error"]["code"] == "unauthorized"
+        # 新登录不受影响
+        assert second_client.login(PASSWORD)[0] == 200
+    finally:
+        second_server.shutdown()
+        second_server.server_close()

@@ -195,16 +195,14 @@ def resolve_credentials(root: Path, *, user_override: str | None = None) -> Cred
 # --------------------------------------------------------------------------- #
 # 会话
 # --------------------------------------------------------------------------- #
-def _load_session_key(root: Path) -> bytes:
-    path = session_key_path(root)
-    try:
-        data = path.read_bytes()
-    except OSError:
-        data = b""
-    if len(data) >= SESSION_KEY_BYTES:
-        return data[:SESSION_KEY_BYTES]
+def _rotate_session_key(root: Path) -> bytes:
+    """每次进程启动都生成新密钥（v2.1.1，QA F2）。
+
+    重启即令所有既有会话失效——比把登出黑名单落盘更简单，也不会出现
+    「logout 后重启、旧 Cookie 复活」的窗口。
+    """
     key = secrets.token_bytes(SESSION_KEY_BYTES)
-    _write_private(path, key)
+    _write_private(session_key_path(root), key)
     return key
 
 
@@ -242,7 +240,7 @@ class AuthManager:
     ) -> None:
         self.root = Path(root)
         self.credentials = resolve_credentials(self.root, user_override=username)
-        self._session_key = _load_session_key(self.root)
+        self._session_key = _rotate_session_key(self.root)
         self._logger = logger
         self._failures: dict[str, list[float]] = {}
         #: 已登出的会话 nonce → 过期时间（内存态；重启即全部失效，符合契约 §7）

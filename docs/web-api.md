@@ -49,6 +49,8 @@ python -m panguverse serve --port 7788 --workspace . --no-open
   `payload={u,exp,nonce}`，12h 有效；密钥独立存 `<workspace>/.panguverse/web/session.key`（32 字节，`0600`），
   **不复用任何 env 值**。Cookie 属性 `HttpOnly; Path=/; SameSite=Lax; Max-Age=43200`，
   请求带 `X-Forwarded-Proto: https` 时追加 `Secure`。
+- **会话密钥启动轮换（v2.1.1）**：每次进程启动都生成新的 `session.key`（覆盖旧文件），
+  因此**重启后所有既有 Cookie 立即失效**；登出黑名单只在内存，也不需要落盘。
 - **校验**：HMAC、`exp`、`u` 与当前账号一致、登出黑名单（内存态 nonce，重启即清空）；
   任一项不过按未认证处理，绝不 500。
 - **登出**：`POST /api/auth/logout` → `200 {"ok":true}`，`Set-Cookie: pv_session=; Max-Age=0 ...`，
@@ -56,6 +58,10 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - **限流**：同 IP 5 分钟内失败 5 次 → 后续请求 `429` + `Retry-After`（秒）；
   成功登录清零。登录失败**不区分**账号不存在/密码错，日志只记
   `[auth] login failed user=<name> ip=<ip>`，绝不出现密码。
+- **真实客户端 IP（v2.1.1）**：限流桶按真实客户端计。TCP 对端不是回环/受信代理时**忽略**
+  `X-Forwarded-For`（防伪造）；对端是回环/受信代理（nginx 在本机反代）时取
+  `X-Forwarded-For` 的**最右一跳**（nginx `proxy_add_x_forwarded_for` 追加的那一跳），
+  非法/缺失回退对端 IP。这样反代后不会退化成「全体用户共用一个桶」的登录 DoS。
 - **接口**：
   - `GET /api/auth/status` → `{"authenticated": false}` / `{"authenticated": true, "user": "admin"}`
     （`--no-auth` 时恒为 `{"authenticated": true, "user": "", "auth_disabled": true}`）；

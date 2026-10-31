@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -34,6 +35,53 @@ MISSING_STATIC_MESSAGE = (
     "请等待前端资源部署后再访问（API 已可用）。"
 )
 MAX_BODY_BYTES = 8 * 1024 * 1024
+
+#: 只有这些对端才被视为受信代理（nginx 在本机回环上反代）
+TRUSTED_PROXY_NETWORKS = (
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("::ffff:127.0.0.0/104"),
+)
+
+
+def _parse_ip(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address((value or "").strip())
+    except ValueError:
+        return None
+
+
+def _is_trusted_proxy(peer: str) -> bool:
+    address = _parse_ip(peer)
+    if address is None:
+        return False
+    mapped = getattr(address, "ipv4_mapped", None)
+    if mapped is not None:
+        address = mapped
+    return any(address in network for network in TRUSTED_PROXY_NETWORKS)
+
+
+def resolve_client_ip(peer: str, headers: dict[str, str]) -> str:
+    """限流用的真实客户端 IP（契约 §3 #7）。
+
+    - 对端不是受信代理 → 用 TCP 对端 IP，**忽略** ``X-Forwarded-For``（防伪造）；
+    - 对端是回环/受信代理 → 取 ``X-Forwarded-For`` 的**最右一跳**（nginx 追加的那一跳），
+      非法/缺失时回退对端 IP。
+    """
+    peer = (peer or "").strip() or "unknown"
+    if not _is_trusted_proxy(peer):
+        return peer
+    forwarded = ""
+    for key, value in headers.items():
+        if key.lower() == "x-forwarded-for":
+            forwarded = value or ""
+            break
+    if not forwarded:
+        return peer
+    rightmost = forwarded.split(",")[-1].strip()
+    if _parse_ip(rightmost) is None:
+        return peer
+    return rightmost
 
 
 class PanguverseRequestHandler(BaseHTTPRequestHandler):
@@ -91,9 +139,10 @@ class PanguverseRequestHandler(BaseHTTPRequestHandler):
         self._emit(self._api(method, parsed, raw))
 
     def _api(self, method: str, parsed: Any, raw: bytes = b"") -> ApiResponse:
-        """把 Cookie / X-Forwarded-Proto / 客户端 IP 交给 API 层（认证需要）。"""
+        """把 Cookie / X-Forwarded-Proto / 真实客户端 IP 交给 API 层（认证需要）。"""
         headers = dict(self.headers.items())
-        client_ip = self.client_address[0] if self.client_address else ""
+        peer = self.client_address[0] if self.client_address else ""
+        client_ip = resolve_client_ip(peer, headers)
         return self.server.api.handle(
             method, parsed.path, parsed.query, raw, headers=headers, client_ip=client_ip
         )
