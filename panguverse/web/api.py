@@ -19,6 +19,7 @@ from ..report import html_report, junit
 from . import service
 from .jobs import JobManager
 from .service import ApiError
+from .tasks_store import TaskStoreError
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
 MAX_BODY_BYTES = 8 * 1024 * 1024
@@ -99,9 +100,9 @@ class WebAPI:
     ) -> Response:
         try:
             params = parse_qs(query, keep_blank_values=True)
-            body = self._parse_body(raw_body) if method in {"POST", "PUT"} else None
+            body = self._parse_body(raw_body) if method in {"POST", "PUT", "PATCH"} else None
             return self._route(method.upper(), path, params, body)
-        except ApiError as exc:
+        except (ApiError, TaskStoreError) as exc:
             return error_response(exc.code, exc.message, exc.status)
         except Exception as exc:  # noqa: BLE001 - 兜底：异常不得穿透到 handler 线程
             return error_response("internal_error", f"{type(exc).__name__}: {exc}")
@@ -146,6 +147,11 @@ class WebAPI:
                     return json_response(service.get_pack(rest[0]))
             if head == "scenarios" and not rest:
                 return json_response(service.list_scenarios(self.root))
+            if head == "tasks":
+                if not rest:
+                    return json_response({"tasks": service.list_tasks(self.root)})
+                if len(rest) == 1:
+                    return json_response(service.get_task(self.root, rest[0]))
             if head == "jobs":
                 if not rest:
                     return json_response([job.to_dict() for job in self.jobs.recent(20)])
@@ -162,6 +168,8 @@ class WebAPI:
                     return json_response(service.get_run(self.root, rest[0]))
                 if len(rest) == 2:
                     run_id, filename = rest
+                    if filename == "config":
+                        return json_response(service.run_config(self.root, run_id))
                     if filename in ("report.html", "junit.xml"):
                         # 磁盘文件保持原样（回归回放依赖）；出口按同一套 mask_env_payload 重新渲染，
                         # 避免 HTML/XML 旁路泄漏 env 明文（A16，v1.4）
@@ -192,6 +200,23 @@ class WebAPI:
             if head == "runs" and not rest:
                 job = service.submit_run(self.jobs, self.root, body)
                 return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
+            if head == "runs" and len(rest) == 2 and rest[1] == "rerun":
+                job = service.rerun(self.jobs, self.root, rest[0], body)
+                return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
+            if head == "tasks":
+                if not rest:
+                    task = service.create_task(self.root, body)
+                    return json_response(task, status=201)
+                if len(rest) == 2 and rest[1] == "run":
+                    job = service.run_task(self.jobs, self.root, rest[0], body)
+                    return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
+        elif method == "PATCH":
+            if head == "tasks" and len(rest) == 1:
+                return json_response(service.update_task(self.root, rest[0], body))
+        elif method == "DELETE":
+            if head == "tasks" and len(rest) == 1:
+                service.delete_task(self.root, rest[0])
+                return Response(status=204, body=b"", headers={"Cache-Control": "no-store"})
 
         raise ApiError("not_found", "接口不存在")
 

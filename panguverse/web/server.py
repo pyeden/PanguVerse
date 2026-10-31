@@ -60,6 +60,17 @@ class PanguverseRequestHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_POST(self) -> None:
+        self._handle_write("POST")
+
+    def do_PATCH(self) -> None:
+        # 任务定义的「部分更新」走 PATCH（契约 §3.2）
+        self._handle_write("PATCH")
+
+    def do_DELETE(self) -> None:
+        # 任务定义的删除走 DELETE（204，无响应体）
+        self._handle_write("DELETE")
+
+    def _handle_write(self, method: str) -> None:
         parsed = urlsplit(self.path)
         if not _is_api_path(parsed.path):
             self._emit(error_response("not_found", "路径不存在"))
@@ -75,7 +86,7 @@ class PanguverseRequestHandler(BaseHTTPRequestHandler):
             self._emit(error_response("bad_request", "请求体过大"), close=True)
             return
         raw = self.rfile.read(length) if length else b""
-        self._emit(self.server.api.handle("POST", parsed.path, parsed.query, raw))
+        self._emit(self.server.api.handle(method, parsed.path, parsed.query, raw))
 
     # ------------------------------------------------------------------ #
     def _serve_static(self, name: str) -> None:

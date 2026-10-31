@@ -7,6 +7,7 @@ MVP 只存内存（服务重启即清空），不排队、允许并发；前端�
 
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
@@ -62,7 +63,10 @@ class Job:
         self.summary: dict[str, Any] | None = None
         self.conclusion: dict[str, Any] | None = None
         self.error: str | None = None
-        self._lock = threading.Lock()
+        #: 终态回调（如回写任务的 last_run_id）：在状态切到终态时同步执行，
+        #: 保证「客户端看到 done/failed 时」旁路数据已经落盘
+        self.on_finish: Callable[[Job], None] | None = None
+        self._lock = threading.RLock()
 
     # ------------------------------------------------------------------ #
     def start(self) -> None:
@@ -99,6 +103,7 @@ class Job:
                 self.conclusion = conclusion
             self.status = DONE
             self.finished_at = time.time()
+            self._notify_finished()
             return True
 
     def fail(self, message: Any) -> bool:
@@ -109,7 +114,16 @@ class Job:
             self.status = FAILED
             self.error = sanitize_message(message)
             self.finished_at = time.time()
+            self._notify_finished()
             return True
+
+    def _notify_finished(self) -> None:
+        """在锁内执行终态回调；回调失败不得影响 job 本身。"""
+        callback = self.on_finish
+        if callback is None:
+            return
+        with contextlib.suppress(Exception):  # 回调是尽力而为的旁路
+            callback(self)
 
     # ------------------------------------------------------------------ #
     @property
@@ -146,13 +160,23 @@ class JobManager:
         self._lock = threading.Lock()
 
     # ------------------------------------------------------------------ #
-    def submit(self, mode: str, task: Callable[[Job], dict[str, Any] | None]) -> Job:
+    def submit(
+        self,
+        mode: str,
+        task: Callable[[Job], dict[str, Any] | None],
+        *,
+        on_finish: Callable[[Job], None] | None = None,
+    ) -> Job:
         job = Job(uuid.uuid4().hex[:12], mode)
+        job.on_finish = on_finish
         with self._lock:
             self._jobs[job.job_id] = job
             self._prune_locked()
         thread = threading.Thread(
-            target=self._worker, args=(job, task), name=f"pv-job-{job.job_id}", daemon=True
+            target=self._worker,
+            args=(job, task),
+            name=f"pv-job-{job.job_id}",
+            daemon=True,
         )
         thread.start()
         return job

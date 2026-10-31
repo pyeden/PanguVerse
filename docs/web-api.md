@@ -22,7 +22,7 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - **只监听本机**：默认 `127.0.0.1`；本服务没有认证、没有会话，**不可暴露公网**。
 - 静态资源走白名单（`index.html` / `app.js` / `style.css` / `favicon.svg`），并用 `realpath` 前缀校验兜底，`/static/../../cli.py` 一律 404。
 - 场景路径经 `realpath` 前缀校验，只能读 `<workspace>` 或仓库内置 `scenarios/`；越界 400。
-- `run_id` 必须匹配 `^[0-9a-f]{6,32}$`，杜绝用 `..` 拼接路径。
+- `run_id` 必须匹配 `^[0-9a-f]{6,32}$`，`task_id` 必须匹配 `^t-[0-9a-f]{6,12}$`，杜绝用 `..` 拼接路径。
 - 错误消息经 `core/redact.py` 打码（不出现密钥/token/Cookie 原文）；`/api/status` 只回 `llm_enabled: bool`，绝不回显密钥值。
 - **HTTP 层 env 打码（v1.3/v1.4，A16）**：所有出口共用一个 `mask_env_payload`——JSON 响应里的 `env` 子树
   （含 `plan.env`、`report.env`、`cases[].variables.env`）中，键名命中
@@ -170,6 +170,95 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `GET /api/runs/{run_id}/junit.xml` → `application/xml` + `Content-Disposition: attachment; filename="panguverse-<run_id>.xml"`；
   同样从打码后的报告数据重新渲染，避免 XML 旁路。
 - 文件缺失 → 404。
+
+### 任务定义 CRUD（v2.0，契约 `tasks/web-tasks-crud-spec.md` §2–§3.3）
+
+任务定义落盘 `<workspace>/tasks/<task_id>.json`：目录 `0700`、文件 `0600`（含 env 明文，与 `last_env.json`
+同策略），写文件走「临时文件 + `os.replace`」原子替换。`task_id` **只能由服务端生成**（`^t-[0-9a-f]{6,12}$`），
+所有路径拼接前都先做格式校验，客户端字符串永远不会被当成路径。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/tasks` | `{"tasks": [<摘要>]}`，按 `updated_at` 倒序 |
+| `GET` | `/api/tasks/{task_id}` | 完整任务（env 值经 `mask_env_payload` 打码） |
+| `POST` | `/api/tasks` | 新建，`201` + 打码后的任务 |
+| `PATCH` | `/api/tasks/{task_id}` | 部分更新，`200`；未知 id `404` |
+| `DELETE` | `/api/tasks/{task_id}` | `204`；**只删任务定义，不删 `runs/` 产物** |
+| `POST` | `/api/tasks/{task_id}/run` | `202 {job_id}`；可选 `{"env": {...}}` 仅本次覆盖 |
+| `GET` | `/api/runs/{run_id}/config` | 从磁盘还原该次运行的配置（env 打码） |
+| `POST` | `/api/runs/{run_id}/rerun` | `202 {job_id}`；可选 env 覆盖 / `save_as_task` |
+
+摘要字段固定为 `task_id,name,mode,scenario,intent,updated_at,last_run_id,last_status,env_keys`
+——**只给 env 键名，不给值**。
+
+请求体（`POST`；`PATCH` 为同一批字段的子集）：
+
+```json
+{
+  "name": "订单闭环冒烟",
+  "mode": "demo | scenario | intent | regression",
+  "scenario": "scenarios/api_smoke.yaml",
+  "intent": "",
+  "env": {"BASE_URL": "http://127.0.0.1:8899", "API_PASSWORD": "demo123"},
+  "regression": false,
+  "no_llm": false
+}
+```
+
+校验规则：
+
+- `name` 必填，trim 后 1–80 字符；同名允许（用 `task_id` 区分）。
+- `mode` 必须是四种之一；`mode=scenario` 时 `scenario` 必填且经 `realpath` 前缀校验（越界/不存在 400）；
+  `mode=intent` 时 `intent` 非空。
+- `env` 为 `string → (string|number|bool)`；`null` 只在 `PATCH` 里有意义（删除该键）。
+- `task_id/created_at/updated_at/last_run_id/last_status` 由服务端维护，请求里出现会被忽略。
+
+**PATCH 的 env 键级合并**（最易写错的一条）：
+
+| 传入值 | 语义 |
+| --- | --- |
+| `"***"` | 沿用已保存的旧值（前端把密钥显示成 `***`，用户不动就不覆盖） |
+| `""` | 同上，沿用旧值（表单留空表示不改） |
+| `null` | 显式删除该键 |
+| 其他 string/number/bool | 覆盖/新增 |
+
+**运行任务**：`POST /api/tasks/{id}/run` 等价于用任务里保存的 `mode/scenario/intent/env/regression/no_llm`
+提交 `/api/runs`；body 里的 `env` 只作用于本次运行，**不写回任务定义**。运行结束后服务端只在 job 进入
+`done`/`failed` 时回写 `last_run_id` / `last_status`（不改 `updated_at`，也不动其它字段；回调在状态切终态时同步执行，
+客户端看到终态即可读到最新值）。
+
+**从历史取配置**：`GET /api/runs/{run_id}/config` 返回
+
+```json
+{
+  "mode": "scenario",
+  "scenario": "scenarios/api_smoke.yaml",
+  "intent": "",
+  "env": {"BASE_URL": "http://127.0.0.1:8899", "API_PASSWORD": "***"},
+  "regression": false,
+  "no_llm": false,
+  "plan_source": "spec",
+  "error": {"case": "认证链路…", "step": "登录", "message": "…", "expected": null, "actual": null}
+}
+```
+
+- 数据源是磁盘 `report.json` 的 `meta.run_config`/`meta.plan_source` 与 `plan.json`（后者未打码，是重跑的真实基线）；
+  旧运行没有 `run_config` 时按 `plan_source` 推断，无法判定则 `mode="scenario"`，并在 `plan_source` 写明实际来源。
+- `env` 在 JSON 出口统一走 `mask_env_payload`（键名保留、敏感值 `***`）。
+- `error` 取**第一个非 passed 步骤**（用例名 + 步骤名 + `message/expected/actual`，消息再经 `jobs.sanitize_message`（`core/redact.py`）打码）；
+  全部通过时为 `null`。缺字段给默认值，不返回 500。
+
+**重跑**：`POST /api/runs/{run_id}/rerun`
+
+```json
+{"env": {"API_PASSWORD": "***"}, "save_as_task": true, "name": "修正后的任务"}
+```
+
+- 服务端从磁盘取真实 env 作基线，请求里的 `"***"`/空串视为沿用，`null` 视为该键不传递；
+- `mode=demo`（或 `regression` 且上次目标是进程内 mock）时，继承的 `BASE_URL` 会被丢弃并重新拉起 mock
+  ——旧端口随进程消失，沿用必然连不上；
+- `save_as_task=true` 时先创建任务定义（写入本次合并后的 env 真值）再运行，`name` 缺省为 `重跑 <run_id>`；
+- 未知 run → 404；无法还原场景（缺 `scenario`）→ 400。
 
 ### 静态资源
 

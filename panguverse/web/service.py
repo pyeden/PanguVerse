@@ -17,6 +17,7 @@ import json
 import os
 import re
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -34,6 +35,7 @@ from ..engine.result import RunResult
 from ..report import DEFAULT_FORMATS, write_all
 from ..report.json_report import conclusion as report_conclusion
 from ..spec.loader import TestSuite, load_suite
+from . import tasks_store
 from .jobs import Job, JobManager, sanitize_message
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -406,16 +408,22 @@ def parse_run_request(payload: Any) -> RunRequest:
     )
 
 
-def submit_run(jobs: JobManager, root: Path, payload: Any) -> Job:
+def submit_run(
+    jobs: JobManager,
+    root: Path,
+    payload: Any,
+    *,
+    on_finish: Callable[[Job], None] | None = None,
+) -> Job:
     request = parse_run_request(payload)
     if request.mode == "demo":
-        return jobs.submit("demo", _demo_task(root, request))
+        return jobs.submit("demo", _demo_task(root, request), on_finish=on_finish)
     if request.mode == "scenario":
         suite = load_scenario_suite(resolve_scenario(root, request.scenario))
-        return jobs.submit("scenario", _scenario_task(root, request, suite))
+        return jobs.submit("scenario", _scenario_task(root, request, suite), on_finish=on_finish)
     if request.mode == "intent":
-        return jobs.submit("intent", _intent_task(root, request))
-    return jobs.submit("regression", _regression_task(root, request))
+        return jobs.submit("intent", _intent_task(root, request), on_finish=on_finish)
+    return jobs.submit("regression", _regression_task(root, request), on_finish=on_finish)
 
 
 # --------------------------------------------------------------------------- #
@@ -449,6 +457,14 @@ def _demo_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any
                 evolve=True,
                 regression=regression,
                 title="PanguVerse API 自动化测试闭环报告",
+                run_config={
+                    "mode": "demo",
+                    "scenario": "",
+                    "intent": request.intent,
+                    "regression": bool(regression),
+                    "no_llm": bool(request.no_llm),
+                    "uses_mock": uses_mock,
+                },
             )
 
     return task
@@ -472,6 +488,14 @@ def _scenario_task(
             evolve=True,
             regression=bool(request.regression),
             title="PanguVerse 场景运行报告",
+            run_config={
+                "mode": "scenario",
+                "scenario": request.scenario,
+                "intent": "",
+                "regression": bool(request.regression),
+                "no_llm": bool(request.no_llm),
+                "uses_mock": False,
+            },
         )
 
     return task
@@ -501,6 +525,14 @@ def _intent_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, A
             evolve=True,
             regression=bool(request.regression),
             title="PanguVerse 意图运行报告",
+            run_config={
+                "mode": "intent",
+                "scenario": "",
+                "intent": request.intent,
+                "regression": bool(request.regression),
+                "no_llm": bool(request.no_llm),
+                "uses_mock": False,
+            },
         )
 
     return task
@@ -535,6 +567,15 @@ def _regression_task(root: Path, request: RunRequest) -> Callable[[Job], dict[st
                     evolve=False,
                     regression=False,
                     title="PanguVerse 回归复用报告",
+                    run_config={
+                        "mode": "regression",
+                        "scenario": "",
+                        "intent": "",
+                        "regression": False,
+                        "no_llm": False,
+                        # 本次目标由基线标记重新拉起：rerun 时不能沿用旧端口
+                        "uses_mock": True,
+                    },
                 )
 
         exec_env = apply_fs_root(root, {**baseline, **request.env}, request.env)
@@ -549,6 +590,14 @@ def _regression_task(root: Path, request: RunRequest) -> Callable[[Job], dict[st
             evolve=False,
             regression=False,
             title="PanguVerse 回归复用报告",
+            run_config={
+                "mode": "regression",
+                "scenario": "",
+                "intent": "",
+                "regression": False,
+                "no_llm": False,
+                "uses_mock": False,
+            },
         )
 
     return task
@@ -570,6 +619,7 @@ def _execute(
     evolve: bool,
     regression: bool,
     title: str,
+    run_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     job.add_phase("plan", "ok", f"{plan.size} 个用例来自 {plan.source}")
     if not plan.cases:
@@ -603,6 +653,8 @@ def _execute(
             "plan_source": plan.source,
             "llm_used": bool(plan.meta.get("llm_used")),
             "heal_enabled": bool(axe.healer),
+            # 供 /api/runs/{id}/config 与 rerun 还原原始请求（新增字段，不改旧字段语义）
+            "run_config": dict(run_config or {}),
         },
     )
     summary = run.summary
@@ -830,6 +882,363 @@ def run_artifact(root: Path, run_id: str, filename: str) -> Path:
     return path
 
 
+
+
+# --------------------------------------------------------------------------- #
+# 任务定义（CRUD，契约 §2/§3.1–§3.3）
+# --------------------------------------------------------------------------- #
+TASK_NAME_MAX = 80
+#: PATCH/覆盖请求里表示「沿用已保存值」的占位值（与 HTTP 打码保持同一字面量）
+ENV_KEEP = "***"
+
+
+def _clean_name(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ApiError("bad_request", "name 必须是字符串")
+    name = value.strip()
+    if not name:
+        raise ApiError("bad_request", "name 不能为空")
+    if len(name) > TASK_NAME_MAX:
+        raise ApiError("bad_request", f"name 不能超过 {TASK_NAME_MAX} 个字符")
+    return name
+
+
+def _clean_mode(value: Any) -> str:
+    if not isinstance(value, str) or value not in VALID_MODES:
+        raise ApiError(
+            "bad_request", f"mode 非法: {value!r}（可选 demo/scenario/intent/regression）"
+        )
+    return value
+
+
+def _clean_text(value: Any, *, field: str) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ApiError("bad_request", f"{field} 必须是字符串")
+    return value.strip()
+
+
+def _validate_task_target(root: Path, mode: str, scenario: str, intent: str) -> None:
+    if mode == "scenario":
+        if not scenario:
+            raise ApiError("bad_request", "mode=scenario 时必须提供 scenario")
+        resolve_scenario(root, scenario)  # realpath 前缀校验：越界/不存在一律 400
+    if mode == "intent" and not intent:
+        raise ApiError("bad_request", "mode=intent 时必须提供非空 intent")
+
+
+def _merge_task_env(current: dict[str, Any], patch: Any) -> dict[str, Any]:
+    """PATCH 的 env 键级合并：``"***"``/``""`` 沿用、``null`` 删除、其余覆盖。"""
+    if not isinstance(patch, dict):
+        raise ApiError("bad_request", "env 必须是 string → (string|number|bool) 的对象")
+    merged = dict(current)
+    for key, value in patch.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ApiError("bad_request", "env 的键必须是非空字符串")
+        if value is None:
+            merged.pop(key, None)
+            continue
+        if isinstance(value, str) and value in ("", ENV_KEEP):
+            continue  # 前端把已保存的密钥显示为 *** / 留空：视为不动旧值
+        if isinstance(value, (bool, str, int, float)):
+            merged[key] = value
+        else:
+            raise ApiError("bad_request", f"env.{key} 必须是 string/number/bool（null 表示删除）")
+    return merged
+
+
+def _as_body(payload: Any) -> dict[str, Any]:
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise ApiError("bad_request", "请求体必须是 JSON 对象")
+    return payload
+
+
+def task_summary(task: dict[str, Any]) -> dict[str, Any]:
+    """列表摘要：**只暴露 env 键名**，不返回任何值。"""
+    env = task.get("env")
+    keys = sorted(str(key) for key in env) if isinstance(env, dict) else []
+    return {
+        "task_id": task.get("task_id", ""),
+        "name": task.get("name", ""),
+        "mode": task.get("mode", ""),
+        "scenario": task.get("scenario", ""),
+        "intent": task.get("intent", ""),
+        "updated_at": task.get("updated_at"),
+        "last_run_id": task.get("last_run_id", ""),
+        "last_status": task.get("last_status", ""),
+        "env_keys": keys,
+    }
+
+
+def list_tasks(root: Path) -> list[dict[str, Any]]:
+    return [task_summary(task) for task in tasks_store.list_tasks(root)]
+
+
+def get_task(root: Path, task_id: str) -> dict[str, Any]:
+    return tasks_store.read_task(root, task_id)
+
+
+def create_task(root: Path, payload: Any) -> dict[str, Any]:
+    data = _as_body(payload)
+    name = _clean_name(data.get("name"))
+    mode = _clean_mode(data.get("mode"))
+    scenario = _clean_text(data.get("scenario"), field="scenario")
+    intent = _clean_text(data.get("intent"), field="intent")
+    env = _coerce_env(data.get("env"))
+    _validate_task_target(root, mode, scenario, intent)
+    now = time.time()
+    task = {
+        "task_id": tasks_store.new_task_id(),
+        "name": name,
+        "mode": mode,
+        "scenario": scenario,
+        "intent": intent,
+        "env": env,
+        "regression": bool(data.get("regression", False)),
+        "no_llm": bool(data.get("no_llm", False)),
+        "created_at": now,
+        "updated_at": now,
+        "last_run_id": "",
+        "last_status": "",
+    }
+    return tasks_store.write_task(root, task)
+
+
+def update_task(root: Path, task_id: str, payload: Any) -> dict[str, Any]:
+    task = tasks_store.read_task(root, task_id)
+    data = _as_body(payload)
+    updated = dict(task)
+    if "name" in data:
+        updated["name"] = _clean_name(data.get("name"))
+    if "mode" in data:
+        updated["mode"] = _clean_mode(data.get("mode"))
+    if "scenario" in data:
+        updated["scenario"] = _clean_text(data.get("scenario"), field="scenario")
+    if "intent" in data:
+        updated["intent"] = _clean_text(data.get("intent"), field="intent")
+    if "env" in data:
+        updated["env"] = _merge_task_env(
+            task.get("env") if isinstance(task.get("env"), dict) else {},
+            data.get("env"),
+        )
+    if "regression" in data:
+        updated["regression"] = bool(data.get("regression"))
+    if "no_llm" in data:
+        updated["no_llm"] = bool(data.get("no_llm"))
+    _validate_task_target(
+        root,
+        str(updated.get("mode") or ""),
+        str(updated.get("scenario") or ""),
+        str(updated.get("intent") or ""),
+    )
+    updated["updated_at"] = time.time()
+    return tasks_store.write_task(root, updated)
+
+
+def delete_task(root: Path, task_id: str) -> None:
+    """只删任务定义；``runs/`` 下的历史产物一律不动。"""
+    tasks_store.delete_task(root, task_id)
+
+
+def _env_override(value: Any) -> dict[str, Any]:
+    """本次运行/重跑的 env 覆盖：``"***"``/空串/``null`` 视为「不覆盖」。"""
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ApiError("bad_request", "env 必须是 string → (string|number|bool) 的对象")
+    cleaned: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, str) or not key.strip():
+            raise ApiError("bad_request", "env 的键必须是非空字符串")
+        if item is None:
+            continue
+        if isinstance(item, str) and item in ("", ENV_KEEP):
+            continue
+        if isinstance(item, (bool, str, int, float)):
+            cleaned[key] = item
+        else:
+            raise ApiError("bad_request", f"env.{key} 必须是 string/number/bool")
+    return cleaned
+
+
+def _task_run_payload(task: dict[str, Any], overrides: dict[str, Any]) -> dict[str, Any]:
+    env = dict(task.get("env") or {})
+    env.update(overrides)
+    return {
+        "mode": task.get("mode") or "",
+        "scenario": task.get("scenario") or "",
+        "intent": task.get("intent") or "",
+        "env": env,
+        "regression": bool(task.get("regression", False)),
+        "no_llm": bool(task.get("no_llm", False)),
+    }
+
+
+def record_task_run(root: Path, task_id: str, job: Job) -> None:
+    """运行结束后回写 ``last_run_id``/``last_status``（尽力而为，绝不影响 job 状态）。"""
+    try:
+        task = tasks_store.read_task(root, task_id)
+    except (tasks_store.TaskStoreError, OSError):
+        return
+    if job.run_id:
+        task["last_run_id"] = job.run_id
+    task["last_status"] = job.status
+    try:
+        tasks_store.write_task(root, task)
+    except (tasks_store.TaskStoreError, OSError):
+        return
+
+
+def run_task(
+    jobs: JobManager, root: Path, task_id: str, payload: Any = None
+) -> Job:
+    task = tasks_store.read_task(root, task_id)
+    data = _as_body(payload)
+    overrides = _env_override(data.get("env")) if "env" in data else {}
+    body = _task_run_payload(task, overrides)
+    return submit_run(
+        jobs, root, body, on_finish=lambda job: record_task_run(root, task_id, job)
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 从运行历史还原配置 / 重跑（契约 §3.4）
+# --------------------------------------------------------------------------- #
+def _report_meta(report: dict[str, Any]) -> dict[str, Any]:
+    meta = report.get("meta")
+    return meta if isinstance(meta, dict) else {}
+
+
+def _report_run_config(report: dict[str, Any]) -> dict[str, Any]:
+    config = _report_meta(report).get("run_config")
+    return config if isinstance(config, dict) else {}
+
+
+def _disk_env(report: dict[str, Any], plan: dict[str, Any]) -> dict[str, Any]:
+    """磁盘上的**真实** env：plan.json 最准（未打码），report 兜底。"""
+    report_plan = report.get("plan")
+    candidates: list[Any] = [
+        plan.get("env"),
+        report_plan.get("env") if isinstance(report_plan, dict) else None,
+        report.get("env"),
+    ]
+    for candidate in candidates:
+        if isinstance(candidate, dict) and candidate:
+            return {str(key): value for key, value in candidate.items() if isinstance(key, str)}
+    return {}
+
+
+def _safe_text(value: Any) -> str:
+    text = "" if value is None else str(value)
+    return safe_message(text) if text.strip() else ""
+
+
+def _first_failure(report: dict[str, Any]) -> dict[str, Any] | None:
+    """第一个非 passed 步骤（用例名 + 步骤名 + message/expected/actual）。"""
+    cases = report.get("cases")
+    if not isinstance(cases, list):
+        return None
+    for case in cases:
+        if not isinstance(case, dict):
+            continue
+        steps = case.get("steps")
+        if isinstance(steps, list):
+            for step in steps:
+                if not isinstance(step, dict):
+                    continue
+                if step.get("status") not in ("failed", "error"):
+                    continue
+                error = step.get("error")
+                error = error if isinstance(error, dict) else {}
+                return {
+                    "case": case.get("name") or case.get("case_id") or "",
+                    "step": step.get("name") or step.get("step_id") or step.get("atom") or "",
+                    "message": _safe_text(error.get("message") or step.get("message")),
+                    "expected": error.get("expected"),
+                    "actual": error.get("actual"),
+                }
+        if case.get("status") in ("failed", "error"):
+            error = case.get("error")
+            error = error if isinstance(error, dict) else {}
+            if error:
+                return {
+                    "case": case.get("name") or case.get("case_id") or "",
+                    "step": "",
+                    "message": _safe_text(error.get("message")),
+                    "expected": error.get("expected"),
+                    "actual": error.get("actual"),
+                }
+    return None
+
+
+def _run_config_core(root: Path, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = get_run(root, run_id)
+    report = payload.get("report") if isinstance(payload.get("report"), dict) else {}
+    plan = payload.get("plan") if isinstance(payload.get("plan"), dict) else {}
+    meta = _report_meta(report)
+    config = _report_run_config(report)
+    plan_source = str(meta.get("plan_source") or plan.get("source") or "unknown")
+
+    mode = config.get("mode")
+    if mode not in VALID_MODES:
+        # 旧运行没有 run_config：能判定就判定，否则按契约回 scenario 并在 plan_source 里说明来源
+        mode = "regression" if plan_source == "memory" else "scenario"
+    scenario = config.get("scenario") if isinstance(config.get("scenario"), str) else ""
+    intent = config.get("intent") if isinstance(config.get("intent"), str) else ""
+    if not intent and mode == "intent":
+        intent = str(plan.get("intent") or "")
+
+    resolved = {
+        "mode": mode,
+        "scenario": scenario,
+        "intent": intent,
+        "env": _disk_env(report, plan),
+        "regression": bool(config.get("regression", False)),
+        "no_llm": bool(config.get("no_llm", False)),
+        "plan_source": plan_source,
+        "error": _first_failure(report),
+    }
+    return resolved, meta
+
+
+def run_config(root: Path, run_id: str) -> dict[str, Any]:
+    """``GET /api/runs/{run_id}/config``：env 为磁盘真值，HTTP 出口统一打码。"""
+    return _run_config_core(root, run_id)[0]
+
+
+def rerun(jobs: JobManager, root: Path, run_id: str, payload: Any = None) -> Job:
+    """以磁盘真实 env 为基线重跑；请求里的 ``"***"`` 一律视为沿用。"""
+    config, meta = _run_config_core(root, run_id)
+    data = _as_body(payload)
+    overrides = _env_override(data.get("env")) if "env" in data else {}
+    env = dict(config["env"])
+    env.update(overrides)
+    mode = config["mode"]
+    raw_config = meta.get("run_config")
+    uses_mock = bool(raw_config.get("uses_mock")) if isinstance(raw_config, dict) else False
+    if uses_mock and "BASE_URL" not in overrides:
+        # 进程内 mock 的端口随上次进程消失，重跑必须重新拉起而不是沿用旧端口
+        env.pop("BASE_URL", None)
+    if mode == "scenario" and not config["scenario"]:
+        raise ApiError("bad_request", "无法从该运行还原场景配置（缺少 scenario）")
+    body = {
+        "mode": mode,
+        "scenario": config["scenario"],
+        "intent": config["intent"],
+        "env": env,
+        "regression": config["regression"],
+        "no_llm": config["no_llm"],
+    }
+    if bool(data.get("save_as_task", False)):
+        name = _clean_name(data.get("name") or f"重跑 {run_id}")
+        task = create_task(root, {**body, "name": name})
+        return run_task(jobs, root, task["task_id"])
+    return submit_run(jobs, root, body)
+
+
 __all__ = [
     "BUILTIN_SCENARIOS",
     "MOCK_TARGET_KIND",
@@ -839,14 +1248,18 @@ __all__ = [
     "RunRequest",
     "apply_fs_root",
     "build_axe",
+    "create_task",
     "default_fs_root",
+    "delete_task",
     "demo_target",
     "get_pack",
     "get_run",
+    "get_task",
     "list_atoms",
     "list_packs",
     "list_runs",
     "list_scenarios",
+    "list_tasks",
     "llm_enabled",
     "load_last_env",
     "load_last_target",
@@ -854,14 +1267,20 @@ __all__ = [
     "missing_env_vars",
     "pack_registry",
     "parse_run_request",
+    "record_task_run",
     "registry",
+    "rerun",
     "resolve_scenario",
     "resolve_workspace",
     "run_artifact",
+    "run_config",
+    "run_task",
     "runs_root",
     "safe_message",
     "save_last_env",
     "status_payload",
     "submit_run",
+    "task_summary",
+    "update_task",
     "validate_run_id",
 ]
