@@ -7,6 +7,10 @@
 (function () {
   'use strict';
 
+  /* 相对接口前缀：允许整站挂在子路径（如 /panguverse/）下，
+   * 避免绝对 /api 请求打到主站。 */
+  var API = 'api/';
+
   /* ================================================================== */
   /* 1. 常量与状态                                                       */
   /* ================================================================== */
@@ -479,7 +483,7 @@
     var j = APP.job;
     if (!j.id) return;
     var id = j.id;
-    request('/api/jobs/' + encodeURIComponent(id)).then(function (data) {
+    request(API + 'jobs/' + encodeURIComponent(id)).then(function (data) {
       if (APP.job.id !== id) return;
       APP.job.data = data;
       APP.job.error = null;
@@ -563,7 +567,7 @@
       showBanner('warn', '<strong>已有任务在运行。</strong> 前端一次只提交一个任务，请等待当前任务结束。', 8000);
       return Promise.reject(new ApiError('已有任务在运行', 409, 'busy'));
     }
-    return apiPost('/api/runs', payload).then(function (res) {
+    return apiPost(API + 'runs', payload).then(function (res) {
       if (!res || !res.job_id) {
         throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
       }
@@ -607,7 +611,7 @@
   }
 
   function refreshStatus() {
-    return apiGet('/api/status').then(function (st) {
+    return apiGet(API + 'status').then(function (st) {
       applyStatus(st);
       return st;
     }).catch(function (err) {
@@ -682,7 +686,7 @@
       '</div>' +
       '<div class="stat-grid">' + statGridHtml(st) + '</div>' +
       '<div class="section">' +
-        '<div class="section-head"><h2>环境</h2><span class="hint">数据来自 GET /api/status</span></div>' +
+        '<div class="section-head"><h2>环境</h2><span class="hint">数据来自 status 接口</span></div>' +
         '<div class="panel">' + facts + '</div>' +
       '</div>' +
       '<div class="section">' +
@@ -696,7 +700,7 @@
 
   function renderRecentRuns(host, ctx) {
     if (!host) return;
-    apiGet('/api/runs?limit=4').then(function (runs) {
+    apiGet(API + 'runs?limit=4').then(function (runs) {
       if (!ctx.alive() || !document.contains(host)) return;
       if (!Array.isArray(runs) || runs.length === 0) {
         host.innerHTML = '<div class="empty"><strong>还没有运行记录</strong>' +
@@ -732,7 +736,7 @@
 
   function renderOverview(host, ctx) {
     host.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取平台状态…</div>';
-    return apiGet('/api/status').then(function (st) {
+    return apiGet(API + 'status').then(function (st) {
       if (!ctx.alive()) return;
       applyStatus(st);
       host.innerHTML = overviewHtml(st);
@@ -960,7 +964,7 @@
 
   function loadScenarios(select, note, ctx) {
     if (!select) return;
-    apiGet('/api/scenarios').then(function (list) {
+    apiGet(API + 'scenarios').then(function (list) {
       if (!ctx.alive() || !select.isConnected) return;
       if (!Array.isArray(list) || list.length === 0) {
         select.innerHTML = '<option value="">没有可用场景</option>';
@@ -1110,7 +1114,7 @@
     var load = function () {
       if (!ctx.alive()) return;
       body.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取运行历史…</div>';
-      apiGet('/api/runs?limit=50').then(function (runs) {
+      apiGet(API + 'runs?limit=50').then(function (runs) {
         if (!ctx.alive()) return;
         body.innerHTML = historyHtml(runs);
       }).catch(function (err) {
@@ -1308,8 +1312,8 @@
           '</div>' +
         '</div>' +
         '<div class="actions">' +
-          '<a class="btn btn-sm" href="/api/runs/' + encodeURIComponent(id) + '/junit.xml" download="panguverse-' + esc(id) + '.xml">下载 JUnit</a>' +
-          '<a class="btn btn-sm" href="/api/runs/' + encodeURIComponent(id) + '/report.html" target="_blank" rel="noopener">打开 HTML 报告</a>' +
+          '<a class="btn btn-sm" href="' + API + 'runs/' + encodeURIComponent(id) + '/junit.xml" download="panguverse-' + esc(id) + '.xml">下载 JUnit</a>' +
+          '<a class="btn btn-sm" href="' + API + 'runs/' + encodeURIComponent(id) + '/report.html" target="_blank" rel="noopener">打开 HTML 报告</a>' +
           '<a class="btn btn-sm btn-ghost" href="#/history">返回历史</a>' +
         '</div>' +
       '</div>';
@@ -1392,7 +1396,7 @@
       return;
     }
     host.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取运行 ' + esc(id) + '…</div>';
-    apiGet('/api/runs/' + encodeURIComponent(id)).then(function (data) {
+    apiGet(API + 'runs/' + encodeURIComponent(id)).then(function (data) {
       if (!ctx.alive()) return;
       if (!data || typeof data !== 'object' || !data.report) {
         throw new ApiError('响应缺少 report 字段', 500, 'bad_response');
@@ -1544,7 +1548,7 @@
       ['domain', 'tag', 'category'].forEach(function (k) {
         if (filterState[k]) qs.push(k + '=' + encodeURIComponent(filterState[k]));
       });
-      var url = '/api/atoms' + (qs.length ? '?' + qs.join('&') : '');
+      var url = API + 'atoms' + (qs.length ? '?' + qs.join('&') : '');
       apiGet(url).then(function (list) {
         if (!ctx.alive()) return;
         applyFilters(Array.isArray(list) ? list : []);
@@ -1574,7 +1578,7 @@
       cSel.addEventListener('change', onChange);
     };
 
-    apiGet('/api/atoms').then(function (atoms) {
+    apiGet(API + 'atoms').then(function (atoms) {
       if (!ctx.alive()) return;
       var list = Array.isArray(atoms) ? atoms : [];
       APP.atomsAll = list;
@@ -1683,7 +1687,7 @@
     var load = function () {
       if (!ctx.alive()) return;
       body.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取领域包…</div>';
-      apiGet('/api/packs').then(function (packs) {
+      apiGet(API + 'packs').then(function (packs) {
         if (!ctx.alive()) return;
         if (!Array.isArray(packs) || packs.length === 0) {
           body.innerHTML = '<div class="empty"><strong>没有可用领域包</strong>' +
@@ -1701,7 +1705,7 @@
 
     var openPack = function (name, opener) {
       openDrawer(esc(name), '<div class="loading"><span class="spinner"></span>正在读取包详情…</div>', opener);
-      apiGet('/api/packs/' + encodeURIComponent(name)).then(function (pack) {
+      apiGet(API + 'packs/' + encodeURIComponent(name)).then(function (pack) {
         if (!pack || typeof pack !== 'object') throw new ApiError('响应格式不正确', 500, 'bad_response');
         setDrawerBody(packDrawerHtml(pack));
       }).catch(function (err) {
