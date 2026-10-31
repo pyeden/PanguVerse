@@ -1,0 +1,164 @@
+# coding-log-web（https://seres-ai.com）只读巡检场景
+#
+# 契约: tasks/api-test-suite-spec.md §2
+# 只打只读接口：不做 POST /api/travel/plan（重计算）与 POST /api/travel/feedback（写数据）。
+name: coding-log-web 站点与旅行助手只读巡检
+description: VuePress 站点页面 + 旅行助手 health/root/weather/share 负向
+tags: [api, codinglog, readonly]
+
+env:
+  BASE_URL: https://seres-ai.com
+  # 固定日期便于复现；超出 AMap 预报窗口时后端返回 source=fallback，字段契约不变
+  WEATHER_DATE: "2026-11-02"
+  SHARE_PROBE_ID: e2e-does-not-exist-0001
+
+cases:
+  # ---------------------------------------------------------------- #
+  - id: site_pages
+    name: 站点首页与 PanguVerse 项目页可访问
+    tags: [site, html]
+    # 注意：站点响应头是 Content-Type: text/html（无 charset）。requests 按 RFC 2616
+    # 以 ISO-8859-1 解码，中文会变成 mojibake，因此这里断言页面中 ASCII 可见的标题片段
+    # （"三木 vlog" 的 vlog）与页面声明的 utf-8 charset，而不是直接断言汉字「三木」。
+    # 该缺陷已在 docs/api-tests.md 的「已知限制」中记录。
+    steps:
+      - id: home
+        use: http_request
+        name: GET /
+        with:
+          method: GET
+          url: ${env.BASE_URL}/
+          timeout: 20
+        assert:
+          status: 200
+          header:
+            name: Content-Type
+            contains: text/html
+          body_contains: vlog
+      - id: home_charset
+        use: http_request
+        name: 首页声明 UTF-8（但响应头缺 charset）
+        with:
+          method: GET
+          url: ${env.BASE_URL}/
+          timeout: 20
+        assert:
+          status: 200
+          body_contains: 'charset="utf-8"'
+      - id: project_page
+        use: http_request
+        name: GET /projects/panguverse/
+        with:
+          method: GET
+          url: ${env.BASE_URL}/projects/panguverse/
+          timeout: 20
+        assert:
+          status: 200
+          body_contains: PanguVerse
+          header:
+            name: Content-Type
+            contains: text/html
+
+  # ---------------------------------------------------------------- #
+  - id: travel_health
+    name: 旅行助手健康检查
+    tags: [travel, health]
+    steps:
+      - id: health
+        use: http_request
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/travel/health
+          timeout: 20
+        assert:
+          status: 200
+          json:
+            - path: status
+              equals: ok
+            - path: service
+              equals: travel-assistant
+            - path: version
+              exists: true
+              type: string
+
+  # ---------------------------------------------------------------- #
+  - id: travel_root
+    name: 旅行助手根路由与端点清单
+    tags: [travel]
+    steps:
+      - id: root
+        use: http_request
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/travel/
+          timeout: 20
+        assert:
+          status: 200
+          json:
+            - path: service
+              equals: travel-assistant
+            - path: endpoints
+              contains: "/api/travel/weather"
+
+  # ---------------------------------------------------------------- #
+  - id: travel_weather
+    name: 天气接口字段契约（真实签名 destination + date）
+    tags: [travel, weather]
+    steps:
+      - id: weather
+        use: http_request
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/travel/weather
+          params:
+            destination: 杭州
+            date: ${env.WEATHER_DATE}
+          timeout: 20
+        assert:
+          status: 200
+          schema:
+            type: object
+            required: [text, temp_min, temp_max, rain_prob, uv, source]
+            properties:
+              text:
+                type: string
+                minLength: 1
+              temp_min:
+                type: integer
+              temp_max:
+                type: integer
+              rain_prob:
+                type: integer
+                minimum: 0
+                maximum: 100
+              uv:
+                type: string
+                minLength: 1
+              source:
+                type: string
+                enum: [amap, fallback]
+          json:
+            - path: temp_max
+              gte: ${weather.body.temp_min}
+            - path: rain_prob
+              lte: 100
+
+  # ---------------------------------------------------------------- #
+  - id: travel_share_negative
+    name: 不存在的分享应 404（负向）
+    tags: [travel, negative]
+    steps:
+      - id: share_missing
+        use: http_request
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/travel/share/${env.SHARE_PROBE_ID}
+          timeout: 20
+        assert:
+          status: 404
+          json:
+            - path: detail
+              exists: true
+              type: string
+            - path: detail
+              contains: 分享

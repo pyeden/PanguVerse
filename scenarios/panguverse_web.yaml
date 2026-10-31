@@ -1,0 +1,448 @@
+# PanguVerse Web 平台自测场景（dogfooding）
+#
+# 契约: tasks/api-test-suite-spec.md §2
+# 说明:
+#   - 密码不通过 --env 传入：`run` 会把 --env 原样写进 runs/<id>/plan.json，
+#     真实密码会落盘。这里用 fs_read_text 从 0600 凭据文件读取，并把读到的
+#     内容登记为 secret，报告/HTML/JUnit 全量按值打码。
+#   - 用例顺序有意为之：unauth_guard 最前（无 cookie），logout_guard 最后。
+#   - 错误密码只试 1 次，且排在正确登录之前（限流阈值 5 次 / 5 分钟）。
+name: PanguVerse Web API 自测（鉴权 + 目录 + 任务 + 运行列表）
+description: 平台 dogfooding：未登录守卫、登录链路、原子/领域包目录、任务 CRUD 与环境三态、运行列表、登出失效
+tags: [api, panguverse, dogfooding]
+
+env:
+  BASE_URL: http://127.0.0.1:7788
+  API_USERNAME: admin
+  # 凭据文件沙箱根与相对路径（可用 --env FS_ROOT=... / --env CREDS_FILE=... 覆盖）
+  FS_ROOT: /tmp
+  CREDS_FILE: pv-test-creds.env
+
+defaults:
+  headers:
+    Content-Type: application/json
+
+cases:
+  # ---------------------------------------------------------------- #
+  - id: unauth_guard
+    name: 未登录访问受保护接口应 401
+    tags: [auth, negative, guard]
+    steps:
+      - id: status_without_cookie
+        use: http_request
+        name: 不带 cookie 访问 /api/status
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/status
+        assert:
+          status: 401
+          json:
+            - path: error.code
+              equals: unauthorized
+            - path: error.message
+              exists: true
+              type: string
+
+  # ---------------------------------------------------------------- #
+  - id: login_flow
+    name: 错误密码 1 次 → 正确登录 → 受保护状态可读
+    tags: [auth, smoke]
+    secrets: [creds_raw, api_password]
+    steps:
+      - id: read_creds
+        use: fs_read_text
+        name: 读取 0600 凭据文件（整段内容登记为密钥）
+        with:
+          path: ${env.CREDS_FILE}
+        capture:
+          creds_raw: text
+      - id: read_password
+        use: regex_extract
+        name: 提取 API_PASSWORD 并登记为密钥
+        with:
+          source: ${creds_raw}
+          pattern: "API_PASSWORD=(.+)"
+          group: 1
+        capture:
+          api_password: value
+      - id: login_bad
+        use: http_request
+        name: 错误密码只尝试一次
+        tags: [negative]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/login
+          json:
+            username: ${env.API_USERNAME}
+            password: definitely-wrong-e2e-once
+        assert:
+          status: 401
+          json:
+            - path: error.code
+              equals: bad_credentials
+      - id: login
+        use: http_request
+        name: 正确凭据登录
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${api_password}
+        assert:
+          status: 200
+          json:
+            - path: ok
+              equals: true
+            - path: user
+              equals: ${env.API_USERNAME}
+      - id: status_authed
+        use: http_request
+        name: 登录后读取 /api/status
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/status
+        assert:
+          status: 200
+          json:
+            - path: atoms
+              gte: 24
+            - path: packs
+              gte: 3
+            - path: version
+              exists: true
+              type: string
+
+  # ---------------------------------------------------------------- #
+  - id: catalog
+    name: 原子与领域包目录完整
+    tags: [catalog]
+    secrets: [creds_raw, api_password]
+    steps:
+      - id: read_creds
+        use: fs_read_text
+        with:
+          path: ${env.CREDS_FILE}
+        capture:
+          creds_raw: text
+      - id: read_password
+        use: regex_extract
+        with:
+          source: ${creds_raw}
+          pattern: "API_PASSWORD=(.+)"
+          group: 1
+        capture:
+          api_password: value
+      - id: login
+        use: http_request
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${api_password}
+        assert:
+          status: 200
+          json:
+            - path: ok
+              equals: true
+      - id: atoms
+        use: http_request
+        name: GET /api/atoms
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/atoms
+        assert:
+          status: 200
+          schema:
+            type: array
+            minItems: 24
+            items:
+              type: object
+              required: [name, category, domain]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+      - id: packs
+        use: http_request
+        name: GET /api/packs
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/packs
+        assert:
+          status: 200
+          schema:
+            type: array
+            minItems: 3
+            items:
+              type: object
+              required: [name, version, domain, atom_count]
+              properties:
+                atom_count:
+                  type: integer
+                  minimum: 1
+
+  # ---------------------------------------------------------------- #
+  - id: task_lifecycle
+    name: 任务 CRUD 与环境变量三态（覆盖 / 保留 / 删除）
+    tags: [tasks, crud]
+    secrets: [creds_raw, api_password]
+    steps:
+      - id: read_creds
+        use: fs_read_text
+        with:
+          path: ${env.CREDS_FILE}
+        capture:
+          creds_raw: text
+      - id: read_password
+        use: regex_extract
+        with:
+          source: ${creds_raw}
+          pattern: "API_PASSWORD=(.+)"
+          group: 1
+        capture:
+          api_password: value
+      - id: login
+        use: http_request
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${api_password}
+        assert:
+          status: 200
+          json:
+            - path: ok
+              equals: true
+
+      - id: list_before
+        use: http_request
+        name: 创建前任务数基线
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/tasks
+        capture:
+          tasks_before: body.tasks
+        assert:
+          status: 200
+          json:
+            - path: tasks
+              type: array
+
+      - id: create
+        use: http_request
+        name: POST /api/tasks（env 含敏感键）
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/tasks
+          json:
+            name: e2e-api-suite
+            mode: demo
+            env:
+              REGION: a
+              KEEP_ME: b
+              DROP_ME: c
+              password: e2e-mask-check
+        capture:
+          task_id: body.task_id
+        assert:
+          status: 201
+          json:
+            - path: task_id
+              matches: "^t-[0-9a-f]{6,12}$"
+            - path: name
+              equals: e2e-api-suite
+            - path: env.password
+              equals: "***"
+
+      - id: get_detail
+        use: http_request
+        name: 详情回读：密钥打码、普通键原样
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/tasks/${task_id}
+        assert:
+          status: 200
+          json:
+            - path: task_id
+              equals: ${task_id}
+            - path: env.password
+              equals: "***"
+            - path: env.REGION
+              equals: a
+
+      - id: patch
+        use: http_request
+        name: PATCH 改名 + env 三态
+        with:
+          method: PATCH
+          url: ${env.BASE_URL}/api/tasks/${task_id}
+          json:
+            name: e2e-api-suite-renamed
+            env:
+              REGION: b-e2e
+              KEEP_ME: "***"
+              DROP_ME: null
+        assert:
+          status: 200
+          json:
+            - path: name
+              equals: e2e-api-suite-renamed
+            - path: env.REGION
+              equals: b-e2e
+            - path: env.KEEP_ME
+              equals: b
+            - path: env.DROP_ME
+              exists: false
+            - path: env.password
+              equals: "***"
+
+      - id: delete
+        use: http_request
+        name: DELETE 自己创建的任务
+        with:
+          method: DELETE
+          url: ${env.BASE_URL}/api/tasks/${task_id}
+        assert:
+          status: 204
+
+      - id: verify_gone
+        use: http_request
+        name: 删除后回读应 404
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/tasks/${task_id}
+        assert:
+          status: 404
+          json:
+            - path: error.code
+              equals: not_found
+
+      - id: list_after
+        use: http_request
+        name: 删除后任务列表
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/tasks
+        capture:
+          tasks_after: body.tasks
+        assert:
+          status: 200
+          json:
+            - path: tasks
+              type: array
+
+      - id: assert_no_residue
+        use: assert_json
+        name: 任务总数与创建前一致（无残留）
+        with:
+          source: ${tasks_after}
+          length: ${tasks_before|len}
+
+  # ---------------------------------------------------------------- #
+  - id: runs_api
+    name: 运行列表接口
+    tags: [runs]
+    secrets: [creds_raw, api_password]
+    steps:
+      - id: read_creds
+        use: fs_read_text
+        with:
+          path: ${env.CREDS_FILE}
+        capture:
+          creds_raw: text
+      - id: read_password
+        use: regex_extract
+        with:
+          source: ${creds_raw}
+          pattern: "API_PASSWORD=(.+)"
+          group: 1
+        capture:
+          api_password: value
+      - id: login
+        use: http_request
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${api_password}
+        assert:
+          status: 200
+          json:
+            - path: ok
+              equals: true
+      - id: runs
+        use: http_request
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/runs
+          params:
+            limit: 5
+        assert:
+          status: 200
+          schema:
+            type: array
+            maxItems: 5
+
+  # ---------------------------------------------------------------- #
+  - id: logout_guard
+    name: 登出后会话立即失效
+    tags: [auth, guard]
+    secrets: [creds_raw, api_password]
+    steps:
+      - id: read_creds
+        use: fs_read_text
+        with:
+          path: ${env.CREDS_FILE}
+        capture:
+          creds_raw: text
+      - id: read_password
+        use: regex_extract
+        with:
+          source: ${creds_raw}
+          pattern: "API_PASSWORD=(.+)"
+          group: 1
+        capture:
+          api_password: value
+      - id: login
+        use: http_request
+        tags: [auth]
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/login
+          json:
+            username: ${env.API_USERNAME}
+            password: ${api_password}
+        assert:
+          status: 200
+          json:
+            - path: ok
+              equals: true
+      - id: logout
+        use: http_request
+        with:
+          method: POST
+          url: ${env.BASE_URL}/api/auth/logout
+        assert:
+          status: 200
+          json:
+            - path: ok
+              equals: true
+      - id: status_after_logout
+        use: http_request
+        name: 登出后 /api/status 应 401
+        with:
+          method: GET
+          url: ${env.BASE_URL}/api/status
+        assert:
+          status: 401
+          json:
+            - path: error.code
+              equals: unauthorized
