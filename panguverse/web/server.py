@@ -13,10 +13,12 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Any
 from urllib.parse import unquote, urlsplit
 
 from .api import Response as ApiResponse
 from .api import WebAPI, error_response
+from .auth import AuthManager
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 STATIC_MIME = {
@@ -43,7 +45,7 @@ class PanguverseRequestHandler(BaseHTTPRequestHandler):
         parsed = urlsplit(self.path)
         path = parsed.path
         if _is_api_path(path):
-            self._emit(self.server.api.handle("GET", path, parsed.query))
+            self._emit(self._api("GET", parsed))
             return
         if path == "/":
             self._serve_index()
@@ -86,7 +88,15 @@ class PanguverseRequestHandler(BaseHTTPRequestHandler):
             self._emit(error_response("bad_request", "请求体过大"), close=True)
             return
         raw = self.rfile.read(length) if length else b""
-        self._emit(self.server.api.handle(method, parsed.path, parsed.query, raw))
+        self._emit(self._api(method, parsed, raw))
+
+    def _api(self, method: str, parsed: Any, raw: bytes = b"") -> ApiResponse:
+        """把 Cookie / X-Forwarded-Proto / 客户端 IP 交给 API 层（认证需要）。"""
+        headers = dict(self.headers.items())
+        client_ip = self.client_address[0] if self.client_address else ""
+        return self.server.api.handle(
+            method, parsed.path, parsed.query, raw, headers=headers, client_ip=client_ip
+        )
 
     # ------------------------------------------------------------------ #
     def _serve_static(self, name: str) -> None:
@@ -176,9 +186,14 @@ class PanguverseHTTPServer(ThreadingHTTPServer):
 
 
 def create_server(
-    host: str, port: int, workspace: str | Path, *, quiet: bool = False
+    host: str,
+    port: int,
+    workspace: str | Path,
+    *,
+    quiet: bool = False,
+    auth: AuthManager | None = None,
 ) -> PanguverseHTTPServer:
-    api = WebAPI(workspace)
+    api = WebAPI(workspace, auth=auth)
     return PanguverseHTTPServer((host, port), api=api, quiet=quiet)
 
 
@@ -189,10 +204,16 @@ def serve(
     workspace: str | Path = ".",
     open_browser: bool = False,
     quiet: bool = False,
+    no_auth: bool = False,
+    auth_user: str | None = None,
 ) -> int:
     root = Path(workspace).expanduser().resolve()
+    auth: AuthManager | None = None
+    if not no_auth:
+        # 默认开启：凭据 env > .panguverse/web/auth.json > 首启生成（密码只打印一次）
+        auth = AuthManager(root, username=auth_user, logger=lambda line: print(line, flush=True))
     try:
-        httpd = create_server(host, port, root, quiet=quiet)
+        httpd = create_server(host, port, root, quiet=quiet, auth=auth)
     except OSError as exc:
         print(f"❌ 无法监听 {host}:{port} -> {exc}（端口被占用或地址不可用）")
         return 2
@@ -200,12 +221,30 @@ def serve(
     bound_port = int(httpd.server_address[1])
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::", ""} else host
     url = f"http://{display_host}:{bound_port}/"
-    print(f"🪓 PanguVerse Web 已启动: {url}")
-    print(f"   工作区: {root}")
+
+    def announce(line: str) -> None:
+        # 启动日志必须即时可见：重定向到文件/systemd 时 stdout 是块缓冲，
+        # 首启密码不 flush 就等于没打印（契约要求「仅显示这一次」）
+        print(line, flush=True)
+
+    announce(f"🪓 PanguVerse Web 已启动: {url}")
+    announce(f"   工作区: {root}")
+    if auth is None:
+        announce("⚠️  已关闭登录认证（--no-auth）：任何人只要能访问端口即可操作，仅限本机调试")
+    else:
+        if auth.generated_password:
+            announce(
+                f"[auth] 初始账号 {auth.user}，初始密码 {auth.generated_password}"
+                "（首次启动生成，仅显示这一次）"
+            )
+        announce(f"[auth] 已启用登录认证，账号 {auth.user}")
     if host not in {"127.0.0.1", "localhost", "::1"}:
-        print("⚠️  已监听非本机地址：本服务无认证，仅限可信网络使用，切勿暴露公网")
+        if auth is None:
+            announce("🚨 危险：正在监听非本机地址且未开启认证，切勿暴露公网！")
+        else:
+            announce("⚠️  已监听非本机地址：登录认证已开启，仍建议放在 HTTPS 反向代理之后")
     if not (STATIC_DIR / "index.html").is_file():
-        print("⚠️  前端资源未就绪（panguverse/web/static/index.html 缺失）：GET / 将返回 503")
+        announce("⚠️  前端资源未就绪（panguverse/web/static/index.html 缺失）：GET / 将返回 503")
 
     if open_browser and host in {"127.0.0.1", "localhost", "::1"}:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()

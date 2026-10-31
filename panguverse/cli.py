@@ -175,6 +175,16 @@ def build_parser() -> argparse.ArgumentParser:
     serve.add_argument("--port", type=int, default=7788, help="监听端口（默认 7788）")
     serve.add_argument("--workspace", default=".", help="工作区目录（默认当前目录）")
     serve.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
+    serve.add_argument(
+        "--no-auth",
+        action="store_true",
+        help="关闭登录认证（默认开启；仅限本机调试，会打印警告）",
+    )
+    serve.add_argument(
+        "--auth-user",
+        default=None,
+        help="覆盖登录账号名（密码仍来自 PANGUVERSE_WEB_PASSWORD 或 .panguverse/web/auth.json）",
+    )
     serve.set_defaults(handler=_cmd_serve)
 
     return parser
@@ -453,6 +463,8 @@ def _cmd_serve(args: argparse.Namespace) -> int:
         port=args.port,
         workspace=args.workspace,
         open_browser=not args.no_open,
+        no_auth=args.no_auth,
+        auth_user=args.auth_user,
     )
 
 

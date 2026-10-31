@@ -6,10 +6,13 @@
 ## 1. 启动
 
 ```bash
-panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open]
+panguverse serve [--host 127.0.0.1] [--port 7788] [--workspace .] [--no-open] [--no-auth] [--auth-user admin]
 # 等价
 python -m panguverse serve --port 7788 --workspace . --no-open
 ```
+
+**登录认证默认开启**（v2.1）：`serve` 不带参数就要求登录；仅 `--no-auth` 关闭（会打印醒目警告，
+本机调试用）。`--auth-user` 可覆盖账号名（密码仍来自环境变量或 `auth.json`）。
 
 - 默认 `127.0.0.1:7788`，工作区默认当前目录；监听成功会打印 `http://127.0.0.1:<port>/`。
 - `--no-open` 不尝试拉起浏览器（CI/测试用）。
@@ -21,6 +24,7 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 
 - **只监听本机**：默认 `127.0.0.1`；本服务没有认证、没有会话，**不可暴露公网**。
 - 静态资源走白名单（`index.html` / `app.js` / `style.css` / `favicon.svg`），并用 `realpath` 前缀校验兜底，`/static/../../cli.py` 一律 404。
+- `/api/*` 默认要求登录（`/api/auth/*` 白名单）；`--no-auth` 仅用于本机调试，暴露非本机地址会打印危险警告。
 - 场景路径经 `realpath` 前缀校验，只能读 `<workspace>` 或仓库内置 `scenarios/`；越界 400。
 - `run_id` 必须匹配 `^[0-9a-f]{6,32}$`，`task_id` 必须匹配 `^t-[0-9a-f]{6,12}$`，杜绝用 `..` 拼接路径。
 - 错误消息经 `core/redact.py` 打码（不出现密钥/token/Cookie 原文）；`/api/status` 只回 `llm_enabled: bool`，绝不回显密钥值。
@@ -30,6 +34,35 @@ python -m panguverse serve --port 7788 --workspace . --no-open
   `report.html` / `junit.xml` 不再直读磁盘原文，而是用打码后的报告数据**重新渲染**（HTML 标题沿用磁盘文件），
   因此 `<pre>` 里的 JSON 仍是合法结构、只换值不换键。磁盘上的 `report.json` / `plan.json` / HTML / XML
   与 `last_env.json` 保持原样（回归回放依赖），只在 HTTP 出口打码。
+
+## 1.1 登录认证（v2.1，契约 `tasks/web-auth-spec.md`）
+
+- **默认开启**：除 `/api/auth/*` 外，所有 `/api/*` 在**路由分派前**统一校验会话，未登录一律
+  `401 {"error":{"code":"unauthorized","message":"需要登录"}}`；`GET /` 与静态资源始终 200，
+  由前端自己看 `GET /api/auth/status` 渲染登录页（不靠 302）。
+- **凭据来源**（优先级从高到低）：
+  1. 环境变量 `PANGUVERSE_WEB_USER` + `PANGUVERSE_WEB_PASSWORD`（不落盘）；
+  2. `<workspace>/.panguverse/web/auth.json`（`0600`，PBKDF2-SHA256，200k 迭代，salt 32 字节）；
+  3. 都没有 → 首次启动生成 16 位随机密码（去掉易混字符），只把哈希写入 `auth.json`，
+     明文仅打印一次：`[auth] 初始账号 admin，初始密码 <pwd>（首次启动生成，仅显示这一次）`。
+- **会话**：Cookie `pv_session` = `base64url(payload).base64url(hmac_sha256(payload, key))`，
+  `payload={u,exp,nonce}`，12h 有效；密钥独立存 `<workspace>/.panguverse/web/session.key`（32 字节，`0600`），
+  **不复用任何 env 值**。Cookie 属性 `HttpOnly; Path=/; SameSite=Lax; Max-Age=43200`，
+  请求带 `X-Forwarded-Proto: https` 时追加 `Secure`。
+- **校验**：HMAC、`exp`、`u` 与当前账号一致、登出黑名单（内存态 nonce，重启即清空）；
+  任一项不过按未认证处理，绝不 500。
+- **登出**：`POST /api/auth/logout` → `200 {"ok":true}`，`Set-Cookie: pv_session=; Max-Age=0 ...`，
+  旧 cookie 立即失效（nonce 进黑名单直到自然过期）。
+- **限流**：同 IP 5 分钟内失败 5 次 → 后续请求 `429` + `Retry-After`（秒）；
+  成功登录清零。登录失败**不区分**账号不存在/密码错，日志只记
+  `[auth] login failed user=<name> ip=<ip>`，绝不出现密码。
+- **接口**：
+  - `GET /api/auth/status` → `{"authenticated": false}` / `{"authenticated": true, "user": "admin"}`
+    （`--no-auth` 时恒为 `{"authenticated": true, "user": "", "auth_disabled": true}`）；
+  - `POST /api/auth/login` `{"username","password"}` → 成功 `200 {"ok":true,"user":"admin"}` + `Set-Cookie`；
+    失败 `401 bad_credentials`；限流 `429 too_many_attempts`；
+  - `POST /api/auth/logout` → `200 {"ok":true}`（幂等）。
+- 认证文件（`auth.json`/`session.key`）目录 `0700`、文件 `0600`，位于已被 gitignore 的 `.panguverse/`。
 
 ## 2. 响应约定
 

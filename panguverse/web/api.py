@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote
 
 from ..report import html_report, junit
 from . import service
+from .auth import AuthManager, build_cookie
 from .jobs import JobManager
 from .service import ApiError
 from .tasks_store import TaskStoreError
@@ -90,18 +91,38 @@ def error_response(code: str, message: str, status: int | None = None) -> Respon
 class WebAPI:
     """把请求映射到服务层；不碰 socket，便于单测直接调用。"""
 
-    def __init__(self, workspace: str | Path, *, jobs: JobManager | None = None) -> None:
+    def __init__(
+        self,
+        workspace: str | Path,
+        *,
+        jobs: JobManager | None = None,
+        auth: AuthManager | None = None,
+    ) -> None:
         self.root = service.resolve_workspace(workspace)
         self.jobs = jobs or JobManager()
+        #: ``None`` = 关闭认证（--no-auth / 单元测试直接嵌入）；``serve`` 默认构造 AuthManager
+        self.auth = auth
 
     # ------------------------------------------------------------------ #
     def handle(
-        self, method: str, path: str, query: str = "", raw_body: bytes = b""
+        self,
+        method: str,
+        path: str,
+        query: str = "",
+        raw_body: bytes = b"",
+        *,
+        headers: dict[str, str] | None = None,
+        client_ip: str = "",
     ) -> Response:
         try:
             params = parse_qs(query, keep_blank_values=True)
             body = self._parse_body(raw_body) if method in {"POST", "PUT", "PATCH"} else None
-            return self._route(method.upper(), path, params, body)
+            request_headers = headers or {}
+            # 认证必须在路由分派之前统一拦截（契约 §3.1），只有 /api/auth/* 白名单放行
+            self._check_auth(path, request_headers)
+            return self._route(
+                method.upper(), path, params, body, headers=request_headers, client_ip=client_ip
+            )
         except (ApiError, TaskStoreError) as exc:
             return error_response(exc.code, exc.message, exc.status)
         except Exception as exc:  # noqa: BLE001 - 兜底：异常不得穿透到 handler 线程
@@ -119,8 +140,26 @@ class WebAPI:
         except (UnicodeDecodeError, ValueError) as exc:
             raise ApiError("bad_request", f"请求体不是合法 JSON: {exc}") from exc
 
+    def _check_auth(self, path: str, headers: dict[str, str]) -> None:
+        if self.auth is None:
+            return
+        segments = [part for part in path.strip("/").split("/") if part]
+        if not segments or segments[0] != "api":
+            return
+        if len(segments) >= 2 and segments[1] == "auth":
+            return
+        if self.auth.user_from_headers(headers) is None:
+            raise ApiError("unauthorized", "需要登录", status=401)
+
     def _route(
-        self, method: str, path: str, query: dict[str, list[str]], body: Any
+        self,
+        method: str,
+        path: str,
+        query: dict[str, list[str]],
+        body: Any,
+        *,
+        headers: dict[str, str] | None = None,
+        client_ip: str = "",
     ) -> Response:
         segments = [unquote(part) for part in path.strip("/").split("/") if part]
         if len(segments) < 2 or segments[0] != "api":
@@ -128,6 +167,10 @@ class WebAPI:
         tail = segments[1:]
         head = tail[0]
         rest = tail[1:]
+        request_headers = headers or {}
+
+        if head == "auth":
+            return self._handle_auth(method, rest, body, request_headers, client_ip)
 
         if method == "GET":
             if head == "status" and not rest:
@@ -229,6 +272,69 @@ class WebAPI:
 
         raise ApiError("not_found", "接口不存在")
 
+    # ------------------------------------------------------------------ #
+    def _handle_auth(
+        self,
+        method: str,
+        rest: list[str],
+        body: Any,
+        headers: dict[str, str],
+        client_ip: str,
+    ) -> Response:
+        if len(rest) != 1:
+            raise ApiError("not_found", "接口不存在")
+        action = rest[0]
+        if action == "status" and method == "GET":
+            if self.auth is None:
+                return json_response(
+                    {"authenticated": True, "user": "", "auth_disabled": True}
+                )
+            user = self.auth.user_from_headers(headers)
+            if user:
+                return json_response({"authenticated": True, "user": user})
+            return json_response({"authenticated": False})
+        if action == "login" and method == "POST":
+            return self._login(body, headers, client_ip)
+        if action == "logout" and method == "POST":
+            if self.auth is not None:
+                self.auth.revoke_headers(headers)
+            return json_response(
+                {"ok": True},
+                headers={
+                    "Set-Cookie": build_cookie(
+                        "", secure=_forwarded_https(headers), max_age=0
+                    )
+                },
+            )
+        raise ApiError("not_found", "接口不存在")
+
+    def _login(
+        self, body: Any, headers: dict[str, str], client_ip: str
+    ) -> Response:
+        if self.auth is None:
+            return json_response({"ok": True, "user": "", "auth_disabled": True})
+        retry_after = self.auth.rate_limit_retry(client_ip)
+        if retry_after:
+            return json_response(
+                {"error": {"code": "too_many_attempts", "message": "尝试过多，请 5 分钟后再试"}},
+                status=429,
+                headers={"Retry-After": str(retry_after)},
+            )
+        if not isinstance(body, dict):
+            raise ApiError("bad_request", "请求体必须是 JSON 对象")
+        username = body.get("username")
+        password = body.get("password")
+        if not self.auth.verify_credentials(username, password):
+            self.auth.record_failure(client_ip)
+            self.auth.log_login_failure(
+                username if isinstance(username, str) else "", client_ip
+            )
+            raise ApiError("bad_credentials", "账号或密码不正确", status=401)
+        self.auth.record_success(client_ip)
+        token = self.auth.issue_session()
+        cookie = build_cookie(token, secure=_forwarded_https(headers))
+        return json_response({"ok": True, "user": self.auth.user}, headers={"Set-Cookie": cookie})
+
 
 # --------------------------------------------------------------------------- #
 def _first(query: dict[str, list[str]], key: str) -> str | None:
@@ -262,6 +368,13 @@ def _read_text(path: Path) -> str:
         return path.read_text(encoding="utf-8")
     except OSError as exc:
         raise ApiError("internal_error", f"读取文件失败: {exc}") from exc
+
+
+def _forwarded_https(headers: dict[str, str]) -> bool:
+    for key, value in headers.items():
+        if key.lower() == "x-forwarded-proto":
+            return (value or "").split(",")[0].strip().lower() == "https"
+    return False
 
 
 def _html_title(disk_html: str) -> str:
