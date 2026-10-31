@@ -185,11 +185,21 @@
     return fetch(path, init).then(function (res) {
       var ctype = (res.headers.get('content-type') || '').toLowerCase();
       var isJson = ctype.indexOf('json') >= 0;
-      var read = isJson
-        ? res.json().catch(function () { return null; })
-        : res.text().catch(function () { return ''; });
+      // 204/205/304 以及 2xx 空体（content-length: 0）没有 JSON 可解析：
+      // 不能因为 Content-Type 是 json 就当成解析失败（DELETE 204 就是典型）。
+      var noContentStatus = res.status === 204 || res.status === 205 || res.status === 304;
+      var emptyBody = res.headers.get('content-length') === '0';
+      var read;
+      if (noContentStatus || (res.ok && emptyBody)) {
+        read = Promise.resolve(null);
+      } else {
+        read = isJson
+          ? res.json().catch(function () { return null; })
+          : res.text().catch(function () { return ''; });
+      }
 
       return read.then(function (payload) {
+        if (noContentStatus) return null;
         if (!res.ok) {
           var msg = '';
           var code = '';
@@ -201,6 +211,7 @@
           }
           throw new ApiError(msg || ('请求失败（HTTP ' + res.status + '）'), res.status, code);
         }
+        if (emptyBody) return null;
         if (isJson && payload === null) {
           throw new ApiError('服务端返回的响应不是合法 JSON', res.status, 'bad_json');
         }
@@ -2022,7 +2033,7 @@
   function deleteTask(taskId, name, reload, btn) {
     confirmDialog({
       title: '删除任务「' + (name || taskId) + '」？',
-      message: '只删配置，历史运行保留：仅删除 tasks/' + taskId + '.json，所有运行记录、报告与回归库都不受影响。此操作不可撤销。',
+      message: '只删配置，历史运行保留：仅删除这条任务定义，所有运行记录、报告与回归库都不受影响。此操作不可撤销。',
       confirmLabel: '删除配置',
       danger: true
     }).then(function (ok) {
