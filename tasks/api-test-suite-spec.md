@@ -10,9 +10,11 @@
 | PanguVerse Web | `http://127.0.0.1:7788` | 本机调试端点，**已开启登录认证** |
 | coding-log-web | `https://seres-ai.com` | 公网站点 + 旅行助手后端 `/api/travel/*` |
 
-## 2. 场景文件（放 `scenarios/`，两个文件，不要改内置四个）
+## 2. 场景文件（放 `scenarios/suites/`，两个文件，不要改内置四个）
 
-### `scenarios/panguverse_web.yaml` — 平台自测
+> 放在 `suites/` 子目录的原因：`demo`/`e2e` 只加载 `scenarios/*.yaml`（非递归），用户套件不该混进内置 demo 的合并集；Web 的 `/api/scenarios` 递归列出，所以界面仍能看到。用例 id 已加 `pv_`/`cl_` 前缀避免重名。
+
+### `scenarios/suites/panguverse_web.yaml` — 平台自测
 
 | 用例 | 步骤 | 断言 |
 | --- | --- | --- |
@@ -27,7 +29,7 @@
 - **限流红线**：错误密码最多试 **1 次**（阈值 5 次会锁 IP 5 分钟），且要在正确登录之前做，避免把后续用例锁死。
 - `task_lifecycle` 必须删除自己创建的任务（幂等、可重复跑）。
 
-### `scenarios/codinglog_web.yaml` — 站点 + 旅行助手
+### `scenarios/suites/codinglog_web.yaml` — 站点 + 旅行助手
 
 | 用例 | 步骤 | 断言 |
 | --- | --- | --- |
@@ -43,7 +45,7 @@
 ## 3. 执行与产物
 
 ```bash
-python -m panguverse run scenarios/panguverse_web.yaml \
+python -m panguverse run scenarios/suites/panguverse_web.yaml \
   --env BASE_URL=http://127.0.0.1:7788 --env API_USERNAME=admin --env API_PASSWORD=<运行时传入> \
   --workspace .panguverse/api-tests
 ```
@@ -66,7 +68,7 @@ python -m panguverse run scenarios/panguverse_web.yaml \
 
 |coder|说明|
 | --- | --- |
-| `scenarios/panguverse_web.yaml`、`scenarios/codinglog_web.yaml` | 只新增，不改内置场景 |
+| `scenarios/suites/panguverse_web.yaml`、`scenarios/suites/codinglog_web.yaml` | 只新增，不改内置场景 |
 | `docs/api-tests.md` | 如何跑、传什么 env、已知限制 |
 | `.gitignore` 追加 `.panguverse/api-tests/`（如需） | 产物不入库 |
 
