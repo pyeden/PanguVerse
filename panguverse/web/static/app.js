@@ -119,6 +119,30 @@
       ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
   }
 
+  /* 剪贴板：优先 async clipboard，失败时退回隐藏 textarea + execCommand */
+  function copyToClipboard(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      return navigator.clipboard.writeText(text);
+    }
+    return new Promise(function (resolve, reject) {
+      try {
+        var ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.top = '0';
+        ta.style.left = '-9999px';
+        document.body.appendChild(ta);
+        ta.select();
+        var ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        if (ok) resolve(); else reject(new Error('浏览器拒绝了复制操作'));
+      } catch (e) {
+        reject(e);
+      }
+    });
+  }
+
   function passStats(summary) {
     var total = summary && typeof summary.total === 'number' ? summary.total : 0;
     var passed = summary && typeof summary.passed === 'number' ? summary.passed : 0;
@@ -1443,6 +1467,479 @@
     '</div>';
   }
 
+  /* ================================================================== */
+  /* 10.5 AI 总结（LLM 可选 + 规则兜底）                                  */
+  /* ================================================================== */
+  var INSIGHT_PRIORITY = {
+    P0: { label: '先修（阻断）', hint: '这些问题会让后续结果不可信' },
+    P1: { label: '重要', hint: '影响覆盖范围或稳定性' },
+    P2: { label: '改进', hint: '补强断言与可维护性' }
+  };
+
+  /* 最小 markdown 渲染：输入先 esc()，再用白名单标签拼接。
+   * 不解析链接/图片/内联 HTML，summary_md 里的标签只会作为文本显示。 */
+  function insightInline(escaped) {
+    var codes = [];
+    var text = escaped.replace(/`([^`]+)`/g, function (_, code) {
+      codes.push(code);
+      return '\u0000' + (codes.length - 1) + '\u0000';
+    });
+    text = text
+      .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+      .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
+      .replace(/(^|[^\w*])\*([^*\n]+)\*(?!\*)/g, '$1<em>$2</em>');
+    return text.replace(/\u0000(\d+)\u0000/g, function (_, i) {
+      return '<code>' + codes[Number(i)] + '</code>';
+    });
+  }
+
+  function markdownHtml(src) {
+    if (!src) return '';
+    var lines = String(src).replace(/\r\n?/g, '\n').split('\n');
+    var out = [];
+    var lists = [];
+    var para = [];
+    var fence = null;
+    var fenceBuf = [];
+
+    function flushPara() {
+      if (!para.length) return;
+      out.push('<p>' + insightInline(esc(para.join(' '))) + '</p>');
+      para = [];
+    }
+    function closeLists() {
+      while (lists.length) out.push('</' + lists.pop() + '>');
+    }
+    function openList(tag) {
+      if (lists.length && lists[lists.length - 1] === tag) return;
+      closeLists();
+      lists.push(tag);
+      out.push('<' + tag + '>');
+    }
+    function flushFence() {
+      out.push('<pre class="md-code"><code>' + esc(fenceBuf.join('\n')) + '</code></pre>');
+      fence = null;
+      fenceBuf = [];
+    }
+
+    lines.forEach(function (line) {
+      if (fence !== null) {
+        if (/^\s*```/.test(line)) flushFence();
+        else fenceBuf.push(line);
+        return;
+      }
+      var mFence = /^\s*```(\S*)\s*$/.exec(line);
+      if (mFence) { flushPara(); closeLists(); fence = mFence[1] || 'code'; fenceBuf = []; return; }
+      if (!line.trim()) { flushPara(); closeLists(); return; }
+      if (/^\s{0,3}([-*_])\1{2,}\s*$/.test(line)) { flushPara(); closeLists(); out.push('<hr>'); return; }
+      var mHead = /^\s{0,3}(#{1,6})\s+(.*)$/.exec(line);
+      if (mHead) {
+        flushPara(); closeLists();
+        var level = Math.min(6, mHead[1].length + 2);
+        out.push('<h' + level + '>' + insightInline(esc(mHead[2].replace(/\s+#+\s*$/, ''))) + '</h' + level + '>');
+        return;
+      }
+      var mQuote = /^\s{0,3}>\s?(.*)$/.exec(line);
+      if (mQuote) { flushPara(); closeLists(); out.push('<blockquote>' + insightInline(esc(mQuote[1])) + '</blockquote>'); return; }
+      var mUl = /^\s*[-*+]\s+(.*)$/.exec(line);
+      if (mUl) { flushPara(); openList('ul'); out.push('<li>' + insightInline(esc(mUl[1])) + '</li>'); return; }
+      var mOl = /^\s*(\d+)[.)]\s+(.*)$/.exec(line);
+      if (mOl) { flushPara(); openList('ol'); out.push('<li>' + insightInline(esc(mOl[2])) + '</li>'); return; }
+      if (lists.length) closeLists();
+      para.push(line);
+    });
+
+    if (fence !== null) flushFence();
+    flushPara();
+    closeLists();
+    return out.join('');
+  }
+
+  function insightSourceMeta(payload) {
+    var p = payload || {};
+    if (p.source === 'llm') {
+      var model = p.model ? String(p.model) : '';
+      return {
+        kind: 'llm',
+        label: 'AI 模型总结' + (model ? '（' + model + '）' : '（模型未标注）'),
+        title: 'AI 总结',
+        model: model
+      };
+    }
+    if (p.source === 'rules') {
+      return {
+        kind: 'rules',
+        label: '离线规则总结',
+        title: '运行总结',
+        model: ''
+      };
+    }
+    return {
+      kind: 'unknown',
+      label: '来源未标注',
+      title: '运行总结',
+      model: ''
+    };
+  }
+
+  function insightCasesHtml(ids) {
+    if (!Array.isArray(ids) || !ids.length) return '';
+    return '<div class="insight-cases">' + ids.map(function (id) {
+      return '<span class="chip">' + esc(id) + '</span>';
+    }).join('') + '</div>';
+  }
+
+  function insightStatsHtml(stats) {
+    if (!stats || typeof stats !== 'object') return '';
+    var rows = [
+      ['用例总数', stats.total],
+      ['通过', stats.passed],
+      ['失败', stats.failed],
+      ['异常', stats.errored],
+      ['跳过', stats.skipped],
+      ['自愈用例', stats.healed_cases],
+      ['总耗时', (typeof stats.duration_ms === 'number') ? fmtMs(stats.duration_ms) : stats.duration_ms]
+    ].filter(function (row) { return row[1] !== undefined && row[1] !== null; });
+    if (!rows.length) return '';
+    return '<div class="insight-stats-wrap">' +
+      '<table class="insight-stats"><caption>统计核对 <span>与 report.summary 对应</span></caption><tbody>' +
+      rows.map(function (row) {
+        return '<tr><th scope="row">' + esc(row[0]) + '</th><td class="mono">' + esc(String(row[1])) + '</td></tr>';
+      }).join('') +
+      '</tbody></table>' +
+    '</div>';
+  }
+
+  function insightFindingsHtml(findings) {
+    if (!Array.isArray(findings) || !findings.length) return '';
+    return '<details class="insight-findings-block">' +
+      '<summary>关键发现（' + findings.length + '）<span>来自报告里的失败归类</span></summary>' +
+      '<ul class="insight-findings">' +
+      findings.map(function (f) {
+        f = f || {};
+        return '<li>' +
+          '<div class="insight-finding-title"><span class="chip">' + esc(f.kind || 'finding') + '</span>' + esc(f.title || '未命名发现') + '</div>' +
+          (f.detail ? '<div class="insight-finding-detail">' + esc(f.detail) + '</div>' : '') +
+          insightCasesHtml(f.case_ids) +
+        '</li>';
+      }).join('') +
+      '</ul>' +
+    '</details>';
+  }
+
+  function insightSuggestionsHtml(suggestions) {
+    if (!Array.isArray(suggestions) || !suggestions.length) {
+      return '<div class="insight-none">这次没有可执行建议。</div>';
+    }
+    var groups = {};
+    suggestions.forEach(function (s) {
+      s = s || {};
+      var key = String(s.priority || '其他').toUpperCase();
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(s);
+    });
+    var rank = { P0: 0, P1: 1, P2: 2 };
+    var keys = Object.keys(groups).sort(function (a, b) {
+      var ra = rank[a] === undefined ? 9 : rank[a];
+      var rb = rank[b] === undefined ? 9 : rank[b];
+      if (ra !== rb) return ra - rb;
+      return a < b ? -1 : (a > b ? 1 : 0);
+    });
+    return '<div class="insight-subhead"><h4>建议</h4><span class="hint">按优先级分组，附相关用例</span></div>' +
+      keys.map(function (key) {
+        var meta = INSIGHT_PRIORITY[key];
+        var list = groups[key];
+        return '<div class="insight-sugg-group" data-priority="' + esc(key) + '">' +
+          '<div class="insight-sugg-head">' +
+            '<span class="prio prio-' + esc(key.toLowerCase()) + '">' + esc(key) + '</span>' +
+            '<span class="insight-sugg-label">' + esc(meta ? meta.label : '其他') + '</span>' +
+            '<span class="insight-sugg-count">' + list.length + ' 条</span>' +
+          '</div>' +
+          '<ul class="insight-sugg-list">' +
+          list.map(function (s) {
+            return '<li>' +
+              '<div class="insight-sugg-title">' + esc(s.title || '未命名建议') + '</div>' +
+              (s.detail ? '<div class="insight-sugg-detail">' + esc(s.detail) + '</div>' : '') +
+              insightCasesHtml(s.case_ids) +
+            '</li>';
+          }).join('') +
+          '</ul>' +
+        '</div>';
+      }).join('');
+  }
+
+  function insightPayloadHtml(payload) {
+    var meta = insightSourceMeta(payload);
+    var p = payload || {};
+    var out = '<div class="insight-source-line">' +
+      '<span class="insight-source insight-source-' + meta.kind + '">' +
+        '<span aria-hidden="true">' + (meta.kind === 'llm' ? '✦' : '⚙') + '</span>' + esc(meta.label) +
+      '</span>' +
+      (meta.kind === 'rules' ? '<span class="insight-offline">未调用模型 · 由报告规则推导</span>' : '') +
+      '<span class="insight-when">生成于 ' + esc(fmtTs(p.generated_at)) + '</span>' +
+    '</div>';
+    if (meta.kind === 'rules' && p.degraded_reason) {
+      out += '<p class="insight-degraded"><strong>降级原因：</strong>' + esc(p.degraded_reason) + '</p>';
+    }
+    if (p.headline) out += '<h3 class="insight-headline">' + esc(p.headline) + '</h3>';
+    out += '<div class="md-body">' + markdownHtml(p.summary_md || '') + '</div>';
+    out += insightFindingsHtml(p.findings);
+    out += insightStatsHtml(p.stats);
+    out += insightSuggestionsHtml(p.suggestions);
+    return out;
+  }
+
+  function insightBlockHtml() {
+    return '<section class="insight-block" id="insightBlock" data-state="loading" aria-labelledby="insightTitle">' +
+      '<div class="insight-head">' +
+        '<div class="insight-head-main">' +
+          '<h2 id="insightTitle">AI 总结</h2>' +
+          '<span class="insight-source" id="insightSource" hidden></span>' +
+        '</div>' +
+        '<div class="insight-actions" id="insightActions"></div>' +
+      '</div>' +
+      '<div class="insight-body" id="insightBody">' +
+        '<div class="insight-loading"><span class="spinner" aria-hidden="true"></span>正在读取总结缓存…</div>' +
+      '</div>' +
+    '</section>';
+  }
+
+  function initInsight(host, ctx, id) {
+    var block = $('#insightBlock', host);
+    if (!block) return;
+    var titleEl = $('#insightTitle', block);
+    var sourceEl = $('#insightSource', block);
+    var bodyEl = $('#insightBody', block);
+    var actionsEl = $('#insightActions', block);
+    var path = API + 'runs/' + encodeURIComponent(id) + '/insight';
+    var state = { phase: 'loading', payload: null, error: null };
+    var timer = null;
+    var startedAt = 0;
+
+    function clearTimer() {
+      if (timer) { clearInterval(timer); timer = null; }
+    }
+    function elapsedText() {
+      return ((Date.now() - startedAt) / 1000).toFixed(1) + ' s';
+    }
+    function startTimer() {
+      startedAt = Date.now();
+      clearTimer();
+      timer = setInterval(function () {
+        if (!ctx.alive()) { clearTimer(); return; }
+        $$('[data-insight-elapsed]', block).forEach(function (el) {
+          el.textContent = elapsedText();
+        });
+      }, 100);
+    }
+    if (ctx.signal && ctx.signal.addEventListener) {
+      ctx.signal.addEventListener('abort', clearTimer);
+    }
+
+    function setSource(meta) {
+      if (!meta) {
+        sourceEl.hidden = true;
+        sourceEl.className = 'insight-source';
+        sourceEl.textContent = '';
+        return;
+      }
+      sourceEl.hidden = false;
+      sourceEl.className = 'insight-source insight-source-' + meta.kind;
+      sourceEl.innerHTML = '<span aria-hidden="true">' + (meta.kind === 'llm' ? '✦' : '⚙') + '</span>' + esc(meta.label);
+    }
+
+    function renderActions() {
+      if (state.phase === 'loading') {
+        actionsEl.innerHTML = '<span class="insight-elapsed">读取中…</span>';
+        return;
+      }
+      if (state.phase === 'generating') {
+        actionsEl.innerHTML = '<button type="button" class="btn btn-sm" disabled>' +
+          '<span class="spinner" aria-hidden="true"></span>生成中 <span class="insight-elapsed" data-insight-elapsed>0.0 s</span></button>';
+        return;
+      }
+      if (state.payload) {
+        actionsEl.innerHTML =
+          '<button type="button" class="btn btn-sm btn-ghost" data-insight-copy>复制总结</button>' +
+          '<button type="button" class="btn btn-sm" data-insight-refresh>重新生成</button>';
+        return;
+      }
+      actionsEl.innerHTML = '<span class="insight-elapsed">尚未生成</span>';
+    }
+
+    function emptyHtml() {
+      return '<div class="insight-empty">' +
+        '<div>' +
+          '<strong>还没有生成过总结</strong>' +
+          '<p>总结会先尝试调用已配置的模型；没有可用密钥时自动降级为离线规则，并在上方明确标注来源。结果会缓存在运行目录，刷新页面不会重复消耗。</p>' +
+        '</div>' +
+        '<button type="button" class="btn btn-primary" data-insight-generate>生成总结</button>' +
+      '</div>';
+    }
+
+    function insightErrorHtml(err, canReload) {
+      var msg = err && err.message ? err.message : '未知错误';
+      var hint = '';
+      if (err && err.status === 404) {
+        hint = '提示：当前后端尚未提供 AI 总结接口（GET/POST .../insight 返回 404），升级后端后再试。';
+      } else if (err && (err.code === 'network' || err.status === 0)) {
+        hint = '提示：后端未启动或端口不通。确认 panguverse serve 仍在运行后重试。';
+      } else if (err && err.status >= 500) {
+        hint = '提示：服务端生成异常，详细原因见服务端日志。';
+      }
+      return '<div class="insight-error" role="alert">' +
+        '<div class="insight-error-title"><span aria-hidden="true">⚠</span>总结生成失败</div>' +
+        '<div class="insight-error-msg">' + esc(msg) + '</div>' +
+        (hint ? '<div class="insight-error-hint">' + esc(hint) + '</div>' : '') +
+        '<div class="insight-error-actions">' +
+          '<button type="button" class="btn btn-sm" data-insight-' + (canReload ? 'reload' : 'retry') + '>重试</button>' +
+        '</div>' +
+      '</div>';
+    }
+
+    function render() {
+      block.setAttribute('data-state', state.phase);
+      var p = state.payload;
+      if (state.phase === 'loading') {
+        block.removeAttribute('data-source');
+        if (titleEl) titleEl.textContent = 'AI 总结';
+        setSource(null);
+        bodyEl.innerHTML = '<div class="insight-loading"><span class="spinner" aria-hidden="true"></span>正在读取总结缓存…</div>';
+        renderActions();
+        return;
+      }
+      if (state.phase === 'generating') {
+        bodyEl.innerHTML = '<div class="insight-loading"><span class="spinner" aria-hidden="true"></span>' +
+          '正在生成总结…首次生成可能需要几秒' +
+          '<span class="insight-elapsed" data-insight-elapsed>' + esc(elapsedText()) + '</span></div>';
+        renderActions();
+        return;
+      }
+      if (state.phase === 'empty') {
+        block.removeAttribute('data-source');
+        if (titleEl) titleEl.textContent = 'AI 总结';
+        setSource(null);
+        bodyEl.innerHTML = emptyHtml();
+        renderActions();
+        return;
+      }
+      if (state.phase === 'ready' && p) {
+        var meta = insightSourceMeta(p);
+        block.setAttribute('data-source', meta.kind);
+        if (titleEl) titleEl.textContent = meta.title;
+        setSource(meta);
+        bodyEl.innerHTML = insightPayloadHtml(p);
+        renderActions();
+        return;
+      }
+      // error：有缓存内容时保留展示，错误条放在顶部，绝不静默
+      if (p) {
+        var pmeta = insightSourceMeta(p);
+        block.setAttribute('data-source', pmeta.kind);
+        if (titleEl) titleEl.textContent = pmeta.title;
+        setSource(pmeta);
+        bodyEl.innerHTML = insightErrorHtml(state.error, false) + insightPayloadHtml(p);
+      } else {
+        block.removeAttribute('data-source');
+        if (titleEl) titleEl.textContent = 'AI 总结';
+        setSource(null);
+        bodyEl.innerHTML = insightErrorHtml(state.error, true);
+      }
+      renderActions();
+    }
+
+    function load() {
+      state.phase = 'loading';
+      state.payload = null;
+      state.error = null;
+      render();
+      apiGet(path).then(function (resp) {
+        if (!ctx.alive()) return;
+        if (resp && resp.available === true) {
+          state.phase = 'ready';
+          state.payload = resp;
+        } else {
+          state.phase = 'empty';
+        }
+        render();
+      }).catch(function (err) {
+        if (!ctx.alive()) return;
+        state.phase = 'error';
+        state.error = err;
+        render();
+      });
+    }
+
+    function generate(refresh) {
+      if (state.phase === 'generating') return;
+      var previous = state.payload;
+      state.phase = 'generating';
+      state.error = null;
+      block.removeAttribute('data-source');
+      if (titleEl) titleEl.textContent = 'AI 总结';
+      setSource(null);
+      startTimer();
+      render();
+      apiPost(path, { refresh: !!refresh }).then(function (resp) {
+        if (!ctx.alive()) return;
+        clearTimer();
+        if (!resp || resp.available !== true) {
+          state.phase = 'error';
+          state.payload = previous;
+          state.error = new ApiError('服务端没有返回可用的总结（available=false）', 200, 'bad_payload');
+          render();
+          return;
+        }
+        state.phase = 'ready';
+        state.payload = resp;
+        render();
+        toast(refresh ? '总结已重新生成' : '总结已生成', 'ok');
+      }).catch(function (err) {
+        if (!ctx.alive()) return;
+        clearTimer();
+        state.phase = 'error';
+        state.payload = previous;
+        state.error = err;
+        render();
+      });
+    }
+
+    function copySummary() {
+      var p = state.payload;
+      if (!p) return;
+      var meta = insightSourceMeta(p);
+      var lines = [];
+      if (p.headline) lines.push(String(p.headline));
+      if (p.summary_md) lines.push('', String(p.summary_md));
+      var list = Array.isArray(p.suggestions) ? p.suggestions : [];
+      if (list.length) {
+        lines.push('', '## 建议');
+        list.forEach(function (s) {
+          s = s || {};
+          lines.push('[' + (s.priority || '-') + '] ' + (s.title || '') + (s.detail ? '：' + s.detail : ''));
+        });
+      }
+      lines.push('', '来源：' + meta.label + (p.degraded_reason ? ' · ' + p.degraded_reason : ''));
+      copyToClipboard(lines.join('\n')).then(function () {
+        toast('总结已复制到剪贴板', 'ok');
+      }).catch(function () {
+        toast('复制失败：浏览器拒绝了剪贴板访问，可手动选中文本复制', 'error');
+      });
+    }
+
+    block.addEventListener('click', function (e) {
+      var t = e.target;
+      if (!t || !t.closest) return;
+      if (t.closest('[data-insight-generate]')) { e.preventDefault(); generate(false); return; }
+      if (t.closest('[data-insight-refresh]')) { e.preventDefault(); generate(true); return; }
+      if (t.closest('[data-insight-copy]')) { e.preventDefault(); copySummary(); return; }
+      if (t.closest('[data-insight-retry]')) { e.preventDefault(); generate(false); return; }
+      if (t.closest('[data-insight-reload]')) { e.preventDefault(); load(); return; }
+    }, ctx.signal ? { signal: ctx.signal } : false);
+
+    load();
+  }
+
   function detailHtml(data, id) {
     var report = data.report || {};
     var summary = report.summary || {};
@@ -1491,7 +1988,7 @@
       ? cases.map(caseCardHtml).join('')
       : '<div class="empty"><strong>该运行没有用例记录</strong><span>report.json 中 cases 为空，请查看 HTML 报告或服务端日志。</span></div>';
 
-    return header + fixRunPanelHtml(report, id) + strip +
+    return header + strip + insightBlockHtml() + fixRunPanelHtml(report, id) +
       '<div class="section"><div class="section-head"><h2>计划</h2><span class="hint">来自 report.plan</span></div>' +
         (Object.keys(plan).length ? planPanelHtml(report) : '<div class="empty"><strong>没有计划信息</strong><span>report.plan 为空。</span></div>') +
       '</div>' +
@@ -1561,6 +2058,7 @@
       }
       host.innerHTML = detailHtml(data, id);
       bindCaseInteractions(host, ctx.signal);
+      initInsight(host, ctx, id);
       host.addEventListener('click', function (e) {
         var btn = e.target.closest ? e.target.closest('[data-fix-run]') : null;
         if (!btn) return;
