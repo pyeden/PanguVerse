@@ -14,7 +14,7 @@ env:
 
 cases:
   # ---------------------------------------------------------------- #
-  - id: site_pages
+  - id: cl_site_pages
     name: 站点首页与 PanguVerse 项目页可访问
     tags: [site, html]
     # 2026-11-01：站点已补 `charset utf-8;`（nginx），响应头现为
@@ -62,7 +62,7 @@ cases:
             contains: text/html
 
   # ---------------------------------------------------------------- #
-  - id: travel_health
+  - id: cl_travel_health
     name: 旅行助手健康检查
     tags: [travel, health]
     steps:
@@ -84,7 +84,7 @@ cases:
               type: string
 
   # ---------------------------------------------------------------- #
-  - id: travel_root
+  - id: cl_travel_root
     name: 旅行助手根路由与端点清单
     tags: [travel]
     steps:
@@ -103,7 +103,7 @@ cases:
               contains: "/api/travel/weather"
 
   # ---------------------------------------------------------------- #
-  - id: travel_weather
+  - id: cl_travel_weather
     name: 天气接口字段契约（真实签名 destination + date）
     tags: [travel, weather]
     steps:
@@ -146,7 +146,7 @@ cases:
               lte: 100
 
   # ---------------------------------------------------------------- #
-  - id: travel_share_negative
+  - id: cl_travel_share_negative
     name: 不存在的分享应 404（负向）
     tags: [travel, negative]
     steps:

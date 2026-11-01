@@ -24,7 +24,7 @@ defaults:
 
 cases:
   # ---------------------------------------------------------------- #
-  - id: unauth_guard
+  - id: pv_unauth_guard
     name: 未登录访问受保护接口应 401
     tags: [auth, negative, guard]
     steps:
@@ -44,7 +44,7 @@ cases:
               type: string
 
   # ---------------------------------------------------------------- #
-  - id: login_flow
+  - id: pv_login_flow
     name: 错误密码 1 次 → 正确登录 → 受保护状态可读
     tags: [auth, smoke]
     secrets: [creds_raw, api_password]
@@ -115,7 +115,7 @@ cases:
               type: string
 
   # ---------------------------------------------------------------- #
-  - id: catalog
+  - id: pv_catalog
     name: 原子与领域包目录完整
     tags: [catalog]
     secrets: [creds_raw, api_password]
@@ -186,7 +186,7 @@ cases:
                   minimum: 1
 
   # ---------------------------------------------------------------- #
-  - id: task_lifecycle
+  - id: pv_task_lifecycle
     name: 任务 CRUD 与环境变量三态（覆盖 / 保留 / 删除）
     tags: [tasks, crud]
     secrets: [creds_raw, api_password]
@@ -345,7 +345,7 @@ cases:
           length: ${tasks_before|len}
 
   # ---------------------------------------------------------------- #
-  - id: runs_api
+  - id: pv_runs_api
     name: 运行列表接口
     tags: [runs]
     secrets: [creds_raw, api_password]
@@ -392,7 +392,7 @@ cases:
             maxItems: 5
 
   # ---------------------------------------------------------------- #
-  - id: logout_guard
+  - id: pv_logout_guard
     name: 登出后会话立即失效
     tags: [auth, guard]
     secrets: [creds_raw, api_password]

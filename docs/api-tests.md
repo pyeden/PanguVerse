@@ -1,12 +1,16 @@
 # 用 PanguVerse 测两个项目的 API（dogfooding）
 
 契约：[`tasks/api-test-suite-spec.md`](../tasks/api-test-suite-spec.md) §2–§4。
-两个场景文件：
+两个**用户套件**放在 `scenarios/suites/`（`scenarios/` 顶层只保留内置 demo 场景）：
 
-| 场景 | 被测对象 | 用例 | 展开后步骤 |
+| 套件 | 被测对象 | 用例 | 展开后步骤 |
 | --- | --- | --- | --- |
-| `scenarios/panguverse_web.yaml` | `http://127.0.0.1:7788`（已开启登录认证） | 6 | 82 |
-| `scenarios/codinglog_web.yaml` | `https://seres-ai.com`（站点 + 旅行助手） | 5 | 29 |
+| `scenarios/suites/panguverse_web.yaml` | `http://127.0.0.1:7788`（已开启登录认证） | 6 | 82 |
+| `scenarios/suites/codinglog_web.yaml` | `https://seres-ai.com`（站点 + 旅行助手） | 5 | 29 |
+
+> `demo` / `e2e` 的默认发现只读 `scenarios/*.yaml`（**不递归子目录**），因此这两个用户套件不会
+> 混进内置 demo 的合并集；Web 界面与 `/api/scenarios` 则递归列出 `scenarios/**`，两个套件都能看到。
+> 用例 id 带套件前缀（`pv_*` / `cl_*`），即使未来被合并进同一个 suite 也不会重名。
 
 > 步骤数是 `assert:` 语法糖展开后的真实执行步数，可用 `panguverse plan -f <场景>` 查看。
 
@@ -38,14 +42,14 @@
 cd /Users/futuredeng/PycharmProjects/PanguVerse
 
 # 平台自测（6 用例）
-.venv/bin/python -m panguverse run scenarios/panguverse_web.yaml \
+.venv/bin/python -m panguverse run scenarios/suites/panguverse_web.yaml \
   --env BASE_URL=http://127.0.0.1:7788 \
   --env FS_ROOT=/tmp \
   --env CREDS_FILE=pv-test-creds.env \
   --workspace .panguverse/api-tests
 
 # 公网站点 + 旅行助手（5 用例，只读）
-.venv/bin/python -m panguverse run scenarios/codinglog_web.yaml \
+.venv/bin/python -m panguverse run scenarios/suites/codinglog_web.yaml \
   --workspace .panguverse/api-tests
 ```
 
@@ -72,28 +76,28 @@ cd /Users/futuredeng/PycharmProjects/PanguVerse
 
 ## 3. 断言清单
 
-### `scenarios/panguverse_web.yaml`
+### `scenarios/suites/panguverse_web.yaml`
 
-顺序有意为之：`unauth_guard` 最前（干净 cookie jar），`logout_guard` 最后。
-
-| 用例 | 关键断言 |
-| --- | --- |
-| `unauth_guard` | `GET /api/status` → `401`；`error.code == unauthorized`；`error.message` 为非空字符串 |
-| `login_flow` | 错误密码 **1 次** → `401` + `error.code == bad_credentials`；正确登录 → `200` + `ok == true` + `user == admin`；随后 `GET /api/status` → `200`、`atoms >= 24`、`packs >= 3`、`version` 为字符串 |
-| `catalog` | `GET /api/atoms` → `200`，JSON Schema：数组、`minItems 24`、每项含 `name/category/domain`；`GET /api/packs` → `200`，数组、`minItems 3`、每项含 `name/version/domain/atom_count` 且 `atom_count >= 1` |
-| `task_lifecycle` | `POST` → `201`，`task_id` 匹配 `^t-[0-9a-f]{6,12}$`，回显 `env.password == "***"`；`GET` → `200` 且 `env.password == "***"`、`env.REGION == a`；`PATCH` → `200`，`name` 生效，`env.REGION` 覆盖为 `b-e2e`、`KEEP_ME` 保留 `b`（传 `"***"`）、`DROP_ME` 删除（传 `null`）、`password` 仍为 `***`；`DELETE` → `204`；再 `GET` → `404` + `error.code == not_found`；`GET /api/tasks` 任务数与创建前**一致**（无残留） |
-| `runs_api` | `GET /api/runs?limit=5` → `200`，数组且 `maxItems 5` |
-| `logout_guard` | 登录后 `POST /api/auth/logout` → `200` + `ok == true`；同一 cookie 再 `GET /api/status` → `401` + `unauthorized` |
-
-### `scenarios/codinglog_web.yaml`
+顺序有意为之：`pv_unauth_guard` 最前（干净 cookie jar），`pv_logout_guard` 最后。
 
 | 用例 | 关键断言 |
 | --- | --- |
-| `site_pages` | `GET /` → `200`、`Content-Type` 含 `text/html`、原文含 `vlog`；`GET /` 原文含 `charset="utf-8"`；`GET /projects/panguverse/` → `200`、`Content-Type` 含 `text/html`、原文含 `PanguVerse` |
-| `travel_health` | `200`；`status == ok`、`service == travel-assistant`、`version` 为字符串 |
-| `travel_root` | `200`；`service == travel-assistant`、`endpoints` 数组包含 `/api/travel/weather` |
-| `travel_weather` | `200`；Schema：`text/temp_min/temp_max/rain_prob/uv/source` 齐全，`text`/`uv` 非空，温度整数，`rain_prob∈[0,100]`，`source∈{amap,fallback}`；并断言 `temp_max >= temp_min` |
-| `travel_share_negative` | `GET /api/travel/share/<不存在 id>` → `404`；`detail` 为字符串且含「分享」 |
+| `pv_unauth_guard` | `GET /api/status` → `401`；`error.code == unauthorized`；`error.message` 为非空字符串 |
+| `pv_login_flow` | 错误密码 **1 次** → `401` + `error.code == bad_credentials`；正确登录 → `200` + `ok == true` + `user == admin`；随后 `GET /api/status` → `200`、`atoms >= 24`、`packs >= 3`、`version` 为字符串 |
+| `pv_catalog` | `GET /api/atoms` → `200`，JSON Schema：数组、`minItems 24`、每项含 `name/category/domain`；`GET /api/packs` → `200`，数组、`minItems 3`、每项含 `name/version/domain/atom_count` 且 `atom_count >= 1` |
+| `pv_task_lifecycle` | `POST` → `201`，`task_id` 匹配 `^t-[0-9a-f]{6,12}$`，回显 `env.password == "***"`；`GET` → `200` 且 `env.password == "***"`、`env.REGION == a`；`PATCH` → `200`，`name` 生效，`env.REGION` 覆盖为 `b-e2e`、`KEEP_ME` 保留 `b`（传 `"***"`）、`DROP_ME` 删除（传 `null`）、`password` 仍为 `***`；`DELETE` → `204`；再 `GET` → `404` + `error.code == not_found`；`GET /api/tasks` 任务数与创建前**一致**（无残留） |
+| `pv_runs_api` | `GET /api/runs?limit=5` → `200`，数组且 `maxItems 5` |
+| `pv_logout_guard` | 登录后 `POST /api/auth/logout` → `200` + `ok == true`；同一 cookie 再 `GET /api/status` → `401` + `unauthorized` |
+
+### `scenarios/suites/codinglog_web.yaml`
+
+| 用例 | 关键断言 |
+| --- | --- |
+| `cl_site_pages` | `GET /` → `200`、`Content-Type` 含 `text/html`、原文含 `vlog`；`GET /` 原文含 `charset="utf-8"`；`GET /projects/panguverse/` → `200`、`Content-Type` 含 `text/html`、原文含 `PanguVerse` |
+| `cl_travel_health` | `200`；`status == ok`、`service == travel-assistant`、`version` 为字符串 |
+| `cl_travel_root` | `200`；`service == travel-assistant`、`endpoints` 数组包含 `/api/travel/weather` |
+| `cl_travel_weather` | `200`；Schema：`text/temp_min/temp_max/rain_prob/uv/source` 齐全，`text`/`uv` 非空，温度整数，`rain_prob∈[0,100]`，`source∈{amap,fallback}`；并断言 `temp_max >= temp_min` |
+| `cl_travel_share_negative` | `GET /api/travel/share/<不存在 id>` → `404`；`detail` 为字符串且含「分享」 |
 
 每条用例都至少有一个状态码之外的字段/结构/内容断言；两个负向用例（未登录 401、分享 404）是真实负向路径。
 
@@ -107,7 +111,7 @@ cd /Users/futuredeng/PycharmProjects/PanguVerse
 
 ## 5. 幂等与清理
 
-- `task_lifecycle` 创建的任务名固定为 `e2e-api-suite`，`task_id` 由服务端随机生成；
+- `pv_task_lifecycle` 创建的任务名固定为 `e2e-api-suite`，`task_id` 由服务端随机生成；
   用例内先记 `tasks` 基线，再创建，最后 `DELETE` 并回读 `404`，最后对比任务数组长度与基线一致。
 - 连跑两次结果一致；跑完 `GET /api/tasks` 不应出现本次创建的任务（`POST` 返回的 `task_id` 已删除）。
 - 运行产物落在 `.panguverse/api-tests/`；仓库 `.gitignore` 已有 `.panguverse/` 规则，
