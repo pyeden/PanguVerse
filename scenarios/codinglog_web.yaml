@@ -17,10 +17,9 @@ cases:
   - id: site_pages
     name: 站点首页与 PanguVerse 项目页可访问
     tags: [site, html]
-    # 注意：站点响应头是 Content-Type: text/html（无 charset）。requests 按 RFC 2616
-    # 以 ISO-8859-1 解码，中文会变成 mojibake，因此这里断言页面中 ASCII 可见的标题片段
-    # （"三木 vlog" 的 vlog）与页面声明的 utf-8 charset，而不是直接断言汉字「三木」。
-    # 该缺陷已在 docs/api-tests.md 的「已知限制」中记录。
+    # 2026-11-01：站点已补 `charset utf-8;`（nginx），响应头现为
+    # `text/html; charset=utf-8`，因此这里恢复对中文内容的直接断言。
+    # 若回归到缺 charset，这条会先失败——正是我们要的守卫。
     steps:
       - id: home
         use: http_request
@@ -34,16 +33,19 @@ cases:
           header:
             name: Content-Type
             contains: text/html
-          body_contains: vlog
+          body_contains: 三木
       - id: home_charset
         use: http_request
-        name: 首页声明 UTF-8（但响应头缺 charset）
+        name: 首页响应头必须声明 charset=utf-8
         with:
           method: GET
           url: ${env.BASE_URL}/
           timeout: 20
         assert:
           status: 200
+          header:
+            name: Content-Type
+            contains: charset=utf-8
           body_contains: 'charset="utf-8"'
       - id: project_page
         use: http_request
