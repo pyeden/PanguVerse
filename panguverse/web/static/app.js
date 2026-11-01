@@ -1,30 +1,37 @@
-/* PanguVerse Web 控制台 — 原生 JS 单页应用
+/* PanguVerse Web 控制台 — 项目 / 套件 / 运行
  *
- * 约束：无构建步骤、无 npm、无 CDN、无外部字体与图片，离线可用。
- * 数据：只消费 /api 契约（见 tasks/web-app-mvp-spec.md §3），不伪造数据。
- * 失败：任何非 2xx / 网络错误都在页面上渲染可读原因，绝不静默。
+ * 约束：
+ * - 无构建步骤、无 npm、无 CDN、无外部字体与图片，离线可用；
+ * - 只消费既有 /api 契约，不伪造数据；
+ * - 接口与静态资源一律使用相对路径（支持整站挂在子路径）；
+ * - 任何 401 都回登录页，并保留原 hash 意图；
+ * - markdown 先转义再按白名单拼接，禁止把模型输出直接塞进 innerHTML；
+ * - 204/空体按成功处理（删除类接口）。
  */
 (function () {
   'use strict';
 
-  /* 相对接口前缀：允许整站挂在子路径（如 /panguverse/）下，
-   * 避免绝对 /api 请求打到主站。 */
   var API = 'api/';
+  var DEFAULT_HASH = '#/projects';
+  var PID_RE = /^p-[0-9a-f]{6,12}$/;
+  var SID_RE = /^s-[0-9a-f]{6,12}$/;
+  var RUN_ID_RE = /^[0-9a-f]{6,32}$/;
+  var PAGE_SIZE = 20;
 
-  /* ================================================================== */
-  /* 1. 常量与状态                                                       */
-  /* ================================================================== */
-  var PHASES = [
-    { key: 'plan', label: '规划' },
-    { key: 'validate', label: '校验' },
-    { key: 'execute', label: '执行' },
-    { key: 'heal', label: '自愈' },
-    { key: 'report', label: '报告' },
-    { key: 'evolve', label: '沉淀' },
-    { key: 'regression', label: '回归' }
-  ];
-
-  var MODE_LABEL = { demo: '演示', scenario: '场景', intent: '意图', regression: '回归' };
+  var STATUS = {
+    passed: { label: '通过', glyph: '✓', cls: 'ok' },
+    ok: { label: '正常', glyph: '✓', cls: 'ok' },
+    failed: { label: '失败', glyph: '✕', cls: 'bad' },
+    error: { label: '异常', glyph: '!', cls: 'bad' },
+    errored: { label: '异常', glyph: '!', cls: 'bad' },
+    skipped: { label: '跳过', glyph: '–', cls: 'dim' },
+    running: { label: '运行中', glyph: '⏵', cls: 'run' },
+    queued: { label: '排队中', glyph: '·', cls: 'dim' },
+    pending: { label: '待开始', glyph: '·', cls: 'dim' },
+    done: { label: '已完成', glyph: '✓', cls: 'ok' },
+    partial: { label: '部分失败', glyph: '!', cls: 'warn' },
+    none: { label: '未运行', glyph: '·', cls: 'dim' }
+  };
 
   var JOB_STATUS = {
     queued: { label: '排队中', cls: 'dim' },
@@ -33,46 +40,27 @@
     failed: { label: '失败', cls: 'bad' }
   };
 
-  var STATUS = {
-    passed: { label: '通过', glyph: '✓', cls: 'ok' },
-    failed: { label: '失败', glyph: '✕', cls: 'bad' },
-    error: { label: '异常', glyph: '!', cls: 'bad' },
-    skipped: { label: '跳过', glyph: '–', cls: 'dim' },
-    ok: { label: '正常', glyph: '✓', cls: 'ok' },
-    failed_phase: { label: '失败', glyph: '✕', cls: 'bad' },
-    running: { label: '进行中', glyph: '⏵', cls: 'run' },
-    pending: { label: '待开始', glyph: '·', cls: 'dim' }
-  };
-
-  var ROUTE_TITLE = {
-    overview: '概览',
-    run: '运行',
-    tasks: '任务',
-    'task-form': '任务',
-    history: '运行历史',
-    'run-detail': '运行详情',
-    atoms: '原子库',
-    packs: '领域包',
-    notfound: '页面不存在'
-  };
-
   var APP = {
     seq: 0,
-    status: null,
-    atomsAll: null,
-    atomFilters: { domain: '', tag: '', category: '' },
-    job: { id: null, mode: '', data: null, error: null, lost: false, startedLocal: 0, poll: null, tick: null, dismiss: false },
     controller: null,
     lastRoute: null,
     bannerRoute: null,
-    pendingBanner: null,
-    tasksReload: null,
-    saveAsTaskSupported: null,
-    auth: { authenticated: false, user: '', legacy: false, next: null, redirecting: false, loggingOut: false }
+    auth: { authenticated: false, user: '', legacy: false, next: null, redirecting: false, loggingOut: false },
+    projects: null,
+    projectsError: null,
+    projectsLoading: false,
+    projectCache: {},
+    scenarios: null,
+    atoms: null,
+    tasks: null,
+    atomFilters: { domain: '', tag: '', category: '' },
+    job: { id: null, timer: null },
+    status: null,
+    batchTimers: []
   };
 
   /* ================================================================== */
-  /* 2. 基础工具                                                         */
+  /* 基础工具                                                            */
   /* ================================================================== */
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $$(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -87,15 +75,53 @@
       .replace(/'/g, '&#39;');
   }
 
+  function enc(value) { return encodeURIComponent(String(value)); }
+
+  function safeDecode(value) {
+    try { return decodeURIComponent(value); } catch (e) { return value; }
+  }
+
   function hasVal(value) {
     if (value === undefined || value === null) return false;
     if (typeof value === 'string' && value.trim() === '') return false;
     return true;
   }
 
-  function fmtNum(n) {
-    if (typeof n !== 'number' || !isFinite(n)) return '—';
-    try { return n.toLocaleString('zh-CN'); } catch (e) { return String(n); }
+  function num(value) {
+    return typeof value === 'number' && isFinite(value) ? value : 0;
+  }
+
+  function fmtNum(value) {
+    if (typeof value !== 'number' || !isFinite(value)) return '—';
+    try { return value.toLocaleString('zh-CN'); } catch (e) { return String(value); }
+  }
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  function toMs(ts) {
+    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return 0;
+    return ts > 100000000000 ? ts : ts * 1000;
+  }
+
+  function fmtTs(ts) {
+    var ms = toMs(ts);
+    if (!ms) return '—';
+    var d = new Date(ms);
+    if (isNaN(d.getTime())) return '—';
+    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
+      ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  }
+
+  function fmtRel(ts) {
+    var ms = toMs(ts);
+    if (!ms) return '—';
+    var diff = Date.now() - ms;
+    if (diff < 0) return fmtTs(ts);
+    if (diff < 60000) return '刚刚';
+    if (diff < 3600000) return Math.floor(diff / 60000) + ' 分钟前';
+    if (diff < 86400000) return Math.floor(diff / 3600000) + ' 小时前';
+    if (diff < 604800000) return Math.floor(diff / 86400000) + ' 天前';
+    return fmtTs(ts);
   }
 
   function fmtMs(ms) {
@@ -108,18 +134,21 @@
     return m + ' 分 ' + s + ' 秒';
   }
 
-  function pad2(n) { return (n < 10 ? '0' : '') + n; }
-
-  /* epoch 秒（后端时间戳）→ 本地时间字符串 */
-  function fmtTs(ts) {
-    if (typeof ts !== 'number' || !isFinite(ts) || ts <= 0) return '—';
-    var d = new Date(ts * 1000);
-    if (isNaN(d.getTime())) return '—';
-    return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) +
-      ' ' + pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds());
+  function fmtDur(ms) {
+    if (typeof ms !== 'number' || !isFinite(ms) || ms < 0) return '—';
+    return fmtMs(ms);
   }
 
-  /* 剪贴板：优先 async clipboard，失败时退回隐藏 textarea + execCommand */
+  function stringifyMaybe(value) {
+    if (value === undefined || value === null) return '';
+    if (typeof value === 'object') return JSON.stringify(value, null, 2);
+    return String(value);
+  }
+
+  function prettyJson(value) {
+    try { return JSON.stringify(value, null, 2); } catch (e) { return String(value); }
+  }
+
   function copyToClipboard(text) {
     if (navigator.clipboard && navigator.clipboard.writeText) {
       return navigator.clipboard.writeText(text);
@@ -137,55 +166,95 @@
         var ok = document.execCommand('copy');
         document.body.removeChild(ta);
         if (ok) resolve(); else reject(new Error('浏览器拒绝了复制操作'));
-      } catch (e) {
-        reject(e);
-      }
+      } catch (e) { reject(e); }
     });
   }
 
-  function passStats(summary) {
-    var total = summary && typeof summary.total === 'number' ? summary.total : 0;
-    var passed = summary && typeof summary.passed === 'number' ? summary.passed : 0;
-    var rate = total > 0 ? Math.round((passed / total) * 1000) / 10 : 0;
-    var tone = total === 0 ? 'low' : (passed === total ? 'perfect' : (rate >= 80 ? 'mid' : 'low'));
-    return { total: total, passed: passed, rate: rate, tone: tone };
-  }
-
-  function rateHtml(summary) {
-    var s = passStats(summary);
-    var text = s.total > 0 ? s.passed + '/' + s.total : '—';
-    var bar = '<div class="pass-bar ' + (s.tone === 'perfect' ? '' : s.tone) + '"><span style="width:' + Math.max(0, Math.min(100, s.rate)) + '%"></span></div>';
-    return '<div><span class="pass-rate ' + s.tone + '">' + esc(text) +
-      (s.total > 0 ? ' · ' + esc(String(s.rate)) + '%' : '') + '</span>' + bar + '</div>';
+  /* ================================================================== */
+  /* 状态与格式化                                                        */
+  /* ================================================================== */
+  function statusMeta(status) {
+    return STATUS[status] || { label: status ? String(status) : '未知', glyph: '?', cls: 'dim' };
   }
 
   function badge(status) {
-    var meta = STATUS[status] || { label: status || '未知', glyph: '?', cls: 'dim' };
+    var meta = statusMeta(status);
     return '<span class="badge ' + meta.cls + '"><span class="glyph" aria-hidden="true">' +
-      meta.glyph + '</span>' + esc(meta.label) + '</span>';
+      esc(meta.glyph) + '</span>' + esc(meta.label) + '</span>';
   }
 
   function jobBadge(status) {
-    var meta = JOB_STATUS[status] || { label: status || '未知', cls: 'dim' };
+    var meta = JOB_STATUS[status] || { label: status ? String(status) : '未知', cls: 'dim' };
     return '<span class="badge ' + meta.cls + '">' + esc(meta.label) + '</span>';
   }
 
-  function valOrMissing(value) {
-    if (value === undefined || value === null || value === '') {
-      return '<span class="missing">未提供</span>';
-    }
-    if (typeof value === 'object') {
-      return '<pre class="json-block">' + esc(JSON.stringify(value, null, 2)) + '</pre>';
-    }
-    return esc(String(value));
+  function dot(status) {
+    var meta = statusMeta(status);
+    return '<span class="dot dot-' + meta.cls + '" title="' + esc(meta.label) + '"></span>';
   }
 
-  function prettyJson(value) {
-    try { return JSON.stringify(value, null, 2); } catch (e) { return String(value); }
+  function runOutcome(run) {
+    run = run || {};
+    var summary = run.summary || {};
+    var hasSummary = summary && typeof summary === 'object' && Object.keys(summary).length > 0;
+    if (hasSummary) {
+      var total = num(summary.total);
+      var passed = num(summary.passed);
+      var failed = num(summary.failed);
+      var errored = num(summary.errored);
+      if (failed > 0) return { status: 'failed', passed: passed, total: total };
+      if (errored > 0) return { status: 'errored', passed: passed, total: total };
+      if (total > 0) return { status: 'passed', passed: passed, total: total };
+    }
+    var conclusion = run.conclusion || {};
+    if (conclusion.success === false) return { status: 'failed', passed: 0, total: 0 };
+    if (conclusion.success === true) return { status: 'passed', passed: 0, total: 0 };
+    if (run.status) return { status: run.status, passed: num(run.passed), total: num(run.total) };
+    return { status: 'none', passed: 0, total: 0 };
+  }
+
+  function rateInfo(pr) {
+    var passed = num(pr && pr.passed);
+    var total = num(pr && pr.total);
+    var rate = total > 0 ? Math.round((passed / total) * 1000) / 10 : null;
+    return { passed: passed, total: total, rate: rate };
+  }
+
+  function rateTone(rate) {
+    if (rate === null) return 'none';
+    if (rate >= 100) return '';
+    if (rate >= 80) return 'mid';
+    return 'low';
+  }
+
+  function rateHtml(pr, opts) {
+    opts = opts || {};
+    var info = rateInfo(pr);
+    var tone = rateTone(info.rate);
+    var label = info.rate === null ? '—' : (Math.round(info.rate * 10) / 10) + '%';
+    var sub = info.total > 0 ? (info.passed + '/' + info.total + ' 用例') : '暂无数据';
+    return '<div class="rate">' +
+      '<div class="rate-top"><span class="rate-num ' + tone + '">' + esc(label) + '</span>' +
+      (opts.showSub === false ? '' : '<span class="rate-sub">' + esc(sub) + '</span>') + '</div>' +
+      '<div class="rate-bar ' + tone + '"><span style="width:' + (info.rate === null ? 0 : Math.max(0, Math.min(100, info.rate))) + '%"></span></div>' +
+      (opts.showSub === false ? '<span class="rate-sub">' + esc(sub) + '</span>' : '') +
+    '</div>';
+  }
+
+  function runCounts(run) {
+    var summary = run && run.summary ? run.summary : {};
+    return {
+      passed: num(summary.passed),
+      total: num(summary.total)
+    };
+  }
+
+  function runWhen(run) {
+    return (run && (run.at || run.finished_at || run.started_at)) || 0;
   }
 
   /* ================================================================== */
-  /* 3. 网络请求（统一错误模型）                                          */
+  /* 网络请求（统一错误模型）                                            */
   /* ================================================================== */
   function ApiError(message, status, code) {
     this.name = 'ApiError';
@@ -211,8 +280,7 @@
     return fetch(path, init).then(function (res) {
       var ctype = (res.headers.get('content-type') || '').toLowerCase();
       var isJson = ctype.indexOf('json') >= 0;
-      // 204/205/304 以及 2xx 空体（content-length: 0）没有 JSON 可解析：
-      // 不能因为 Content-Type 是 json 就当成解析失败（DELETE 204 就是典型）。
+      // 204/205/304 与 2xx 空体没有 JSON：DELETE 204 必须按成功处理。
       var noContentStatus = res.status === 204 || res.status === 205 || res.status === 304;
       var emptyBody = res.headers.get('content-length') === '0';
       var read;
@@ -235,7 +303,7 @@
           } else if (typeof payload === 'string' && payload.trim()) {
             msg = payload.trim().slice(0, 300);
           }
-          // 会话过期：任何业务接口的 401 都统一回登录视图（auth 自身接口除外）
+          // 任何业务接口的 401 都统一回登录视图（auth 自身接口除外）
           if (res.status === 401 && path.indexOf('api/auth/') !== 0) {
             handleUnauthorized();
           }
@@ -262,10 +330,11 @@
   function errorHint(err) {
     if (!err) return '';
     if (err.code === 'network' || err.status === 0) {
-      return '提示：后端未启动或端口不通。用 panguverse serve --port 7788 --no-open 启动后重试。';
+      return '提示：后端未启动或端口不通。请确认 panguverse serve 正在运行后重试。';
     }
-    if (err.status === 404) return '提示：资源不存在。检查 run_id / 包名，或确认后端版本包含该接口。';
-    if (err.status === 400) return '提示：请求参数被拒绝。请检查填写内容（例如场景是否为空、意图是否为空）。';
+    if (err.status === 401) return '提示：登录已过期，请重新登录。';
+    if (err.status === 404) return '提示：资源不存在。检查项目/套件/运行 ID，或确认后端版本包含该接口。';
+    if (err.status === 400) return '提示：请求参数被拒绝，请检查填写内容（名称、场景路径、环境变量）。';
     if (err.status === 409) return '提示：已有同名任务在运行，等它结束后再试。';
     if (err.status >= 500) return '提示：服务端内部错误，详细原因见服务端日志。';
     return '';
@@ -275,17 +344,14 @@
     var msg = err && err.message ? err.message : '未知错误';
     var code = err && err.code ? err.code : (err && err.status ? 'http_' + err.status : 'error');
     var hint = errorHint(err);
-    return '' +
-      '<div class="error-block" role="alert">' +
-        '<div class="error-title"><span aria-hidden="true">⚠</span>' + esc(title || '请求失败') +
-          '<span class="error-code">' + esc(code) + '</span>' +
-        '</div>' +
-        '<div class="error-msg">' + esc(msg) + '</div>' +
-        (hint ? '<div class="error-hint">' + esc(hint) + '</div>' : '') +
-        '<div class="error-actions">' +
-          '<button type="button" class="btn btn-sm" data-retry>重试</button>' +
-        '</div>' +
-      '</div>';
+    return '<div class="error-block" role="alert">' +
+      '<div class="error-title"><span aria-hidden="true">⚠</span>' + esc(title || '请求失败') +
+        '<span class="error-code">' + esc(code) + '</span>' +
+      '</div>' +
+      '<div class="error-msg">' + esc(msg) + '</div>' +
+      (hint ? '<div class="error-hint">' + esc(hint) + '</div>' : '') +
+      '<div class="error-actions"><button type="button" class="btn btn-sm" data-retry>重试</button></div>' +
+    '</div>';
   }
 
   function renderError(host, err, onRetry, title) {
@@ -297,981 +363,1736 @@
     }
   }
 
+  function loadingHtml(text) {
+    return '<div class="loading"><span class="spinner" aria-hidden="true"></span>' + esc(text || '加载中…') + '</div>';
+  }
+
+  function emptyHtml(title, body, actions) {
+    return '<div class="empty">' +
+      (title ? '<strong>' + esc(title) + '</strong>' : '') +
+      (body ? '<span>' + body + '</span>' : '') +
+      (actions ? '<div class="actions">' + actions + '</div>' : '') +
+    '</div>';
+  }
+
+  function pageHead(title, sub, actions) {
+    return '<div class="page-head"><div class="page-head-main">' +
+      '<h1>' + esc(title) + '</h1>' +
+      (sub ? '<div class="sub">' + sub + '</div>' : '') +
+      '</div>' +
+      (actions ? '<div class="actions">' + actions + '</div>' : '') +
+    '</div>';
+  }
+
   /* ================================================================== */
-  /* 4. 横幅 / Toast / 抽屉                                              */
+  /* 提示 / 横幅 / Toast                                                 */
   /* ================================================================== */
   function showBanner(kind, html, ttl) {
     if (!APP.auth || !APP.auth.authenticated) return;
     var banner = $('#globalBanner');
     if (!banner) return;
-    // 横幅只在「产生它的视图」内有效：路由一变就收，避免带着上一页的成功提示
     APP.bannerRoute = APP.lastRoute || null;
     banner.dataset.kind = kind || 'info';
     banner.innerHTML = '<div class="banner-body">' + html + '</div>' +
       '<button type="button" class="banner-close" data-banner-close aria-label="关闭提示">✕</button>';
     banner.hidden = false;
     clearTimeout(showBanner._t);
-    if (ttl) {
-      showBanner._t = setTimeout(hideBanner, ttl);
-    }
+    if (ttl) showBanner._t = setTimeout(hideBanner, ttl);
   }
 
   function hideBanner() {
     var banner = $('#globalBanner');
-    APP.bannerRoute = null;
-    clearTimeout(showBanner._t);
     if (banner) { banner.hidden = true; banner.innerHTML = ''; }
   }
 
-  /* 先切路由、再展示横幅：避免横幅带上一条路由的 key 被自动收掉 */
-  function goRoute(hash, banner) {
-    APP.pendingBanner = banner || null;
-    if (location.hash === hash) render();
-    else location.hash = hash;
-  }
-
-  function toast(message, kind, ttl) {
-    if (!APP.auth || !APP.auth.authenticated) return;
+  function toast(message, kind) {
     var host = $('#toasts');
     if (!host) return;
-    var node = document.createElement('div');
-    node.className = 'toast';
-    node.dataset.kind = kind || 'info';
-    node.setAttribute('role', kind === 'error' ? 'alert' : 'status');
-    node.textContent = message;
-    host.appendChild(node);
+    var el = document.createElement('div');
+    el.className = 'toast ' + (kind || 'info');
+    el.textContent = String(message || '');
+    host.appendChild(el);
     setTimeout(function () {
-      if (node.parentNode) node.parentNode.removeChild(node);
-    }, ttl || (kind === 'error' ? 6000 : 3200));
+      el.style.transition = 'opacity .2s ease';
+      el.style.opacity = '0';
+      setTimeout(function () { if (el.parentNode) el.parentNode.removeChild(el); }, 220);
+    }, kind === 'error' ? 6000 : 3600);
   }
 
-  var drawerState = { opener: null, ctrl: null };
+  /* ================================================================== */
+  /* 模态框                                                              */
+  /* ================================================================== */
+  var MODAL = { open: false, busy: false, resolve: null, opts: null };
 
-  function openDrawer(titleHtml, bodyHtml, opener) {
-    var root = $('#drawerRoot');
+  function closeModal(result) {
+    var root = $('#modalRoot');
     if (!root) return;
-    if (drawerState.ctrl) {
-      try { drawerState.ctrl.abort(); } catch (e) { /* noop */ }
-    }
-    drawerState.ctrl = (typeof AbortController === 'function') ? new AbortController() : null;
-    drawerState.opener = opener || document.activeElement;
-    root.hidden = false;
-    root.innerHTML = '' +
-      '<button type="button" class="drawer-backdrop" data-drawer-close tabindex="-1" aria-label="关闭侧栏"></button>' +
-      '<aside class="drawer" role="dialog" aria-modal="true" aria-label="详情面板">' +
-        '<div class="drawer-head">' +
-          '<h2>' + titleHtml + '</h2>' +
-          '<button type="button" class="btn btn-icon drawer-close" data-drawer-close aria-label="关闭详情面板">✕</button>' +
-        '</div>' +
-        '<div class="drawer-body">' + bodyHtml + '</div>' +
-      '</aside>';
-    var closeBtn = $('.drawer-close', root);
-    if (closeBtn) closeBtn.focus();
-    document.body.style.overflow = 'hidden';
-  }
-
-  function setDrawerBody(html) {
-    var body = $('#drawerRoot .drawer-body');
-    if (body) body.innerHTML = html;
-  }
-
-  function closeDrawer() {
-    var root = $('#drawerRoot');
-    if (!root || root.hidden) return;
-    if (drawerState.ctrl) {
-      try { drawerState.ctrl.abort(); } catch (e) { /* noop */ }
-      drawerState.ctrl = null;
-    }
     root.hidden = true;
     root.innerHTML = '';
-    document.body.style.overflow = '';
-    if (drawerState.opener && typeof drawerState.opener.focus === 'function') {
-      try { drawerState.opener.focus(); } catch (e) { /* noop */ }
+    document.body.removeAttribute('data-modal');
+    MODAL.open = false;
+    MODAL.busy = false;
+    var resolve = MODAL.resolve;
+    var opts = MODAL.opts;
+    MODAL.resolve = null;
+    MODAL.opts = null;
+    if (opts && typeof opts.onClose === 'function') opts.onClose(result);
+    if (resolve) resolve(result);
+  }
+
+  function openModal(opts) {
+    opts = opts || {};
+    var root = $('#modalRoot');
+    if (!root) return null;
+    if (MODAL.open) closeModal(null);
+
+    var okLabel = opts.okLabel === undefined ? '保存' : opts.okLabel;
+    var cancelLabel = opts.cancelLabel === undefined ? '取消' : opts.cancelLabel;
+    var title = opts.title || '操作';
+
+    root.innerHTML =
+      '<div class="modal-backdrop" data-modal-close></div>' +
+      '<div class="modal-card' + (opts.wide ? ' modal-wide' : '') + '" role="dialog" aria-modal="true" aria-labelledby="modalTitle">' +
+        '<div class="modal-head">' +
+          '<div><h2 id="modalTitle">' + esc(title) + '</h2>' +
+          (opts.subtitle ? '<div class="modal-sub">' + esc(opts.subtitle) + '</div>' : '') + '</div>' +
+          '<button type="button" class="btn btn-icon modal-close" data-modal-close aria-label="关闭">✕</button>' +
+        '</div>' +
+        '<form class="modal-body" id="modalForm" novalidate>' +
+          (opts.bodyHtml || '') +
+          '<div class="modal-error" id="modalError" role="alert"></div>' +
+        '</form>' +
+        '<div class="modal-foot">' +
+          '<button type="button" class="btn" data-modal-close>' + esc(cancelLabel) + '</button>' +
+          (okLabel === null ? '' : '<button type="submit" class="btn btn-primary" form="modalForm" id="modalOk">' + esc(okLabel) + '</button>') +
+        '</div>' +
+      '</div>';
+
+    root.hidden = false;
+    document.body.setAttribute('data-modal', '1');
+    MODAL.open = true;
+    MODAL.busy = false;
+    MODAL.opts = opts;
+
+    var form = $('#modalForm', root);
+    if (opts.onMount) {
+      try { opts.onMount(root, form); } catch (e) { /* 挂载失败不应炸整页 */ }
     }
-    drawerState.opener = null;
+    if (form) {
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        if (MODAL.busy || typeof opts.onSubmit !== 'function') return;
+        var errEl = $('#modalError', root);
+        if (errEl) { errEl.textContent = ''; errEl.setAttribute('data-show', '0'); }
+        MODAL.busy = true;
+        var okBtn = $('#modalOk', root);
+        if (okBtn) { okBtn.disabled = true; okBtn.innerHTML = '<span class="spinner" aria-hidden="true"></span>处理中…'; }
+        var result;
+        try { result = opts.onSubmit(root, form); } catch (err) { result = Promise.reject(err); }
+        Promise.resolve(result).then(function (value) {
+          MODAL.busy = false;
+          if (value === false) { restoreModalOk(root, okBtn, okLabel); return; }
+          if (typeof opts.closeOnSuccess === 'function' ? opts.closeOnSuccess(value) : true) {
+            closeModal(value === undefined ? true : value);
+          } else {
+            restoreModalOk(root, okBtn, okLabel);
+          }
+        }).catch(function (err) {
+          MODAL.busy = false;
+          restoreModalOk(root, okBtn, okLabel);
+          if (errEl) {
+            errEl.textContent = (err && err.message) ? err.message : '操作失败';
+            errEl.setAttribute('data-show', '1');
+          }
+        });
+      });
+    }
+
+    setTimeout(function () {
+      var focusable = $$('input:not([type="hidden"]):not([disabled]), select, textarea, button', root)
+        .filter(function (el) { return el.offsetParent !== null && !el.hasAttribute('data-modal-close'); });
+      if (focusable.length) {
+        try { focusable[0].focus(); } catch (e) { /* noop */ }
+      }
+    }, 20);
+
+    return root;
+  }
+
+  function restoreModalOk(root, okBtn, label) {
+    if (!okBtn) return;
+    okBtn.disabled = false;
+    okBtn.textContent = label;
+  }
+
+  function confirmDialog(opts) {
+    opts = opts || {};
+    return new Promise(function (resolve) {
+      MODAL.resolve = resolve;
+      openModal({
+        title: opts.title || '请确认',
+        subtitle: opts.subtitle || '',
+        bodyHtml: '<div class="muted">' + (opts.bodyHtml || '') + '</div>',
+        okLabel: opts.okLabel || '确认',
+        cancelLabel: '取消',
+        onClose: function (result) { resolve(result === true); },
+        onSubmit: function () { resolve(true); closeModal(true); return true; }
+      });
+      // 危险动作：把确认按钮染红
+      if (opts.danger) {
+        var ok = $('#modalOk');
+        if (ok) { ok.classList.remove('btn-primary'); ok.classList.add('btn-danger'); }
+      }
+    });
+  }
+
+  function showModalError(root, message) {
+    var el = $('#modalError', root || $('#modalRoot'));
+    if (!el) return;
+    el.textContent = message || '';
+    el.setAttribute('data-show', message ? '1' : '0');
   }
 
   /* ================================================================== */
-  /* 5. 任务面板与轮询                                                   */
+  /* 环境变量编辑器                                                      */
   /* ================================================================== */
-  function phaseMap(data) {
-    var map = {};
-    var list = (data && data.phases) || [];
-    list.forEach(function (p) { if (p && p.name) map[p.name] = p; });
-    return map;
+  function envRowHtml(entry) {
+    entry = entry || {};
+    var existing = !!entry.existing;
+    var raw = entry.value;
+    var value = (raw === undefined || raw === null) ? '' : String(raw);
+    var masked = value === '***';
+    var shown = masked ? '' : value;
+    var placeholder = entry.placeholder || (masked ? '***（沿用）' : (existing ? '留空沿用' : '值'));
+    return '<div class="env-row" data-env-row data-existing="' + (existing ? '1' : '0') + '">' +
+      '<input class="input env-key mono" data-env-key value="' + esc(entry.key || '') + '" placeholder="变量名" autocomplete="off" spellcheck="false"' +
+        (existing ? ' readonly' : '') + '>' +
+      '<input class="input env-val mono" data-env-value value="' + esc(shown) + '" placeholder="' + esc(placeholder) + '" autocomplete="off" spellcheck="false">' +
+      '<button type="button" class="btn btn-icon" data-env-del title="删除变量" aria-label="删除变量">✕</button>' +
+    '</div>';
   }
 
-  function currentPhaseKey(map, data) {
-    if (!data || (data.status !== 'queued' && data.status !== 'running')) return null;
-    for (var i = 0; i < PHASES.length; i++) {
-      if (!map[PHASES[i].key]) return PHASES[i].key;
+  function mountEnvEditor(hostEl, entries, opts) {
+    opts = opts || {};
+    if (!hostEl) return { collect: function () { return {}; } };
+    var rows = hostEl.querySelector('[data-env-rows]');
+    if (!rows) return { collect: function () { return {}; } };
+    rows.innerHTML = (entries || []).map(envRowHtml).join('') ||
+      '<div class="env-empty" data-env-empty>暂无环境变量</div>';
+
+    hostEl.addEventListener('click', function (e) {
+      var del = e.target.closest ? e.target.closest('[data-env-del]') : null;
+      if (del) {
+        var row = del.closest('[data-env-row]');
+        if (!row) return;
+        if (row.getAttribute('data-existing') === '1') {
+          row.hidden = true;
+          row.setAttribute('data-deleted', '1');
+        } else {
+          row.parentNode.removeChild(row);
+        }
+        refreshEnvEmpty(rows);
+        return;
+      }
+      var add = e.target.closest ? e.target.closest('[data-env-add]') : null;
+      if (add) {
+        var empty = rows.querySelector('[data-env-empty]');
+        if (empty) empty.parentNode.removeChild(empty);
+        var wrap = document.createElement('div');
+        wrap.innerHTML = envRowHtml({ key: '', value: '', existing: false, placeholder: opts.placeholder || '值' });
+        var newRow = wrap.firstChild;
+        rows.appendChild(newRow);
+        var keyInput = newRow.querySelector('[data-env-key]');
+        if (keyInput) keyInput.focus();
+      }
+    });
+
+    function refreshEnvEmpty() {
+      var any = rows.querySelector('[data-env-row]:not([hidden])');
+      var empty = rows.querySelector('[data-env-empty]');
+      if (!any && !empty) {
+        var div = document.createElement('div');
+        div.className = 'env-empty';
+        div.setAttribute('data-env-empty', '1');
+        div.textContent = '暂无环境变量';
+        rows.appendChild(div);
+      } else if (any && empty) {
+        empty.parentNode.removeChild(empty);
+      }
+    }
+
+    function collect(collectOpts) {
+      collectOpts = collectOpts || {};
+      var out = {};
+      var dup = [];
+      $$('[data-env-row]', rows).forEach(function (row) {
+        var keyEl = row.querySelector('[data-env-key]');
+        var valEl = row.querySelector('[data-env-value]');
+        if (!keyEl || !valEl) return;
+        var key = keyEl.value.trim();
+        if (!key) return;
+        if (row.getAttribute('data-deleted') === '1') {
+          out[key] = null;
+          return;
+        }
+        if (Object.prototype.hasOwnProperty.call(out, key)) dup.push(key);
+        var val = valEl.value;
+        if (val === '***') return;
+        if (collectOpts.existing === false) {
+          if (val !== '') out[key] = val;
+          return;
+        }
+        // 已保存值留空 = 沿用；有值 = 覆盖
+        if (val !== '') out[key] = val;
+      });
+      return { env: out, duplicates: dup };
+    }
+
+    return {
+      collect: function (collectOpts) { return collect(collectOpts).env; },
+      duplicates: function () { var d = []; $$('[data-env-row]:not([hidden])', rows).forEach(function (row) {
+        var el = row.querySelector('[data-env-key]');
+        if (el && el.value.trim()) d.push(el.value.trim());
+      }); return d.filter(function (v, i, arr) { return arr.indexOf(v) !== i; }); },
+      addRow: function (entry) {
+        var empty = rows.querySelector('[data-env-empty]');
+        if (empty) empty.parentNode.removeChild(empty);
+        var wrap = document.createElement('div');
+        wrap.innerHTML = envRowHtml(entry || {});
+        rows.appendChild(wrap.firstChild);
+      }
+    };
+  }
+
+  function envEditorBlock(opts) {
+    opts = opts || {};
+    return '<div class="env-editor" data-env-editor>' +
+      '<div class="env-rows" data-env-rows>' +
+        ((opts.entries || []).map(envRowHtml).join('') || '<div class="env-empty" data-env-empty>暂无环境变量</div>') +
+      '</div>' +
+      '<button type="button" class="btn btn-sm env-add" data-env-add>＋ 添加变量</button>' +
+      (opts.note ? '<div class="env-note">' + esc(opts.note) + '</div>' : '') +
+    '</div>';
+  }
+
+  function envEntriesFromObject(env, existing, placeholder) {
+    var out = [];
+    if (!env || typeof env !== 'object') return out;
+    Object.keys(env).sort().forEach(function (key) {
+      out.push({ key: key, value: env[key], existing: existing !== false, placeholder: placeholder });
+    });
+    return out;
+  }
+
+  /* ================================================================== */
+  /* 通用表格                                                            */
+  /* ================================================================== */
+  function dataTable(cols, rows, opts) {
+    opts = opts || {};
+    if (!rows.length) return opts.emptyHtml || '';
+    var head = cols.map(function (c) {
+      return '<th' + (c.cls ? ' class="' + c.cls + '"' : '') + '>' + esc(c.label) + '</th>';
+    }).join('');
+    var body = rows.map(function (row, idx) {
+      var trAttrs = '';
+      if (opts.rowHref) {
+        trAttrs = ' class="is-clickable" data-href="' + esc(opts.rowHref(row, idx)) + '" tabindex="0"';
+      }
+      var tds = cols.map(function (c) {
+        var html = c.render ? c.render(row, idx) : esc(row[c.key]);
+        return '<td data-label="' + esc(c.label) + '"' + (c.cls ? ' class="' + c.cls + '"' : '') + '>' + html + '</td>';
+      }).join('');
+      return '<tr' + trAttrs + '>' + tds + '</tr>';
+    }).join('');
+    return '<div class="table-wrap"><table class="data-table"><thead><tr>' + head +
+      '</tr></thead><tbody>' + body + '</tbody></table></div>';
+  }
+
+  /* ================================================================== */
+  /* 路由                                                                */
+  /* ================================================================== */
+  function parseQuery(qs) {
+    var out = {};
+    if (!qs) return out;
+    qs.split('&').forEach(function (pair) {
+      if (!pair) return;
+      var i = pair.indexOf('=');
+      var k = i < 0 ? pair : pair.slice(0, i);
+      var v = i < 0 ? '' : pair.slice(i + 1);
+      out[safeDecode(k)] = safeDecode(v.replace(/\+/g, ' '));
+    });
+    return out;
+  }
+
+  function parseRoute() {
+    var raw = (location.hash || '').replace(/^#/, '');
+    var qIndex = raw.indexOf('?');
+    var path = qIndex >= 0 ? raw.slice(0, qIndex) : raw;
+    var query = parseQuery(qIndex >= 0 ? raw.slice(qIndex + 1) : '');
+    if (!path || path === '/') return { name: 'projects' };
+    var segs = path.split('/').filter(Boolean).map(safeDecode);
+
+    // 旧书签兼容：旧 IA → 新 IA
+    if (segs.length === 1) {
+      var legacy = { overview: 'projects', history: 'projects', tasks: 'platform-tasks', atoms: 'platform-atoms', packs: 'platform-packs', run: 'projects' };
+      if (legacy[segs[0]]) return { name: 'redirect', to: legacy[segs[0]] };
+    }
+    if (segs[0] === 'projects' && segs.length === 1) return { name: 'projects' };
+    if (segs[0] === 'platform' && segs.length === 2 && ['atoms', 'packs', 'tasks'].indexOf(segs[1]) >= 0) {
+      return { name: 'platform-' + segs[1], platform: segs[1] };
+    }
+    if (segs[0] === 'runs' && segs.length === 2) {
+      return { name: 'run-detail', runId: segs[1], legacyDetail: true };
+    }
+    if (segs[0] === 'p' && segs.length >= 2) {
+      var pid = segs[1];
+      if (!PID_RE.test(pid)) return { name: 'notfound', path: path };
+      if (segs.length === 2) return { name: 'overview', pid: pid, query: query };
+      if (segs.length === 3 && ['overview', 'run', 'history', 'settings'].indexOf(segs[2]) >= 0) {
+        return { name: segs[2], pid: pid, query: query };
+      }
+      if (segs.length === 4 && segs[2] === 'runs') {
+        return { name: 'run-detail', pid: pid, runId: segs[3], query: query };
+      }
+    }
+    return { name: 'notfound', path: path };
+  }
+
+  function routeKey(route) {
+    return route.name + ':' + (route.pid || '') + ':' + (route.runId || '') + ':' + (route.platform || '');
+  }
+
+  function go(hash) {
+    if (location.hash === hash) { render(); return; }
+    location.hash = hash;
+  }
+
+  function notFoundHtml(path) {
+    return pageHead('页面不存在', '没有匹配的路由：<span class="mono">' + esc(path || '') + '</span>') +
+      emptyHtml('可用入口', '项目列表 · 平台原子库 / 领域包 / 任务模板',
+        '<a class="btn btn-primary" href="#/projects">回到项目列表</a><a class="btn" href="#/platform/atoms">平台</a>');
+  }
+
+  function platformTitle(key) {
+    return { atoms: '原子库', packs: '领域包', tasks: '任务模板' }[key] || '平台';
+  }
+
+  /* ================================================================== */
+  /* 外壳：侧栏 / 顶栏                                                   */
+  /* ================================================================== */
+  function loadProjects(force) {
+    if (APP.projectsPromise && !force) return APP.projectsPromise;
+    APP.projectsLoading = true;
+    renderSidebar();
+    var promise = apiGet(API + 'projects').then(function (payload) {
+      var list = payload && Array.isArray(payload.projects) ? payload.projects : [];
+      APP.projects = list;
+      APP.projectsError = null;
+      APP.projectsLoading = false;
+      list.forEach(function (p) {
+        if (p && p.project_id) {
+          var cached = APP.projectCache[p.project_id];
+          if (!cached) APP.projectCache[p.project_id] = { project_id: p.project_id, name: p.name, base_url: p.base_url, suites: null };
+        }
+      });
+      renderSidebar();
+      return list;
+    }).catch(function (err) {
+      APP.projectsLoading = false;
+      APP.projectsError = err;
+      renderSidebar();
+      throw err;
+    });
+    APP.projectsPromise = promise;
+    return promise;
+  }
+
+  function getProject(pid, force) {
+    if (!force && APP.projectCache[pid] && APP.projectCache[pid].suites) {
+      return Promise.resolve(APP.projectCache[pid]);
+    }
+    return apiGet(API + 'projects/' + enc(pid)).then(function (project) {
+      if (project && project.project_id) {
+        APP.projectCache[project.project_id] = project;
+        var list = APP.projects || [];
+        var found = false;
+        list.forEach(function (p) { if (p.project_id === project.project_id) found = true; });
+        if (!found) { list.push({ project_id: project.project_id, name: project.name }); APP.projects = list; }
+      }
+      return project;
+    });
+  }
+
+  function invalidateProject(pid) {
+    delete APP.projectCache[pid];
+    APP.projectsPromise = null;
+  }
+
+  function renderSidebar() {
+    var host = $('#projectList');
+    if (!host) return;
+    var route = parseRoute();
+    var activePid = route.pid || '';
+    var list = APP.projects;
+
+    if (list === null && APP.projectsLoading) {
+      host.innerHTML = '<div class="side-empty"><span class="spinner" aria-hidden="true"></span><span>正在读取项目…</span></div>';
+    } else if (list === null && APP.projectsError) {
+      host.innerHTML = '<div class="side-empty"><span>项目列表读取失败</span>' +
+        '<button type="button" class="link-btn" data-act="reload-projects">重试</button></div>';
+    } else if (!list || !list.length) {
+      host.innerHTML = '';
+    } else {
+      host.innerHTML = list.map(function (p) {
+        var last = p.last_run || null;
+        var st = last ? (last.status || runOutcome(last).status) : 'none';
+        var meta = last
+          ? (statusMeta(st).label + (last.at ? ' · ' + fmtRel(last.at) : ''))
+          : (p.suite_count ? (p.suite_count + ' 个套件') : '还没有运行');
+        return '<a class="project-item" href="#/p/' + enc(p.project_id) + '/overview"' +
+          (p.project_id === activePid ? ' aria-current="page"' : '') + ' title="' + esc(p.name || p.project_id) + '">' +
+          dot(st) +
+          '<span class="pi-text"><span class="pi-name">' + esc(p.name || p.project_id) + '</span>' +
+          '<span class="pi-meta">' + esc(meta) + '</span></span>' +
+        '</a>';
+      }).join('');
+    }
+
+    var empty = $('#sideEmpty');
+    if (empty) empty.hidden = !(list !== null && !APP.projectsLoading && !APP.projectsError && (!list || !list.length));
+
+    var navKey = route.platform || '';
+    $$('.platform-links a').forEach(function (a) {
+      if (a.getAttribute('data-nav') === navKey) a.setAttribute('aria-current', 'page');
+      else a.removeAttribute('aria-current');
+    });
+    var group = $('#platformGroup');
+    if (group && navKey) group.open = true;
+  }
+
+  function renderTopbar(route) {
+    var crumb = $('#crumb');
+    var tabs = $('#projectTabs');
+    var project = route.pid ? (APP.projectCache[route.pid] || null) : null;
+    var title = '项目';
+    var html = '';
+
+    if (route.name === 'projects') {
+      title = '项目';
+    } else if (route.name === 'redirect') {
+      title = 'PanguVerse';
+    } else if (route.platform) {
+      title = '平台';
+      html = ' <span class="crumb-sub">' + esc(platformTitle(route.platform)) + '</span>';
+    } else if (route.name === 'run-detail' && !route.pid) {
+      title = '未归类运行';
+      html = ' <span class="crumb-sub mono">' + esc(route.runId || '') + '</span>';
+    } else if (route.name === 'notfound') {
+      title = '页面不存在';
+    } else if (route.pid) {
+      title = (project && project.name) ? project.name : (route.pid || '项目');
+      html = ' <span class="crumb-sub mono">' + esc(route.pid) + '</span>';
+    }
+    if (crumb) crumb.innerHTML = esc(title) + html;
+
+    if (!tabs) return;
+    if (route.pid && route.name !== 'run-detail') {
+      tabs.hidden = false;
+      var active = route.name;
+      var items = [
+        ['overview', '概览'],
+        ['run', '运行'],
+        ['history', '历史'],
+        ['settings', '设置']
+      ];
+      tabs.innerHTML = items.map(function (item) {
+        return '<a class="tab" href="#/p/' + enc(route.pid) + '/' + item[0] + '"' +
+          (active === item[0] ? ' aria-current="page"' : '') + '>' + esc(item[1]) + '</a>';
+      }).join('');
+    } else if (route.pid && route.name === 'run-detail') {
+      tabs.hidden = false;
+      tabs.innerHTML = [
+        ['overview', '概览'], ['run', '运行'], ['history', '历史'], ['settings', '设置']
+      ].map(function (item) {
+        return '<a class="tab" href="#/p/' + enc(route.pid) + '/' + item[0] + '"' +
+          (item[0] === 'history' ? ' aria-current="page"' : '') + '>' + esc(item[1]) + '</a>';
+      }).join('');
+    } else {
+      tabs.hidden = true;
+      tabs.innerHTML = '';
+    }
+  }
+
+  function resolveRouteProject(route) {
+    return route.pid ? getProject(route.pid).catch(function () { return null; }) : Promise.resolve(null);
+  }
+
+  function render() {
+    if (!APP.auth.authenticated) return;
+    var seq = ++APP.seq;
+    var route = parseRoute();
+    var host = $('#view');
+    if (!host) return;
+
+    if (APP.controller) {
+      try { APP.controller.abort(); } catch (e) { /* noop */ }
+    }
+    APP.controller = (typeof AbortController === 'function') ? new AbortController() : null;
+
+    var key = routeKey(route);
+    if (APP.lastRoute !== key && APP.lastRoute !== null) {
+      try { window.scrollTo(0, 0); } catch (e) { /* noop */ }
+    }
+    if (APP.bannerRoute && APP.bannerRoute !== key) hideBanner();
+    APP.lastRoute = key;
+    renderSidebar();
+    closeMobileNav();
+
+    var ctx = {
+      alive: function () { return seq === APP.seq; },
+      signal: APP.controller ? APP.controller.signal : undefined
+    };
+
+    var pageTitle = 'PanguVerse';
+    if (route.name === 'projects') pageTitle = '项目';
+    else if (route.platform) pageTitle = platformTitle(route.platform);
+    else if (route.pid) pageTitle = (APP.projectCache[route.pid] && APP.projectCache[route.pid].name) || '项目';
+    document.title = pageTitle + ' · PanguVerse';
+
+    if (route.name === 'redirect') {
+      var target = { projects: '#/projects', 'platform-atoms': '#/platform/atoms', 'platform-packs': '#/platform/packs', 'platform-tasks': '#/platform/tasks' }[route.to] || DEFAULT_HASH;
+      try { history.replaceState(null, '', target); } catch (e) { location.hash = target; }
+      render();
+      return;
+    }
+
+    // 顶栏需要项目名时先补一次详情（不阻塞渲染）
+    var top = function (project) {
+      renderTopbar(route);
+      if (project && project.name) {
+        var crumb = $('#crumb');
+        if (crumb && route.pid) {
+          crumb.innerHTML = esc(project.name) + ' <span class="crumb-sub mono">' + esc(route.pid) + '</span>';
+        }
+      }
+    };
+    renderTopbar(route);
+    if (route.pid && !APP.projectCache[route.pid]) {
+      resolveRouteProject(route).then(function (project) {
+        if (!ctx.alive()) return;
+        top(project);
+      });
+    } else if (route.pid) {
+      top(APP.projectCache[route.pid]);
+    }
+
+    host.innerHTML = '<div class="loading"><span class="spinner" aria-hidden="true"></span>加载中…</div>';
+
+    var task = null;
+    if (route.name === 'projects') task = renderProjects(host, ctx);
+    else if (route.name === 'overview') task = renderOverview(host, ctx, route.pid, route.query || {});
+    else if (route.name === 'run') task = renderRun(host, ctx, route.pid, route.query || {});
+    else if (route.name === 'history') task = renderHistory(host, ctx, route.pid, route.query || {});
+    else if (route.name === 'settings') task = renderSettings(host, ctx, route.pid);
+    else if (route.name === 'run-detail') task = renderDetail(host, ctx, route.pid || '', route.runId, !!route.legacyDetail);
+    else if (route.name === 'platform-atoms') task = renderAtoms(host, ctx);
+    else if (route.name === 'platform-packs') task = renderPacks(host, ctx);
+    else if (route.name === 'platform-tasks') task = renderTasks(host, ctx);
+    else { host.innerHTML = notFoundHtml(route.path || ''); return; }
+
+    if (task && typeof task.catch === 'function') {
+      task.catch(function (err) {
+        if (!ctx.alive()) return;
+        host.innerHTML = '<div id="routeError"></div>';
+        renderError($('#routeError', host), err, function () { render(); }, '页面渲染失败');
+      });
+    }
+  }
+
+  /* ================================================================== */
+  /* 登录 / 退出                                                         */
+  /* ================================================================== */
+  function showBoot() {
+    var app = $('#appShell');
+    if (app) app.hidden = true;
+    var login = $('#loginRoot');
+    if (login) { login.hidden = true; login.innerHTML = ''; }
+    var boot = $('#bootRoot');
+    if (boot) boot.hidden = false;
+  }
+
+  function setAuthChrome() {
+    var who = $('#whoami');
+    var out = $('#logoutBtn');
+    var show = !!(APP.auth.authenticated);
+    if (who) {
+      who.hidden = !show;
+      who.textContent = show ? (APP.auth.user || (APP.auth.legacy ? '无需登录' : '')) : '';
+      who.title = show && APP.auth.user ? '当前账号：' + APP.auth.user : '';
+    }
+    if (out) out.hidden = !show || !!APP.auth.legacy;
+  }
+
+  function showAppView() {
+    var boot = $('#bootRoot');
+    if (boot) boot.hidden = true;
+    var login = $('#loginRoot');
+    if (login) { login.hidden = true; login.innerHTML = ''; }
+    var app = $('#appShell');
+    if (app) app.hidden = false;
+    var skip = $('.skip-link');
+    if (skip) skip.hidden = false;
+    setAuthChrome();
+  }
+
+  function loginCardHtml(opts) {
+    opts = opts || {};
+    return '<div class="login-card" role="main" aria-labelledby="loginTitle">' +
+      '<div class="login-brand">' +
+        '<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">' +
+          '<path d="M7 24L16 6l9 18z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>' +
+          '<path d="M11.5 19h9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>' +
+        '</svg>' +
+        '<div><h1 id="loginTitle">登录 PanguVerse</h1><div class="login-sub">项目 · 套件 · 运行</div></div>' +
+      '</div>' +
+      (opts.notice ? '<div class="login-notice" role="status">' + esc(opts.notice) + '</div>' : '') +
+      '<div class="login-error" id="loginError" role="alert"' + (opts.error ? '' : ' hidden') + '>' + esc(opts.error || '') + '</div>' +
+      '<form class="login-form" id="loginForm" novalidate>' +
+        '<div class="field"><label for="loginUser">账号</label>' +
+          '<input class="input" id="loginUser" name="username" autocomplete="username" spellcheck="false" placeholder="admin" value="' + esc(opts.user || '') + '"></div>' +
+        '<div class="field"><label for="loginPass">密码</label>' +
+          '<input class="input" id="loginPass" name="password" type="password" autocomplete="current-password" spellcheck="false" placeholder="输入密码"></div>' +
+        '<button type="submit" class="btn btn-primary" id="loginSubmit">登录</button>' +
+        (opts.retry ? '<button type="button" class="btn btn-sm btn-ghost" data-auth-retry>重新检测服务端</button>' : '') +
+      '</form>' +
+      '<div class="login-foot">会话有效期 12 小时；刷新页面会校验服务端会话。</div>' +
+    '</div>';
+  }
+
+  function setLoginError(message) {
+    var el = $('#loginError');
+    if (!el) return;
+    el.textContent = message || '';
+    el.hidden = !message;
+  }
+
+  function showLoginView(opts) {
+    opts = opts || {};
+    var boot = $('#bootRoot');
+    if (boot) boot.hidden = true;
+    var app = $('#appShell');
+    if (app) app.hidden = true;
+    var skip = $('.skip-link');
+    if (skip) skip.hidden = true;
+    var root = $('#loginRoot');
+    if (!root) return;
+    root.hidden = false;
+    root.innerHTML = loginCardHtml(opts);
+    var form = $('#loginForm', root);
+    if (form) form.addEventListener('submit', function (e) { e.preventDefault(); submitLogin(form); });
+    var retry = $('[data-auth-retry]', root);
+    if (retry) retry.addEventListener('click', function () { initAuth(); });
+    document.title = '登录 · PanguVerse';
+    var userEl = $('#loginUser', root);
+    var pwdEl = $('#loginPass', root);
+    if (userEl && !userEl.value) userEl.focus();
+    else if (pwdEl) pwdEl.focus();
+  }
+
+  function submitLogin(form) {
+    if (!form || form.dataset.busy === '1') return;
+    var userEl = $('#loginUser', form);
+    var pwdEl = $('#loginPass', form);
+    var btn = $('#loginSubmit', form);
+    var username = userEl ? userEl.value.trim() : '';
+    var password = pwdEl ? pwdEl.value : '';
+    if (!username || !password) {
+      setLoginError('请输入账号和密码。');
+      if (!username && userEl) userEl.focus();
+      else if (pwdEl) pwdEl.focus();
+      return;
+    }
+    form.dataset.busy = '1';
+    setLoginError('');
+    if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
+
+    apiPost(API + 'auth/login', { username: username, password: password }).then(function (res) {
+      if (pwdEl) pwdEl.value = '';
+      form.dataset.busy = '';
+      APP.auth.authenticated = true;
+      APP.auth.user = (res && res.user) || username;
+      APP.auth.legacy = false;
+      APP.auth.redirecting = false;
+      var next = APP.auth.next;
+      APP.auth.next = null;
+      if (!next || next.charAt(0) !== '#' || next === '#') next = DEFAULT_HASH;
+
+      showAppView();
+      loadProjects(true).catch(function () {});
+      loadStatus();
+      if (location.hash !== next) location.hash = next;
+      else render();
+      toast('已登录：' + (APP.auth.user || username), 'ok');
+    }).catch(function (err) {
+      if (pwdEl) pwdEl.value = '';
+      form.dataset.busy = '';
+      if (btn) { btn.disabled = false; btn.textContent = '登录'; }
+      setLoginError(err && err.message ? err.message : '登录失败');
+      if (pwdEl) pwdEl.focus();
+    });
+  }
+
+  function resetClientState() {
+    stopJobWatcher();
+    clearBatchTimers();
+    APP.projects = null;
+    APP.projectsError = null;
+    APP.projectsLoading = false;
+    APP.projectsPromise = null;
+    APP.projectCache = {};
+    APP.scenarios = null;
+    APP.atoms = null;
+    APP.tasks = null;
+    APP.atomFilters = { domain: '', tag: '', category: '' };
+    APP.bannerRoute = null;
+    APP.lastRoute = null;
+    APP.seq++;
+    if (APP.controller) {
+      try { APP.controller.abort(); } catch (e) { /* noop */ }
+      APP.controller = null;
+    }
+    hideBanner();
+    closeModal(null);
+    var view = $('#view');
+    if (view) view.innerHTML = '';
+    var toasts = $('#toasts');
+    if (toasts) toasts.innerHTML = '';
+  }
+
+  function handleUnauthorized() {
+    if (!APP.auth.authenticated || APP.auth.redirecting) return;
+    APP.auth.redirecting = true;
+    APP.auth.legacy = false;
+    var h = location.hash;
+    APP.auth.next = (h && h.charAt(0) === '#' && h !== '#' && h !== DEFAULT_HASH) ? h : null;
+    APP.auth.authenticated = false;
+    APP.auth.user = '';
+    resetClientState();
+    showLoginView({ notice: '登录已过期，请重新登录' });
+    setTimeout(function () { APP.auth.redirecting = false; }, 0);
+  }
+
+  function doLogout(btn) {
+    if (APP.auth.loggingOut) return;
+    APP.auth.loggingOut = true;
+    if (btn) { btn.disabled = true; btn.textContent = '退出中…'; }
+    apiPost(API + 'auth/logout', {}).then(finish).catch(function (err) {
+      if (err && err.status === 401) { finish(); return; }
+      APP.auth.loggingOut = false;
+      if (btn) { btn.disabled = false; btn.textContent = '退出登录'; }
+      toast('退出失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+    });
+    function finish() {
+      APP.auth.loggingOut = false;
+      APP.auth.authenticated = false;
+      APP.auth.user = '';
+      APP.auth.legacy = false;
+      APP.auth.next = null;
+      APP.auth.redirecting = false;
+      resetClientState();
+      showLoginView({ notice: '已退出登录' });
+    }
+  }
+
+  function initAuth() {
+    showBoot();
+    apiGet(API + 'auth/status').then(function (st) {
+      var disabled = !!(st && (st.auth_disabled === true || st.auth_enabled === false));
+      if (st && (st.authenticated === true || disabled)) {
+        APP.auth.authenticated = true;
+        APP.auth.user = st.user || '';
+        APP.auth.legacy = disabled;
+        var h = location.hash;
+        APP.auth.next = (!disabled && h && h.indexOf('#/') === 0 && h !== DEFAULT_HASH) ? h : null;
+        showAppView();
+        loadProjects(true).catch(function () {});
+        loadStatus();
+        render();
+        return;
+      }
+      APP.auth.authenticated = false;
+      APP.auth.user = '';
+      APP.auth.legacy = false;
+      var cur = location.hash;
+      APP.auth.next = (cur && cur.indexOf('#/') === 0 && cur !== DEFAULT_HASH) ? cur : null;
+      showLoginView({});
+    }).catch(function (err) {
+      if (err && err.status === 404) {
+        // 旧后端或 --no-auth 未暴露 auth/status：按无认证模式继续
+        APP.auth.authenticated = true;
+        APP.auth.legacy = true;
+        APP.auth.user = '';
+        showAppView();
+        loadProjects(true).catch(function () {});
+        loadStatus();
+        render();
+        return;
+      }
+      if (err && err.status === 401) {
+        APP.auth.authenticated = false;
+        APP.auth.legacy = false;
+        showLoginView({});
+        return;
+      }
+      showLoginView({
+        error: '无法读取登录状态：' + (err && err.message ? err.message : '未知错误'),
+        retry: true
+      });
+    });
+  }
+
+  /* ================================================================== */
+  /* 平台状态                                                            */
+  /* ================================================================== */
+  function loadStatus() {
+    var conn = $('#connState');
+    apiGet(API + 'status').then(function (st) {
+      APP.status = st || {};
+      if (conn) { conn.dataset.state = 'ok'; var t = $('.conn-text', conn); if (t) t.textContent = '已连接'; }
+      var text = $('#llmText');
+      var dotEl = $('#llmDot');
+      var llm = !!(st && st.llm_enabled);
+      if (text) text.textContent = llm ? '模型规划已启用' : '离线规则模式';
+      if (dotEl) dotEl.className = 'llm-dot ' + (llm ? 'is-on' : 'is-off');
+      var facts = $('#sideFacts');
+      if (facts) facts.hidden = false;
+      var ws = $('#factWorkspace');
+      var ver = $('#factVersion');
+      if (ws) { ws.textContent = (st && (st.workspace || st.root)) || '—'; ws.title = ws.textContent; }
+      if (ver) ver.textContent = (st && st.version) || '—';
+    }).catch(function () {
+      if (conn) { conn.dataset.state = 'bad'; var t2 = $('.conn-text', conn); if (t2) t2.textContent = '未连接'; }
+      var text2 = $('#llmText');
+      if (text2) text2.textContent = '平台状态不可用';
+      var d2 = $('#llmDot');
+      if (d2) d2.className = 'llm-dot is-off';
+    });
+  }
+
+  /* ================================================================== */
+  /* 项目列表页                                                          */
+  /* ================================================================== */
+  function projectCardHtml(p) {
+    var last = p.last_run || null;
+    var st = last ? (last.status || runOutcome(last).status) : 'none';
+    var meta = statusMeta(st);
+    var lastAt = last ? (last.at || last.started_at || last.finished_at) : 0;
+    var rate = p.pass_rate || (last ? { passed: last.passed, total: last.total } : null);
+    return '<a class="project-card" href="#/p/' + enc(p.project_id) + '/overview" data-search-text="' +
+        esc(((p.name || '') + ' ' + (p.base_url || '')).toLowerCase()) + '">' +
+      '<div class="pc-top">' +
+        '<span class="pc-name">' + esc(p.name || p.project_id) + '</span>' +
+        '<span class="pc-status">' + dot(st) + esc(meta.label) + '</span>' +
+      '</div>' +
+      '<div class="pc-url mono">' + esc(p.base_url || '未配置站点地址') + '</div>' +
+      '<div class="pc-stats">' +
+        '<div class="pc-stat"><b>' + esc(p.suite_count === undefined ? '—' : String(p.suite_count)) + '</b><span>套件</span></div>' +
+        '<div class="pc-stat"><b>' + (rate ? (rate.total > 0 ? Math.round((num(rate.passed) / num(rate.total)) * 100) + '%' : '—') : '—') + '</b><span>通过率</span></div>' +
+        '<div class="pc-stat"><b>' + esc(lastAt ? fmtRel(lastAt) : '—') + '</b><span>上次运行</span></div>' +
+      '</div>' +
+      '<div class="pc-foot">' + rateHtml(rate || {}, { showSub: false }) + '</div>' +
+    '</a>';
+  }
+
+  function renderProjects(host, ctx) {
+    host.innerHTML = pageHead('项目',
+      '一个项目 = 一组套件 + 共享环境。运行、历史与总结都归属项目。',
+      '<button type="button" class="btn btn-primary" data-act="new-project">＋ 新建项目</button>' +
+      '<button type="button" class="btn btn-ghost" data-act="from-history">从历史创建项目</button>') +
+      '<div id="projectsBody">' + loadingHtml('正在读取项目…') + '</div>';
+    var body = $('#projectsBody', host);
+
+    loadProjects(true).then(function (list) {
+      if (!ctx.alive()) return;
+      if (!list.length) {
+        body.innerHTML = '<div class="empty hero-empty">' +
+          '<div class="empty-mark" aria-hidden="true">◫</div>' +
+          '<strong>先建一个项目</strong>' +
+          '<p>把同一站点的套件和环境放在一起：之后每次运行都会自动归属，概览直接给出最近 5 次结果与失败 Top 3。</p>' +
+          '<div class="actions">' +
+            '<button type="button" class="btn btn-primary" data-act="new-project">新建项目</button>' +
+            '<button type="button" class="btn" data-act="from-history">从历史创建项目</button>' +
+          '</div>' +
+          '<p class="hint">旧运行不会丢失：它们会显示为「未归类」，仍可通过运行详情查看。</p>' +
+        '</div>';
+        return;
+      }
+      body.innerHTML =
+        '<div class="toolbar">' +
+          '<label class="search" aria-label="搜索项目"><span aria-hidden="true">⌕</span>' +
+            '<input type="search" data-search="projects" placeholder="搜索项目（名称或站点地址），按 / 聚焦" autocomplete="off"></label>' +
+          '<span class="toolbar-spacer"></span>' +
+          '<span class="filter-count" id="projectCount">共 ' + list.length + ' 个项目</span>' +
+        '</div>' +
+        '<div class="projects-grid" id="projectsGrid">' + list.map(projectCardHtml).join('') + '</div>' +
+        '<div id="projectsNoMatch" hidden>' + emptyHtml('没有匹配的项目', '换个关键词，或清空搜索。', '<button type="button" class="btn btn-sm" data-act="clear-project-search">清空搜索</button>') + '</div>';
+
+      var input = $('[data-search="projects"]', body);
+      if (input) {
+        input.addEventListener('input', function () {
+          var q = input.value.trim().toLowerCase();
+          var cards = $$('.project-card', body);
+          var shown = 0;
+          cards.forEach(function (card) {
+            var hit = !q || (card.getAttribute('data-search-text') || '').indexOf(q) >= 0;
+            card.hidden = !hit;
+            if (hit) shown++;
+          });
+          var count = $('#projectCount', body);
+          if (count) count.textContent = q ? ('匹配 ' + shown + ' / ' + cards.length + ' 个项目') : ('共 ' + cards.length + ' 个项目');
+          var noMatch = $('#projectsNoMatch', body);
+          if (noMatch) noMatch.hidden = shown > 0;
+        });
+      }
+    }).catch(function (err) {
+      if (!ctx.alive()) return;
+      body.innerHTML = '<div id="projectsError"></div>';
+      renderError($('#projectsError', body), err, function () { renderProjects(host, ctx); }, '无法读取项目列表');
+    });
+  }
+
+  function openProjectModal() {
+    var root = openModal({
+      title: '新建项目',
+      subtitle: '项目保存站点地址与默认环境；套件在项目设置里绑定。',
+      okLabel: '创建项目',
+      bodyHtml:
+        '<div class="field"><label for="npName">项目名称</label>' +
+          '<input class="input" id="npName" name="name" placeholder="例如 coding-log-web" autocomplete="off" maxlength="80"></div>' +
+        '<div class="field"><label for="npBase">站点地址 base_url</label>' +
+          '<input class="input mono" id="npBase" name="base_url" placeholder="https://seres-ai.com" autocomplete="off" spellcheck="false"></div>' +
+        '<div class="field"><span class="field-label">项目默认环境变量（可选）</span>' +
+          envEditorBlock({ note: '密钥保存后会以 *** 返回；这里填写的值会作为项目默认，套件 env 可覆盖。' }) + '</div>',
+      onMount: function (rootEl) {
+        if (!rootEl) return;
+        var editor = mountEnvEditor($('[data-env-editor]', rootEl), [], { placeholder: '值' });
+        rootEl._envEditor = editor;
+        var name = $('#npName', rootEl);
+        if (name) name.focus();
+      },
+      onSubmit: function (rootEl) {
+        var nameEl = $('#npName', rootEl);
+        var baseEl = $('#npBase', rootEl);
+        var name = nameEl ? nameEl.value.trim() : '';
+        if (!name) {
+          if (nameEl) nameEl.focus();
+          return Promise.reject(new ApiError('请填写项目名称', 0, 'validation'));
+        }
+        var env = (rootEl._envEditor ? rootEl._envEditor.collect({ existing: false }) : {});
+        var body = { name: name, base_url: baseEl ? baseEl.value.trim() : '' };
+        if (Object.keys(env).length) body.env = env;
+        return apiPost(API + 'projects', body).then(function (project) {
+          APP.projectsPromise = null;
+          if (project && project.project_id) APP.projectCache[project.project_id] = project;
+          loadProjects(true).catch(function () {});
+          setTimeout(function () { go('#/p/' + enc(project.project_id) + '/overview'); }, 0);
+          toast('项目已创建：' + (project.name || name), 'ok');
+          return project;
+        });
+      }
+    });
+    return root;
+  }
+
+  function openHistoryGuide() {
+    openModal({
+      title: '从历史创建项目',
+      subtitle: '旧运行不会自动归类；这里只提供迁移路径，不会自动建项目。',
+      okLabel: '新建项目',
+      bodyHtml:
+        '<div id="guideBody">' + loadingHtml('正在查看最近运行…') + '</div>',
+      onMount: function (rootEl) {
+        var body = $('#guideBody', rootEl);
+        apiGet(API + 'runs?limit=50').then(function (runs) {
+          var list = Array.isArray(runs) ? runs : [];
+          var unclassified = list.filter(function (r) {
+            var meta = (r && r.meta) || {};
+            return !meta.project_id;
+          }).length;
+          if (!body) return;
+          body.innerHTML =
+            '<div class="notice info"><span aria-hidden="true">ⓘ</span><div>最近 ' + list.length + ' 次运行中，有 <b>' + unclassified + '</b> 次未归类（无项目归属）。</div></div>' +
+            '<ol style="margin:0 0 0 18px;padding:0;color:var(--dim);display:flex;flex-direction:column;gap:8px;">' +
+              '<li><b style="color:var(--text-soft)">新建项目</b>：填写名称与站点地址。</li>' +
+              '<li><b style="color:var(--text-soft)">绑定套件</b>：在项目「设置」里选择旧运行使用的场景文件。</li>' +
+              '<li><b style="color:var(--text-soft)">继续使用旧运行</b>：历史运行不会被改名或删除，仍可通过运行详情查看。</li>' +
+            '</ol>';
+        }).catch(function (err) {
+          if (body) body.innerHTML = '<div class="notice"><span aria-hidden="true">⚠</span><div>暂时无法读取历史运行：' + esc(err && err.message ? err.message : '未知错误') + '</div></div>';
+        });
+      },
+      onSubmit: function () {
+        setTimeout(openProjectModal, 0);
+        return true;
+      }
+    });
+  }
+
+  /* ================================================================== */
+  /* 项目概览                                                            */
+  /* ================================================================== */
+  function findSuite(project, sid) {
+    var suites = (project && Array.isArray(project.suites)) ? project.suites : [];
+    for (var i = 0; i < suites.length; i++) {
+      if (suites[i].suite_id === sid) return suites[i];
     }
     return null;
   }
 
-  function phaseStatus(key, map, data) {
-    var rec = map[key];
-    if (rec) {
-      if (rec.status === 'failed' || rec.status === 'error') return 'failed';
-      if (rec.status === 'running') return 'active';
-      if (rec.status === 'healed') return 'healed';
-      if (rec.status === 'skipped') return 'skipped';
-      return 'ok';
+  function suiteLabel(project, sid) {
+    if (!sid) return '未归类';
+    var suite = findSuite(project, sid);
+    return suite && suite.name ? suite.name : sid;
+  }
+
+  function runSuiteId(run) {
+    if (!run) return '';
+    if (run.suite_id) return run.suite_id;
+    if (run.meta && run.meta.suite_id) return run.meta.suite_id;
+    return '';
+  }
+
+  function runSuiteName(project, run) {
+    if (!run) return '运行';
+    if (run.suite_name) return run.suite_name;
+    var sid = runSuiteId(run);
+    return sid ? suiteLabel(project, sid) : (run.run_id ? 'run ' + run.run_id.slice(0, 8) : '运行');
+  }
+
+  function recentRunsHtml(project, runs) {
+    if (!Array.isArray(runs) || !runs.length) {
+      return emptyHtml('还没有运行记录',
+        '绑定套件后点「一键跑全部套件」，最近 5 次结果会出现在这里。',
+        '<button type="button" class="btn btn-primary" data-act="run-all" data-pid="' + esc(project.project_id) + '">一键跑全部套件</button>' +
+        '<a class="btn" href="#/p/' + enc(project.project_id) + '/history">查看历史</a>');
     }
-    if (key === currentPhaseKey(map, data)) return 'active';
+    return '<div class="run-list">' + runs.map(function (run) {
+      var outcome = runOutcome(run);
+      var counts = runCounts(run);
+      if (!counts.total && outcome.total) counts = { passed: outcome.passed, total: outcome.total };
+      var when = runWhen(run);
+      var rid = run.run_id || '';
+      return '<a class="run-row" href="#/p/' + enc(project.project_id) + '/runs/' + enc(rid) + '">' +
+        badge(outcome.status) +
+        '<span class="run-main"><b>' + esc(runSuiteName(project, run)) + '</b>' +
+          '<span class="mono">' + esc(rid) + '</span></span>' +
+        '<span class="run-num">' + (counts.total ? esc(counts.passed + '/' + counts.total) : '—') + '</span>' +
+        '<span class="run-when">' + esc(when ? fmtRel(when) : '—') + '</span>' +
+        '<span class="run-arrow" aria-hidden="true">›</span>' +
+      '</a>';
+    }).join('') + '</div>';
+  }
+
+  function failureTopHtml(items) {
+    if (!Array.isArray(items) || !items.length) {
+      return emptyHtml('最近 5 次运行没有失败用例', '失败归类会在出现失败后自动聚合到这里（最多 3 条）。');
+    }
+    return '<div class="fail-list">' + items.slice(0, 3).map(function (f) {
+      f = f || {};
+      var cases = Array.isArray(f.cases) ? f.cases : (Array.isArray(f.case_ids) ? f.case_ids : []);
+      var shown = cases.slice(0, 6);
+      return '<div class="fail-item">' +
+        '<div class="fail-kind"><b>' + esc(f.kind || '未归类失败') + '</b>' +
+          '<div class="chips">' + shown.map(function (id) { return '<span class="chip mono">' + esc(id) + '</span>'; }).join('') +
+            (cases.length > shown.length ? '<span class="chip">+' + (cases.length - shown.length) + '</span>' : '') +
+          '</div></div>' +
+        '<span class="fail-count">' + esc(String(num(f.count))) + '</span>' +
+      '</div>';
+    }).join('') + '</div>';
+  }
+
+  function kpiHtml(project, summary) {
+    var rate = rateInfo(summary && summary.pass_rate);
+    var recent = Array.isArray(summary && summary.recent_runs) ? summary.recent_runs : [];
+    var latest = recent.length ? recent[0] : (project.last_run || null);
+    var latestOutcome = latest ? (latest.status || runOutcome(latest).status) : 'none';
+    var failTotal = 0;
+    (Array.isArray(summary && summary.failure_top) ? summary.failure_top : []).forEach(function (f) {
+      failTotal += num(f && f.count);
+    });
+    var rateLabel = rate.rate === null ? '—' : (Math.round(rate.rate * 10) / 10) + '%';
+    var rateCls = rate.rate === null ? 'dim' : (rate.rate >= 80 ? 'ok' : 'bad');
+    return '<div class="kpi-grid">' +
+      '<div class="kpi"><span class="kpi-label">通过率</span><span class="kpi-num ' + rateCls + '">' + esc(rateLabel) + '</span>' +
+        '<span class="kpi-sub">' + (rate.total ? esc(rate.passed + '/' + rate.total + ' 用例') : '暂无数据') + '</span></div>' +
+      '<div class="kpi"><span class="kpi-label">套件</span><span class="kpi-num">' + esc(String(Array.isArray(project.suites) ? project.suites.length : (project.suite_count || 0))) + '</span>' +
+        '<span class="kpi-sub">运行只取当前项目套件</span></div>' +
+      '<div class="kpi"><span class="kpi-label">最近运行</span><span class="kpi-num dim" style="font-size:17px">' + esc(statusMeta(latestOutcome).label) + '</span>' +
+        '<span class="kpi-sub">' + esc(latest && runWhen(latest) ? fmtRel(runWhen(latest)) : '还没有运行') + '</span></div>' +
+      '<div class="kpi"><span class="kpi-label">失败 Top 3 合计</span><span class="kpi-num ' + (failTotal ? 'bad' : 'ok') + '">' + esc(String(failTotal)) + '</span>' +
+        '<span class="kpi-sub">最近 5 次运行的失败用例</span></div>' +
+    '</div>';
+  }
+
+  function overviewSectionsHtml(project, summary) {
+    var runs = Array.isArray(summary && summary.recent_runs) ? summary.recent_runs : [];
+    return '<section class="section" id="recentSection">' +
+        '<div class="section-head"><h2>最近 5 次运行</h2>' +
+          '<span class="hint">点击任意一行进入运行详情</span>' +
+          '<a class="btn btn-sm" href="#/p/' + enc(project.project_id) + '/history">全部历史</a></div>' +
+        recentRunsHtml(project, runs) +
+      '</section>' +
+      '<section class="section" id="failureSection">' +
+        '<div class="section-head"><h2>失败 Top 3</h2><span class="hint">按报告 failure_kind 聚合</span></div>' +
+        failureTopHtml(summary && summary.failure_top) +
+      '</section>';
+  }
+
+  function renderOverview(host, ctx, pid, query) {
+    var batchId = query && query.batch ? String(query.batch) : '';
+    host.innerHTML = pageHead('项目概览', '', '') + '<div id="ovLoad">' + loadingHtml('正在读取项目概览…') + '</div>';
+    return Promise.all([getProject(pid), apiGet(API + 'projects/' + enc(pid) + '/summary?limit=5')])
+      .then(function (results) {
+        if (!ctx.alive()) return;
+        var project = results[0];
+        var summary = results[1] || {};
+        var suites = Array.isArray(project.suites) ? project.suites : [];
+        host.innerHTML =
+          pageHead(project.name || pid,
+            '<span class="mono">' + esc(project.base_url || '未配置站点地址') + '</span>' +
+            '<span>' + suites.length + ' 个套件</span>' +
+            '<span>创建于 ' + esc(fmtTs(project.created_at)) + '</span>',
+            '<button type="button" class="btn btn-primary" data-act="run-all" data-pid="' + esc(pid) + '"' +
+              (suites.length ? '' : ' disabled title="先绑定套件"') + '>▶ 一键跑全部套件</button>' +
+            '<a class="btn" href="#/p/' + enc(pid) + '/run">选择套件运行</a>' +
+            '<a class="btn btn-ghost" href="#/p/' + enc(pid) + '/settings">设置</a>') +
+          '<div id="batchHost">' + (batchId ? '' : '') + '</div>' +
+          '<div id="kpiHost">' + kpiHtml(project, summary) + '</div>' +
+          '<div id="ovSections">' + overviewSectionsHtml(project, summary) + '</div>' +
+          (suites.length ? '' :
+            '<div class="notice info"><span aria-hidden="true">ⓘ</span><div>这个项目还没有绑定套件。' +
+            '<a href="#/p/' + enc(pid) + '/settings">去设置里绑定</a>后就能一键运行。</div></div>');
+
+        if (batchId) {
+          mountBatchPanel($('#batchHost', host), batchId, pid, {
+            onDone: function () { refreshOverview(host, pid, ctx); }
+          });
+        }
+      });
+  }
+
+  function refreshOverview(host, pid, ctx) {
+    if (!ctx.alive()) return;
+    Promise.all([
+      getProject(pid, true).catch(function () { return APP.projectCache[pid]; }),
+      apiGet(API + 'projects/' + enc(pid) + '/summary?limit=5').catch(function () { return null; })
+    ]).then(function (results) {
+      if (!ctx.alive() || !results[1]) return;
+      var project = results[0] || APP.projectCache[pid];
+      if (!project) return;
+      var kpi = $('#kpiHost', host);
+      var sections = $('#ovSections', host);
+      if (kpi) kpi.innerHTML = kpiHtml(project, results[1]);
+      if (sections) sections.innerHTML = overviewSectionsHtml(project, results[1]);
+      loadProjects(true).catch(function () {});
+    });
+  }
+
+  function startRunAll(pid, btn) {
+    getProject(pid).then(function (project) {
+      var suites = Array.isArray(project.suites) ? project.suites : [];
+      if (!suites.length) {
+        toast('还没有绑定套件，先去设置里绑定', 'error');
+        go('#/p/' + enc(pid) + '/settings');
+        return;
+      }
+      if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>提交中…'; }
+      return startBatch(pid, null, null).then(function (res) {
+        var bid = res && res.batch_id;
+        if (!bid) throw new ApiError('服务端没有返回 batch_id', 500, 'bad_payload');
+        go('#/p/' + enc(pid) + '/overview?batch=' + enc(bid));
+        toast('已提交 ' + suites.length + ' 个套件，串行执行', 'ok');
+      }).catch(function (err) {
+        if (btn) { btn.disabled = false; btn.textContent = '▶ 一键跑全部套件'; }
+        toast('提交失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+      });
+    }).catch(function (err) {
+      toast('无法读取项目：' + (err && err.message ? err.message : '未知错误'), 'error');
+    });
+  }
+
+  /* ================================================================== */
+  /* 批量运行                                                            */
+  /* ================================================================== */
+  function startBatch(pid, suiteIds, envOverrides) {
+    var body = {};
+    if (Array.isArray(suiteIds) && suiteIds.length) body.suite_ids = suiteIds;
+    if (envOverrides && Object.keys(envOverrides).length) body.env = envOverrides;
+    return apiPost(API + 'projects/' + enc(pid) + '/run', body);
+  }
+
+  function clearBatchTimers() {
+    (APP.batchTimers || []).forEach(function (t) { clearTimeout(t); });
+    APP.batchTimers = [];
+  }
+
+  function batchRowStatus(row) {
+    var total = num(row && row.total);
+    var passed = num(row && row.passed);
+    if (row && row.run_id && total > 0) {
+      return passed >= total ? 'passed' : 'failed';
+    }
+    if (row && row.status === 'done') return passed > 0 ? 'passed' : 'done';
+    if (row && row.status) return row.status;
     return 'pending';
   }
 
-  function completedPhases(map) {
-    var n = 0;
-    PHASES.forEach(function (p) {
-      var rec = map[p.key];
-      if (rec && rec.status !== 'running') n++;
-    });
-    return n;
-  }
-
-  function elapsedSeconds() {
-    var j = APP.job;
-    var d = j.data;
-    if (d && typeof d.elapsed_ms === 'number' && d.status && d.status !== 'queued') {
-      return Math.max(0, d.elapsed_ms / 1000);
+  function batchHtml(batch, pid) {
+    var suites = Array.isArray(batch && batch.suites) ? batch.suites : [];
+    var agg = (batch && batch.aggregate) || {};
+    var passed = num(agg.passed);
+    var total = num(agg.total);
+    var suitesPassed = num(agg.suites_passed);
+    var suitesFailed = num(agg.suites_failed);
+    if (!suites.length && !agg.total) {
+      return loadingHtml('批次已提交，正在等待第一个套件…');
     }
-    var base = d && typeof d.started_at === 'number' ? d.started_at * 1000 : j.startedLocal;
-    var end = d && typeof d.finished_at === 'number' ? d.finished_at * 1000 : Date.now();
-    return Math.max(0, (end - base) / 1000);
-  }
-
-  function elapsedText() {
-    var sec = elapsedSeconds();
-    if (sec < 60) return sec.toFixed(1) + ' 秒';
-    return Math.floor(sec / 60) + ' 分 ' + Math.round(sec % 60) + ' 秒';
-  }
-
-  function jobCardHtml() {
-    var j = APP.job;
-    var data = j.data;
-    var status = j.lost ? 'failed' : (data ? data.status : 'queued');
-    var map = phaseMap(data);
-    var done = data && (data.status === 'done' || data.status === 'failed');
-    // 后端可能把「跑完但没通过」记为 done；此时按失败呈现，避免绿色「已完成」误导
-    var runFailed = !!(data && data.conclusion && data.conclusion.success === false);
-    var badgeHtml = jobBadge(status);
-    if (data && data.status === 'done' && runFailed) {
-      badgeHtml = '<span class="badge bad"><span class="glyph" aria-hidden="true">✕</span>未通过</span>';
-    }
-
-    var pct = done ? 100 : Math.round((completedPhases(map) / PHASES.length) * 100);
-    if (!done && pct < 4) pct = 4;
-
-    var phasesHtml = PHASES.map(function (p) {
-      var st = phaseStatus(p.key, map, data);
-      return '<span class="phase" data-s="' + st + '"><span class="p-dot" aria-hidden="true"></span>' + p.label + '</span>';
-    }).join('');
-
-    var resultHtml = '';
-    if (j.lost) {
-      resultHtml = '<div class="error-msg">任务状态已丢失（服务可能已重启）。内存态任务不会恢复，请到运行历史查看已落盘的结果。</div>';
-    } else if (j.error) {
-      resultHtml = '<div class="error-msg">读取任务状态失败：' + esc(j.error.message) + '</div>';
-    } else if (data && data.status === 'failed') {
-      resultHtml = '<div class="error-msg">任务失败：' + esc(data.error || '未提供失败原因（请查看服务端日志）') + '</div>';
-    } else if (data && data.summary) {
-      var s = data.summary;
-      var verdict = data.conclusion && data.conclusion.verdict;
-      resultHtml = '<div class="job-result">' +
-        '<span>通过 <b>' + esc(String(s.passed)) + '/' + esc(String(s.total)) + '</b></span>' +
-        '<span>失败 <b>' + esc(String(s.failed)) + '</b></span>' +
-        '<span>异常 <b>' + esc(String(s.errored)) + '</b></span>' +
-        '<span>自愈 <b>' + esc(String(s.healed_cases)) + '</b></span>' +
-        '<span>耗时 <b>' + esc(fmtMs(s.duration_ms)) + '</b></span>' +
-        '</div>' +
-        (verdict ? '<div class="job-result"><span>结论 <b>' + esc(verdict) + '</b></span></div>' : '');
-    }
-
-    var actions = '';
-    if (data && data.run_id && data.status === 'done') {
-      actions = '<div class="error-actions" style="display:flex;gap:8px;flex-wrap:wrap">' +
-        '<button type="button" class="btn btn-sm btn-primary" data-act="job-detail" data-run="' + esc(data.run_id) + '">查看运行详情</button>' +
-        '<a class="btn btn-sm" href="#/history">运行历史</a></div>';
-    }
-
-    return '' +
-      '<div class="job-card" data-status="' + esc(status) + '">' +
-        '<div class="job-head">' +
-          '<span class="job-title">任务 · ' + esc(MODE_LABEL[j.mode] || j.mode || '未知模式') + '</span>' +
-          badgeHtml +
-          '<span class="job-meta">' + esc(j.id || '') + '</span>' +
-          '<span class="job-spacer"></span>' +
-          '<span class="job-meta">已运行 <span data-elapsed="1">' + esc(elapsedText()) + '</span></span>' +
-          '<button type="button" class="btn btn-icon" data-act="job-dismiss" aria-label="收起任务面板">✕</button>' +
-        '</div>' +
-        '<div class="phases" aria-label="阶段进度">' + phasesHtml + '</div>' +
-        '<div class="progress-track"><div class="progress-fill ' + (status === 'failed' || runFailed ? 'failed' : (status === 'done' ? 'done' : '')) +
-          '" style="width:' + pct + '%"></div></div>' +
-        resultHtml +
-        actions +
-      '</div>';
-  }
-
-  function renderJobPanels() {
-    var dock = $('#jobDock');
-    if (dock) {
-      if (APP.job.id && !APP.job.dismiss) {
-        dock.hidden = false;
-        dock.innerHTML = jobCardHtml();
-      } else {
-        dock.hidden = true;
-        dock.innerHTML = '';
-      }
-    }
-    $$('[data-job-inline]').forEach(function (host) {
-      host.innerHTML = APP.job.id ? jobCardHtml() : '';
-    });
-    syncRunFormState();
-  }
-
-  function tickElapsed() {
-    if (!APP.job.id) return;
-    $$('[data-elapsed]').forEach(function (node) {
-      node.textContent = elapsedText();
-    });
-  }
-
-  function stopJobTimers() {
-    if (APP.job.poll) { clearInterval(APP.job.poll); APP.job.poll = null; }
-    if (APP.job.tick) { clearInterval(APP.job.tick); APP.job.tick = null; }
-  }
-
-  function pollJob() {
-    var j = APP.job;
-    if (!j.id) return;
-    var id = j.id;
-    request(API + 'jobs/' + encodeURIComponent(id)).then(function (data) {
-      if (APP.job.id !== id) return;
-      APP.job.data = data;
-      APP.job.error = null;
-      APP.job.lost = false;
-      if (data && (data.status === 'done' || data.status === 'failed')) {
-        stopJobTimers();
-        try { localStorage.removeItem('pv.activeJob'); } catch (e) { /* noop */ }
-        if (APP.job.notified !== id) {
-          APP.job.notified = id;
-          if (data.status === 'done' && data.conclusion && data.conclusion.success === false) {
-            toast('任务未通过：' + (data.summary ? data.summary.passed + '/' + data.summary.total + ' 通过' : '存在失败用例'), 'error');
-          } else if (data.status === 'done') {
-            toast('任务完成：' + (data.summary ? data.summary.passed + '/' + data.summary.total + ' 通过' : '已生成报告'), 'ok');
-          } else {
-            toast('任务失败：' + (data.error || '未提供原因'), 'error');
-          }
-        }
-        refreshStatus().then(function (st) {
-          if (st && parseRoute().name === 'overview') patchOverviewStats(st);
-        });
-        // 任务跑完后回写 last_run_id / last_status：列表页开着就刷新一次
-        if (parseRoute().name === 'tasks' && typeof APP.tasksReload === 'function') {
-          APP.tasksReload();
-        }
-      }
-      renderJobPanels();
-    }).catch(function (err) {
-      if (APP.job.id !== id) return;
-      if (err.status === 404) {
-        APP.job.lost = true;
-        stopJobTimers();
-        try { localStorage.removeItem('pv.activeJob'); } catch (e) { /* noop */ }
-      } else {
-        APP.job.error = err;
-      }
-      renderJobPanels();
-    });
-  }
-
-  function attachJob(id, mode, startedAtLocal) {
-    stopJobTimers();
-    var j = APP.job;
-    j.id = id;
-    j.mode = mode || '';
-    j.data = null;
-    j.error = null;
-    j.lost = false;
-    j.dismiss = false;
-    j.notified = null;
-    j.startedLocal = startedAtLocal || Date.now();
-    try {
-      localStorage.setItem('pv.activeJob', JSON.stringify({ id: id, mode: j.mode, at: j.startedLocal }));
-    } catch (e) { /* noop */ }
-    j.poll = setInterval(pollJob, 900);
-    j.tick = setInterval(tickElapsed, 1000);
-    renderJobPanels();
-    pollJob();
-  }
-
-  function restoreJob() {
-    var raw = null;
-    try { raw = localStorage.getItem('pv.activeJob'); } catch (e) { return; }
-    if (!raw) return;
-    var obj = null;
-    try { obj = JSON.parse(raw); } catch (e) { obj = null; }
-    if (!obj || !obj.id) {
-      try { localStorage.removeItem('pv.activeJob'); } catch (e2) { /* noop */ }
-      return;
-    }
-    var age = Date.now() - (obj.at || 0);
-    if (age > 6 * 3600 * 1000) {
-      try { localStorage.removeItem('pv.activeJob'); } catch (e3) { /* noop */ }
-      return;
-    }
-    attachJob(obj.id, obj.mode, obj.at);
-  }
-
-  function jobIsActive() {
-    var d = APP.job.data;
-    return !!(APP.job.id && !APP.job.lost && (!d || d.status === 'queued' || d.status === 'running'));
-  }
-
-  function startRun(payload) {
-    if (jobIsActive()) {
-      showBanner('warn', '<strong>已有任务在运行。</strong> 前端一次只提交一个任务，请等待当前任务结束。', 8000);
-      return Promise.reject(new ApiError('已有任务在运行', 409, 'busy'));
-    }
-    return apiPost(API + 'runs', payload).then(function (res) {
-      if (!res || !res.job_id) {
-        throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
-      }
-      attachJob(res.job_id, payload.mode);
-      toast('任务已提交：' + res.job_id, 'ok');
-      return res;
-    });
-  }
-
-  /* ================================================================== */
-  /* 6. 平台状态（侧栏 + 连接指示）                                       */
-  /* ================================================================== */
-  function updateConn(ok, err) {
-    var node = $('#connState');
-    if (!node) return;
-    node.dataset.state = ok ? 'ok' : 'bad';
-    node.innerHTML = '<span class="conn-dot" aria-hidden="true"></span>' + (ok ? '已连接' : '未连接');
-    node.title = ok ? '' : ((err && err.message) || '无法连接服务端');
-  }
-
-  function applyStatus(st) {
-    APP.status = st || null;
-    updateConn(!!st);
-    var badgeEl = $('#llmBadge');
-    var textEl = $('#llmText');
-    if (st) {
-      var llm = !!st.llm_enabled;
-      if (badgeEl) badgeEl.dataset.mode = llm ? 'ai' : 'offline';
-      if (textEl) textEl.textContent = '规划方式：' + (llm ? 'AI 规划' : '离线规则规划');
-      if (badgeEl) {
-        badgeEl.title = llm ? '已配置模型密钥，规划可调用 LLM' : '未配置模型密钥，使用离线规则兜底（不会调用 LLM）';
-      }
-      var ws = $('#factWorkspace');
-      if (ws) { ws.textContent = st.workspace || '—'; ws.title = st.workspace || ''; }
-      var ver = $('#factVersion');
-      if (ver) ver.textContent = st.version || '—';
-    } else if (badgeEl) {
-      badgeEl.dataset.mode = 'error';
-      if (textEl) textEl.textContent = '规划方式：未知（未连接）';
-    }
-  }
-
-  function refreshStatus() {
-    return apiGet(API + 'status').then(function (st) {
-      applyStatus(st);
-      return st;
-    }).catch(function (err) {
-      updateConn(false, err);
-      return null;
-    });
-  }
-
-  /* ================================================================== */
-  /* 7. 概览                                                             */
-  /* ================================================================== */
-  function statCard(spec) {
-    return '' +
-      '<div class="stat-card"' + (spec.tone ? ' data-tone="' + spec.tone + '"' : '') + '>' +
-        (spec.action ? '<div class="stat-action">' + spec.action + '</div>' : '') +
-        '<div class="stat-label">' + esc(spec.label) + '</div>' +
-        '<div class="stat-value' + (spec.small ? ' small' : '') + '">' + spec.value + '</div>' +
-        '<div class="stat-note">' + spec.note + '</div>' +
-      '</div>';
-  }
-
-  function statGridHtml(st) {
-    var llm = !!st.llm_enabled;
-    return '' +
-      statCard({
-        label: '原子数',
-        value: esc(fmtNum(st.atoms)),
-        note: '可编排的原子动作'
-      }) +
-      statCard({
-        label: '领域包',
-        value: esc(fmtNum(st.packs)),
-        note: '领域包边界与语义'
-      }) +
-      statCard({
-        label: '回归库',
-        value: esc(fmtNum(st.regression_count)),
-        note: '已沉淀用例，可直接重跑',
-        action: '<button type="button" class="btn btn-sm" data-act="run-regression">跑一次</button>'
-      }) +
-      statCard({
-        label: '规划方式',
-        small: true,
-        tone: llm ? 'accent' : 'warn',
-        value: esc(llm ? 'AI 规划' : '离线规则规划'),
-        note: llm
-          ? '已配置模型密钥'
-          : '未配置模型密钥，规则兜底（不会调用 LLM）'
-      });
-  }
-
-  function overviewHtml(st) {
-    var facts = '' +
-      '<div class="kv-grid">' +
-        '<dt>工作区</dt><dd class="mono">' + (hasVal(st.workspace) ? esc(st.workspace) : '<span class="missing">未提供</span>') + '</dd>' +
-        '<dt>HTTP 后端</dt><dd class="mono">' + esc(st.http_backend || '未提供') + '</dd>' +
-        '<dt>场景</dt><dd>' + esc(fmtNum(st.scenarios)) + ' 个</dd>' +
-        '<dt>经验</dt><dd>' + esc(fmtNum(st.lessons_count)) + ' 条</dd>' +
-        '<dt>版本</dt><dd class="mono">' + esc(st.version || '未提供') + '</dd>' +
-      '</div>';
-
-    return '' +
-      '<div class="page-head">' +
-        '<div>' +
-          '<h1>概览</h1>' +
-          '<div class="sub">本机控制台 · 规划 → 校验 → 执行 → 自愈 → 报告 → 沉淀 → 回归</div>' +
-        '</div>' +
-        '<div class="actions">' +
-          '<button type="button" class="btn btn-primary" data-act="run-demo">运行内置演示</button>' +
-          '<a class="btn" href="#/run">自定义运行</a>' +
-        '</div>' +
+    var status = (batch && batch.status) || 'running';
+    return '<div class="batch-head">' +
+        '<h2>批量运行</h2>' + badge(status === 'failed' ? 'failed' : (status === 'done' ? 'passed' : status)) +
+        '<span class="batch-id">' + esc(batch && batch.batch_id ? batch.batch_id : '') + '</span>' +
+        '<span class="batch-elapsed" data-batch-elapsed>自动刷新中</span>' +
       '</div>' +
-      '<div class="stat-grid">' + statGridHtml(st) + '</div>' +
-      '<div class="section">' +
-        '<div class="section-head"><h2>环境</h2><span class="hint">数据来自 status 接口</span></div>' +
-        '<div class="panel">' + facts + '</div>' +
+      '<div class="batch-agg">' +
+        '<div><b>' + esc(String(suitesPassed)) + '</b><span>套件通过</span></div>' +
+        '<div><b>' + esc(String(suitesFailed)) + '</b><span>套件失败</span></div>' +
+        '<div><b>' + esc(String(passed)) + '/' + esc(String(total)) + '</b><span>用例通过</span></div>' +
+        '<div><b>' + esc(fmtDur(num(agg.duration_ms))) + '</b><span>总耗时</span></div>' +
       '</div>' +
-      '<div class="section">' +
-        '<div class="section-head">' +
-          '<h2>最近运行</h2>' +
-          '<span class="hint"><a href="#/history">查看全部历史</a></span>' +
-        '</div>' +
-        '<div id="recentRuns"><div class="loading"><span class="spinner"></span>正在读取运行历史…</div></div>' +
-      '</div>';
+      '<div class="batch-suites">' + suites.map(function (row) {
+        var st = batchRowStatus(row);
+        var name = row.name || suiteLabel(APP.projectCache[pid], row.suite_id);
+        var count = num(row.total) ? (num(row.passed) + '/' + num(row.total)) : '';
+        return '<div class="batch-row">' +
+          badge(st) +
+          '<span class="batch-name">' + esc(name) + '</span>' +
+          '<span class="batch-num">' + esc(count) + '</span>' +
+          (row.run_id
+            ? '<a class="btn btn-sm" href="#/p/' + enc(pid) + '/runs/' + enc(row.run_id) + '">查看详情</a>'
+            : '<span class="hint">' + esc(row.status === 'running' ? '执行中…' : '等待中…') + '</span>') +
+          (row.error ? '<div class="batch-error">' + esc(row.error) + '</div>' : '') +
+        '</div>';
+      }).join('') + '</div>' +
+      (status === 'done' || status === 'failed'
+        ? '<div class="hint" style="margin-top:8px">' + esc(status === 'done' ? '全部套件已执行完毕。' : '批次结束，部分套件没有拿到报告。') + '</div>'
+        : '');
   }
 
-  function renderRecentRuns(host, ctx) {
-    if (!host) return;
-    apiGet(API + 'runs?limit=4').then(function (runs) {
-      if (!ctx.alive() || !document.contains(host)) return;
-      if (!Array.isArray(runs) || runs.length === 0) {
-        host.innerHTML = '<div class="empty"><strong>还没有运行记录</strong>' +
-          '<span>点击「运行内置演示」跑通一次闭环，结果会写入工作区 runs/ 目录。</span></div>';
-        return;
-      }
-      var rows = runs.map(function (r) {
-        var s = r.summary || {};
-        var verdict = (r.conclusion && r.conclusion.verdict) || (s.success ? '通过' : '存在失败');
-        return '<tr class="is-clickable" data-href="#/runs/' + encodeURIComponent(r.run_id) + '">' +
-          '<td class="tight"><a class="row-link" href="#/runs/' + encodeURIComponent(r.run_id) + '">' + esc(r.run_id) + '</a></td>' +
-          '<td class="tight">' + esc(fmtTs(r.started_at)) + '</td>' +
-          '<td>' + rateHtml(s) + '</td>' +
-          '<td class="num">' + esc(fmtMs(r.duration_ms)) + '</td>' +
-          '<td>' + esc(verdict) + '</td>' +
-        '</tr>';
-      }).join('');
-      host.innerHTML = '<div class="table-wrap"><table class="data">' +
-        '<thead><tr><th>run</th><th>开始时间</th><th>通过率</th><th class="num">耗时</th><th>结论</th></tr></thead>' +
-        '<tbody>' + rows + '</tbody></table></div>';
-    }).catch(function (err) {
-      if (!ctx.alive() || !document.contains(host)) return;
-      host.innerHTML = '<div class="empty"><strong>无法读取运行历史</strong><span>' +
-        esc(err.message) + '</span><a href="#/history">打开运行历史页重试</a></div>';
-    });
-  }
-
-  function patchOverviewStats(st) {
-    var grid = $('#view .stat-grid');
-    if (!grid || !st) return;
-    grid.innerHTML = statGridHtml(st);
-  }
-
-  function renderOverview(host, ctx) {
-    host.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取平台状态…</div>';
-    return apiGet(API + 'status').then(function (st) {
-      if (!ctx.alive()) return;
-      applyStatus(st);
-      host.innerHTML = overviewHtml(st);
-      renderRecentRuns($('#recentRuns', host), ctx);
-    }).catch(function (err) {
-      if (!ctx.alive()) return;
-      updateConn(false, err);
-      applyStatus(null);
-      renderError(host, err, function () { render(); }, '无法读取平台状态');
-    });
-  }
-
-  /* ================================================================== */
-  /* 8. 运行页                                                           */
-  /* ================================================================== */
-  var MODE_HINTS = {
-    demo: '运行内置闭环演示（7 个用例）：规划 → 校验 → 执行 → 自愈 → 报告 → 沉淀 → 回归复用。',
-    scenario: '从工作区或内置 scenarios/ 目录选择 YAML 场景文件直接执行，不需要重新描述意图。',
-    intent: '用一句话描述目标，由规划层生成用例；未配置模型密钥时使用离线规则规划。',
-    regression: '直接复用已沉淀的回归库重新执行，不重新规划。'
-  };
-
-  function getMode(form) {
-    var checked = $('input[name="mode"]:checked', form);
-    return checked ? checked.value : 'demo';
-  }
-
-  function addEnvRow(container, key, value, opts) {
-    if (!container) return;
+  function mountBatchPanel(hostEl, batchId, pid, opts) {
+    if (!hostEl) return;
     opts = opts || {};
-    var masked = !!opts.masked;
-    var row = document.createElement('div');
-    row.className = 'env-row' + (masked ? ' env-row-masked' : '');
-    if (masked) row.setAttribute('data-masked', '1');
-    row.innerHTML = '' +
-      '<input class="input" data-env-key aria-label="环境变量名" placeholder="BASE_URL" value="' + esc(key || '') + '" autocomplete="off" spellcheck="false">' +
-      '<input class="input" data-env-val aria-label="环境变量值" placeholder="' + (masked ? '***（留空沿用）' : 'http://127.0.0.1:8899') + '" value="' + esc(value || '') + '" autocomplete="off" spellcheck="false"' +
-        (masked ? ' title="已保存的值；保持 *** 或留空表示沿用，删除整行表示移除该键"' : '') + '>' +
-      '<button type="button" class="btn btn-icon btn-danger-ghost" data-remove-env aria-label="删除该环境变量">✕</button>';
-    container.appendChild(row);
-  }
+    var startedAt = Date.now();
+    var alive = true;
+    var attempts = 0;
+    hostEl.innerHTML = '<div class="batch-panel" id="batchPanel">' + loadingHtml('正在读取批次状态…') + '</div>';
 
-  function runFormHtml() {
-    return '' +
-      '<div class="page-head">' +
-        '<div>' +
-          '<h1>运行</h1>' +
-          '<div class="sub">选择一种方式生成计划并执行；结果写入工作区 runs/ 目录，可在运行历史里回看。</div>' +
-        '</div>' +
-        '<div class="actions"><a class="btn" href="#/history">运行历史</a></div>' +
-      '</div>' +
-      '<form class="form-grid" id="runForm" novalidate>' +
-        '<div class="field">' +
-          '<span class="field-label" id="modeLabel">运行模式</span>' +
-          '<div class="segmented" role="radiogroup" aria-labelledby="modeLabel">' +
-            '<label><input type="radio" name="mode" value="demo" checked><span>演示</span></label>' +
-            '<label><input type="radio" name="mode" value="scenario"><span>场景</span></label>' +
-            '<label><input type="radio" name="mode" value="intent"><span>意图</span></label>' +
-            '<label><input type="radio" name="mode" value="regression"><span>回归</span></label>' +
-          '</div>' +
-          '<div class="field-hint" id="modeHint"></div>' +
-        '</div>' +
-
-        '<div class="field" data-when="scenario" hidden>' +
-          '<label for="scenarioSelect">场景文件</label>' +
-          '<select class="select" id="scenarioSelect">' +
-            '<option value="">加载中…</option>' +
-          '</select>' +
-          '<div class="field-hint" id="scenarioNote">正在读取场景列表…</div>' +
-        '</div>' +
-
-        '<div class="field" data-when="intent" hidden>' +
-          '<label for="intentInput">意图描述</label>' +
-          '<textarea class="textarea" id="intentInput" placeholder="例如：检查健康状态并验证登录下单" autocomplete="off"></textarea>' +
-          '<div class="field-hint">示例：检查健康状态并验证登录下单。无模型密钥时由离线规则生成计划。</div>' +
-        '</div>' +
-
-        '<div class="field" data-when="demo scenario intent" hidden>' +
-          '<span class="field-label">环境变量</span>' +
-          '<div class="env-rows" id="envRows"></div>' +
-          '<div><button type="button" class="btn btn-sm" id="addEnv">+ 添加环境变量</button></div>' +
-          '<div class="field-hint">键值对会作为运行时环境传入（如 BASE_URL、API_USERNAME）。留空的行会被忽略。</div>' +
-        '</div>' +
-
-        '<div class="field" data-when="demo scenario intent" hidden>' +
-          '<label class="checkbox">' +
-            '<input type="checkbox" id="noLlm">' +
-            '<span>强制离线规则规划（no_llm）</span>' +
-          '</label>' +
-          '<div class="field-hint">勾选后即使配置了模型密钥也不调用 LLM，全部走规则兜底。</div>' +
-        '</div>' +
-
-        '<div class="field" data-when="regression" hidden>' +
-          '<div class="panel">' +
-            '<div class="kv-grid">' +
-              '<dt>来源</dt><dd>已沉淀的回归库（复用上次执行结构，不重新规划）</dd>' +
-              '<dt>条件</dt><dd>回归库为空时任务会失败并给出原因；先跑一次演示或场景即可沉淀。</dd>' +
-            '</div>' +
-          '</div>' +
-        '</div>' +
-
-        '<div class="form-actions">' +
-          '<button type="submit" class="btn btn-primary" id="submitRun">开始运行</button>' +
-          '<span class="form-note" id="runNote">任务在后台线程执行，本页会轮询进度。</span>' +
-        '</div>' +
-        '<div id="runFormError" aria-live="assertive"></div>' +
-        '<div data-job-inline></div>' +
-      '</form>';
-  }
-
-  function setFormError(form, message, focusEl) {
-    var host = $('#runFormError', form);
-    if (host) {
-      host.innerHTML = message ? '<div class="error-block" role="alert">' +
-        '<div class="error-title"><span aria-hidden="true">⚠</span>无法提交</div>' +
-        '<div class="error-msg">' + esc(message) + '</div>' +
-        '</div>' : '';
-    }
-    if (focusEl && typeof focusEl.focus === 'function') focusEl.focus();
-  }
-
-  function syncRunFormState() {
-    var form = $('#runForm');
-    if (!form) return;
-    var submit = $('#submitRun', form);
-    var note = $('#runNote', form);
-    if (!submit) return;
-    var busy = jobIsActive();
-    if (submit.dataset.busy !== '1') {
-      submit.disabled = busy;
-    }
-    if (note && busy) {
-      note.textContent = '已有任务在运行，完成前不能提交新任务。';
-    } else if (note && !busy) {
-      note.textContent = '任务在后台线程执行，本页会轮询进度。';
-    }
-  }
-
-  function collectEnv(form) {
-    var env = {};
-    var errors = [];
-    $$('.env-row', form).forEach(function (row, idx) {
-      var keyEl = $('[data-env-key]', row);
-      var valEl = $('[data-env-val]', row);
-      var key = keyEl ? keyEl.value.trim() : '';
-      var val = valEl ? valEl.value : '';
-      if (!key && String(val).trim() === '') return;
-      if (!key) {
-        errors.push('第 ' + (idx + 1) + ' 行：填写了值但缺少变量名');
-        return;
+    function stop() {
+      alive = false;
+      if (opts.signal && opts.signal.removeEventListener) {
+        try { opts.signal.removeEventListener('abort', stop); } catch (e) { /* noop */ }
       }
-      if (Object.prototype.hasOwnProperty.call(env, key)) {
-        errors.push('环境变量名重复：' + key);
-        return;
+    }
+    if (opts.signal && opts.signal.addEventListener) {
+      opts.signal.addEventListener('abort', stop);
+    }
+
+    function render(data) {
+      var panel = $('#batchPanel', hostEl);
+      if (!panel) return;
+      panel.innerHTML = batchHtml(data, pid);
+      var el = $('[data-batch-elapsed]', panel);
+      if (el) {
+        var secs = Math.floor((Date.now() - startedAt) / 1000);
+        el.textContent = (data.status === 'done' || data.status === 'failed') ? ('结束于 ' + fmtRel(Date.now() / 1000)) : ('已等待 ' + secs + ' 秒');
       }
-      env[key] = val;
-    });
-    return { env: env, errors: errors };
-  }
-
-  function submitRunForm(form) {
-    if (!form) return;
-    setFormError(form, '');
-    var mode = getMode(form);
-    var payload = { mode: mode };
-
-    var scenarioEl = $('#scenarioSelect', form);
-    var intentEl = $('#intentInput', form);
-    var noLlmEl = $('#noLlm', form);
-
-    if (mode === 'scenario') {
-      var scenario = scenarioEl ? scenarioEl.value : '';
-      if (!scenario) {
-        setFormError(form, '请选择场景文件（列表为空或全部解析失败时无法运行场景模式）。', scenarioEl);
-        return;
-      }
-      payload.scenario = scenario;
-    }
-    if (mode === 'intent') {
-      var intent = intentEl ? intentEl.value.trim() : '';
-      if (!intent) {
-        setFormError(form, '意图不能为空，请填写一句话目标。', intentEl);
-        return;
-      }
-      payload.intent = intent;
-    }
-    if (mode !== 'regression') {
-      var envResult = collectEnv(form);
-      if (envResult.errors.length) {
-        setFormError(form, envResult.errors.join('；'), $('[data-env-key]', form));
-        return;
-      }
-      if (Object.keys(envResult.env).length > 0) payload.env = envResult.env;
-      if (noLlmEl && noLlmEl.checked) payload.no_llm = true;
     }
 
-    if (jobIsActive()) {
-      setFormError(form, '已有任务在运行，请等待其完成后再提交。');
-      return;
-    }
-
-    var submit = $('#submitRun', form);
-    if (submit) {
-      submit.dataset.busy = '1';
-      submit.disabled = true;
-      submit.textContent = '提交中…';
-    }
-
-    startRun(payload).then(function () {
-      setFormError(form, '');
-    }).catch(function (err) {
-      if (err && err.code === 'busy') {
-        setFormError(form, '已有任务在运行，请等待其完成后再提交。');
-      } else {
-        var host = $('#runFormError', form);
-        if (host) {
-          renderError(host, err, function () { submitRunForm(form); }, '任务提交失败');
+    function tick() {
+      if (!alive || !document.body.contains(hostEl)) { stop(); return; }
+      apiGet(API + 'batches/' + enc(batchId)).then(function (data) {
+        if (!alive || !document.body.contains(hostEl)) { stop(); return; }
+        attempts = 0;
+        render(data);
+        if (data && (data.status === 'done' || data.status === 'failed')) {
+          stop();
+          if (typeof opts.onDone === 'function') opts.onDone(data);
+          return;
         }
-      }
-    }).then(function () {
-      if (submit) {
-        submit.dataset.busy = '';
-        submit.disabled = jobIsActive();
-        submit.textContent = getMode(form) === 'demo' ? '运行内置演示' : '开始运行';
-      }
-      syncRunFormState();
-    });
-  }
-
-  function loadScenarios(select, note, ctx, desired) {
-    if (!select) return;
-    apiGet(API + 'scenarios').then(function (list) {
-      if (!ctx.alive() || !select.isConnected) return;
-      if (!Array.isArray(list) || list.length === 0) {
-        select.innerHTML = '<option value="">没有可用场景</option>';
-        select.disabled = true;
-        if (note) note.textContent = '未发现场景文件：把 YAML 放到 <workspace>/scenarios/ 下，或使用内置 scenarios/ 目录。';
-        return;
-      }
-      var bad = [];
-      var firstOk = null;
-      var options = list.map(function (item) {
-        var isBad = !!item.error;
-        var name = item.name || item.id || '(未命名)';
-        var sourceLabel = item.source === 'workspace' ? '工作区' : '内置';
-        var label = isBad
-          ? name + ' · 解析失败 · ' + sourceLabel
-          : name + ' · ' + (item.cases || 0) + ' 用例 · ' + sourceLabel;
-        if (isBad) {
-          bad.push({ name: name, error: item.error });
-        } else if (!firstOk) {
-          firstOk = item;
-        }
-        return '<option value="' + esc(item.id) + '"' + (isBad ? ' disabled' : '') + '>' + esc(label) + '</option>';
-      });
-      // 已保存/原运行的场景可能不在列表里（被删或改名）：补一个只读选项，避免静默丢配置
-      if (desired && !list.some(function (item) { return item && item.id === desired; })) {
-        options.push('<option value="' + esc(desired) + '">' + esc(desired) + ' · 当前配置（不在场景列表）</option>');
-      }
-      select.innerHTML = options.join('');
-      select.disabled = false;
-      if (desired) select.value = desired;
-      else if (firstOk) select.value = firstOk.id;
-      if (note) {
-        if (bad.length) {
-          note.innerHTML = bad.length + ' 个场景解析失败（已置灰不可选）：' +
-            esc(bad[0].name) + '：' + esc(bad[0].error || '未提供原因') +
-            (bad.length > 1 ? '（另有 ' + (bad.length - 1) + ' 个）' : '');
-        } else {
-          note.textContent = '共 ' + list.length + ' 个场景可选，工作区场景优先。';
-        }
-      }
-    }).catch(function (err) {
-      if (!ctx.alive() || !select.isConnected) return;
-      select.innerHTML = '<option value="">场景加载失败</option>';
-      select.disabled = true;
-      if (note) {
-        note.innerHTML = '<span class="field-error">场景列表加载失败：' + esc(err.message) + '</span>' +
-          ' <button type="button" class="btn btn-sm" data-scenario-retry>重试</button>';
-        var btn = $('[data-scenario-retry]', note);
-        if (btn) {
-          btn.addEventListener('click', function () {
-            note.textContent = '正在读取场景列表…';
-            loadScenarios(select, note, ctx);
-          });
-        }
-      }
-    });
-  }
-
-  function renderRun(host, ctx) {
-    host.innerHTML = runFormHtml();
-    var form = $('#runForm', host);
-    if (!form) return;
-
-    var envRows = $('#envRows', form);
-    addEnvRow(envRows);
-
-    var addBtn = $('#addEnv', form);
-    if (addBtn) {
-      addBtn.addEventListener('click', function () {
-        addEnvRow(envRows);
-        var inputs = $$('[data-env-key]', envRows);
-        if (inputs.length) inputs[inputs.length - 1].focus();
-      });
-    }
-    if (envRows) {
-      envRows.addEventListener('click', function (e) {
-        var btn = e.target.closest ? e.target.closest('[data-remove-env]') : null;
-        if (!btn) return;
-        var row = btn.closest('.env-row');
-        if (row && row.parentNode) row.parentNode.removeChild(row);
-      });
-    }
-
-    var radios = $$('input[name="mode"]', form);
-    var applyMode = function () {
-      var mode = getMode(form);
-      $$('[data-when]', form).forEach(function (block) {
-        var modes = (block.getAttribute('data-when') || '').split(/\s+/);
-        block.hidden = modes.indexOf(mode) < 0;
-      });
-      var hintEl = $('#modeHint', form);
-      if (hintEl) hintEl.textContent = MODE_HINTS[mode] || '';
-      var submit = $('#submitRun', form);
-      if (submit && submit.dataset.busy !== '1') {
-        submit.textContent = mode === 'demo' ? '运行内置演示' : '开始运行';
-      }
-      setFormError(form, '');
-    };
-    radios.forEach(function (r) { r.addEventListener('change', applyMode); });
-    applyMode();
-
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
-      submitRunForm(form);
-    });
-
-    loadScenarios($('#scenarioSelect', form), $('#scenarioNote', form), ctx);
-    renderJobPanels();
-    syncRunFormState();
-  }
-
-  /* ================================================================== */
-  /* 9. 运行历史                                                         */
-  /* ================================================================== */
-  function historyHtml(runs) {
-    if (!Array.isArray(runs) || runs.length === 0) {
-      return '<div class="empty"><strong>还没有运行记录</strong>' +
-        '<span>每次运行都会在 <code>&lt;workspace&gt;/runs/&lt;run_id&gt;/</code> 落盘 report.json / report.html / junit.xml。</span>' +
-        '<span>先跑一次内置演示，这里就会出现记录。</span>' +
-        '<a class="btn btn-primary btn-sm" href="#/run">去运行页</a></div>';
-    }
-    var rows = runs.map(function (r) {
-      var s = r.summary || {};
-      var verdict = (r.conclusion && r.conclusion.verdict) || (s.success ? '通过' : '存在失败');
-      var caseCount = typeof s.total === 'number' ? s.total + ' 个用例' : '—';
-      return '<tr class="is-clickable" data-href="#/runs/' + encodeURIComponent(r.run_id) + '">' +
-        '<td class="tight"><a class="row-link" href="#/runs/' + encodeURIComponent(r.run_id) + '">' + esc(r.run_id) + '</a></td>' +
-        '<td class="tight">' + esc(fmtTs(r.started_at)) + '</td>' +
-        '<td>' + rateHtml(s) + '</td>' +
-        '<td class="num">' + esc(fmtMs(r.duration_ms)) + '</td>' +
-        '<td class="tight">' + esc(caseCount) + '</td>' +
-        '<td>' + esc(verdict) + '</td>' +
-        '<td class="tight"><div class="row-actions">' +
-          '<button type="button" class="btn btn-sm" data-rerun="' + esc(r.run_id) + '">重跑</button>' +
-          '<button type="button" class="btn btn-sm" data-edit-config="' + esc(r.run_id) + '">编辑配置</button>' +
-        '</div></td>' +
-      '</tr>';
-    }).join('');
-    return '<div class="table-wrap"><table class="data history-table">' +
-      '<thead><tr><th>run_id</th><th>开始时间</th><th>通过率</th><th class="num">耗时</th><th>用例</th><th>结论</th><th>操作</th></tr></thead>' +
-      '<tbody>' + rows + '</tbody></table></div>';
-  }
-
-  function rerunRun(runId, btn) {
-    if (jobIsActive()) {
-      showBanner('warn', '<strong>已有任务在运行。</strong> 完成前不能提交新的重跑。', 8000);
-      return;
-    }
-    if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
-    apiPost(API + 'runs/' + encodeURIComponent(runId) + '/rerun', {}).then(function (res) {
-      if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
-      attachJob(res.job_id, '');
-      showBanner('info', '<strong>已提交重跑：</strong>源运行 ' + esc(runId) + ' → 任务 ' + esc(res.job_id) + '。进度见右下角面板。', 6000);
-      // 拿到源运行模式后再补上任务面板标题
-      apiGet(API + 'runs/' + encodeURIComponent(runId) + '/config').then(function (cfg) {
-        if (APP.job.id === res.job_id && cfg && cfg.mode && MODE_LABEL[cfg.mode]) {
-          APP.job.mode = cfg.mode;
-          renderJobPanels();
-        }
-      }).catch(function () { /* 标题只是锦上添花 */ });
-    }).catch(function (err) {
-      showBanner('error', '<strong>重跑失败：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
-    }).then(function () {
-      if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '重跑'; }
-    });
-  }
-
-  function renderHistory(host, ctx) {
-    host.innerHTML = '' +
-      '<div class="page-head">' +
-        '<div><h1>运行历史</h1><div class="sub">扫描工作区 runs/ 目录，按开始时间倒序；点击行查看详情。</div></div>' +
-        '<div class="actions">' +
-          '<button type="button" class="btn" data-act="history-refresh">刷新</button>' +
-          '<a class="btn btn-primary" href="#/run">新建运行</a>' +
-        '</div>' +
-      '</div>' +
-      '<div id="historyBody"><div class="loading"><span class="spinner"></span>正在读取运行历史…</div></div>';
-
-    var body = $('#historyBody', host);
-    var load = function () {
-      if (!ctx.alive()) return;
-      body.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取运行历史…</div>';
-      apiGet(API + 'runs?limit=50').then(function (runs) {
-        if (!ctx.alive()) return;
-        body.innerHTML = historyHtml(runs);
+        var timer = setTimeout(tick, 1200);
+        APP.batchTimers.push(timer);
       }).catch(function (err) {
-        if (!ctx.alive()) return;
-        body.innerHTML = '<div id="historyError"></div>';
-        renderError($('#historyError', body), err, load, '无法读取运行历史');
+        if (!alive) return;
+        attempts++;
+        if (attempts < 3) {
+          var timer = setTimeout(tick, 1500);
+          APP.batchTimers.push(timer);
+          return;
+        }
+        stop();
+        var panel = $('#batchPanel', hostEl);
+        if (panel) {
+          panel.innerHTML = '<div class="batch-head"><h2>批量运行</h2></div><div id="batchError"></div>';
+          renderError($('#batchError', panel), err, function () { render(); }, '无法读取批次状态');
+        }
       });
-    };
-    load();
-    var refreshBtn = $('[data-act="history-refresh"]', host);
-    if (refreshBtn) refreshBtn.addEventListener('click', load);
+    }
 
-    host.addEventListener('click', function (e) {
-      var t = e.target;
-      if (!t || !t.closest) return;
-      var rerunBtn = t.closest('[data-rerun]');
-      if (rerunBtn) {
-        e.preventDefault();
-        rerunRun(rerunBtn.getAttribute('data-rerun'), rerunBtn);
-        return;
-      }
-      var editBtn = t.closest('[data-edit-config]');
-      if (editBtn) {
-        e.preventDefault();
-        location.hash = '#/tasks/new?run=' + encodeURIComponent(editBtn.getAttribute('data-edit-config'));
-      }
-    }, ctx.signal ? { signal: ctx.signal } : false);
+    tick();
   }
 
   /* ================================================================== */
-  /* 10. 运行详情                                                        */
+  /* 项目内运行                                                          */
   /* ================================================================== */
-  var RUN_ID_RE = /^[0-9a-f]{6,32}$/;
+  function suiteRowHtml(suite) {
+    var tags = Array.isArray(suite.tags) ? suite.tags : [];
+    var envCount = suite.env && typeof suite.env === 'object' ? Object.keys(suite.env).length : 0;
+    return '<label class="suite-row">' +
+      '<input type="checkbox" name="suite" value="' + esc(suite.suite_id) + '" checked>' +
+      '<span class="suite-main"><span class="suite-name">' + esc(suite.name || suite.suite_id) + '</span>' +
+        '<span class="suite-scenario">' + esc(suite.scenario || '未配置场景') + '</span></span>' +
+      '<span class="suite-tags">' + tags.slice(0, 3).map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('') + '</span>' +
+      '<span class="suite-env">' + (envCount ? ('env ' + envCount + ' 项') : '') + '</span>' +
+    '</label>';
+  }
+
+  function renderRun(host, ctx, pid, query) {
+    var batchId = query && query.batch ? String(query.batch) : '';
+    host.innerHTML = loadingHtml('正在读取项目套件…');
+    return getProject(pid).then(function (project) {
+      if (!ctx.alive()) return;
+      var suites = Array.isArray(project.suites) ? project.suites : [];
+      var env = project.env && typeof project.env === 'object' ? project.env : {};
+      var envEntries = Object.keys(env).sort().map(function (key) {
+        var val = env[key];
+        return {
+          key: key,
+          value: '',
+          existing: false,
+          placeholder: val === '***' ? '***（沿用）' : ('当前：' + stringifyMaybe(val))
+        };
+      });
+
+      host.innerHTML = pageHead(project.name + ' · 运行',
+        '只运行当前项目的套件；不会出现跨项目混跑。批量串行执行，单个套件失败不影响其余。',
+        '<a class="btn" href="#/p/' + enc(pid) + '/history">运行历史</a>' +
+        '<a class="btn btn-ghost" href="#/p/' + enc(pid) + '/settings">管理套件</a>') +
+        '<div id="runBatchHost">' + (batchId ? '' : '') + '</div>' +
+        (suites.length
+          ? '<form id="runForm" class="stack">' +
+              '<section class="panel">' +
+                '<div class="panel-head"><h2>选择套件</h2>' +
+                  '<span class="hint" id="suiteCount">已选 ' + suites.length + ' / ' + suites.length + '</span>' +
+                  '<span class="row-end"></span>' +
+                  '<button type="button" class="btn btn-sm" data-suite-all>全选</button>' +
+                  '<button type="button" class="btn btn-sm" data-suite-none>清空</button>' +
+                '</div>' +
+                '<div class="suite-list" id="suiteList">' + suites.map(suiteRowHtml).join('') + '</div>' +
+                '<div class="panel-foot"><button type="submit" class="btn btn-primary" id="runSubmit">▶ 运行所选套件</button>' +
+                  '<span class="hint">按顺序串行执行；结果会汇总成一个批次。</span></div>' +
+              '</section>' +
+              '<section class="panel">' +
+                '<div class="panel-head"><h2>本次环境变量覆盖</h2><span class="hint">留空沿用项目默认 / 套件默认；密钥显示为 ***</span></div>' +
+                envEditorBlock({
+                  entries: envEntries,
+                  note: '优先级：套件 env > 项目 env > 本次填写；同名变量以项目/套件默认值为准。要改默认值请到「设置」。'
+                }) +
+              '</section>' +
+            '</form>'
+          : '<div class="empty hero-empty">' +
+              '<div class="empty-mark" aria-hidden="true">⚙</div>' +
+              '<strong>这个项目还没有套件</strong>' +
+              '<p>先绑定一个场景文件（scenarios/...），之后才能运行。</p>' +
+              '<div class="actions"><a class="btn btn-primary" href="#/p/' + enc(pid) + '/settings">去设置绑定套件</a></div>' +
+            '</div>');
+
+      if (batchId) {
+        mountBatchPanel($('#runBatchHost', host), batchId, pid, {
+          onDone: function () {
+            loadProjects(true).catch(function () {});
+            getProject(pid, true).catch(function () {});
+          },
+          signal: ctx.signal
+        });
+      }
+
+      var form = $('#runForm', host);
+      if (!form) return;
+      var envEditor = mountEnvEditor($('[data-env-editor]', form), envEntries, { placeholder: '值' });
+      var list = $('#suiteList', form);
+      var countEl = $('#suiteCount', form);
+      var submit = $('#runSubmit', form);
+
+      function selected() {
+        return $$('input[name="suite"]:checked', form).map(function (el) { return el.value; });
+      }
+      function updateCount() {
+        var n = selected().length;
+        if (countEl) countEl.textContent = '已选 ' + n + ' / ' + suites.length;
+        if (submit) submit.textContent = '▶ 运行 ' + n + ' 个套件';
+      }
+      list.addEventListener('change', updateCount);
+      var allBtn = $('[data-suite-all]', form);
+      var noneBtn = $('[data-suite-none]', form);
+      if (allBtn) allBtn.addEventListener('click', function () {
+        $$('input[name="suite"]', form).forEach(function (el) { el.checked = true; });
+        updateCount();
+      });
+      if (noneBtn) noneBtn.addEventListener('click', function () {
+        $$('input[name="suite"]', form).forEach(function (el) { el.checked = false; });
+        updateCount();
+      });
+      updateCount();
+
+      form.addEventListener('submit', function (e) {
+        e.preventDefault();
+        var ids = selected();
+        if (!ids.length) { toast('至少选择一个套件', 'error'); return; }
+        if (submit) { submit.disabled = true; submit.innerHTML = '<span class="spinner" aria-hidden="true"></span>提交中…'; }
+        startBatch(pid, ids, envEditor.collect({ existing: false })).then(function (res) {
+          var bid = res && res.batch_id;
+          if (!bid) throw new ApiError('服务端没有返回 batch_id', 500, 'bad_payload');
+          go('#/p/' + enc(pid) + '/run?batch=' + enc(bid));
+          toast('已提交 ' + ids.length + ' 个套件', 'ok');
+        }).catch(function (err) {
+          if (submit) { submit.disabled = false; submit.textContent = '▶ 运行 ' + ids.length + ' 个套件'; }
+          toast('提交失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+        });
+      });
+    });
+  }
+
+  /* ================================================================== */
+  /* 项目内历史                                                          */
+  /* ================================================================== */
+  function pageNumber(value) {
+    var n = parseInt(value, 10);
+    return (isFinite(n) && n > 0) ? n : 1;
+  }
+
+  function historyHash(pid, state) {
+    var qs = [];
+    if (state.suite) qs.push('suite=' + enc(state.suite));
+    if (state.status && state.status !== 'all') qs.push('status=' + enc(state.status));
+    if (state.page > 1) qs.push('page=' + enc(state.page));
+    return '#/p/' + enc(pid) + '/history' + (qs.length ? '?' + qs.join('&') : '');
+  }
+
+  function historyRowHref(pid, item) {
+    return '#/p/' + enc(pid) + '/runs/' + enc(item.run_id || '');
+  }
+
+  function historyColumns(project, pid) {
+    return [
+      {
+        label: '套件',
+        render: function (item) {
+          return '<span class="cell-main">' + esc(runSuiteName(project, item)) + '</span>' +
+            '<div class="cell-sub mono">' + esc(item.run_id || '') + '</div>';
+        }
+      },
+      {
+        label: '状态',
+        render: function (item) { return badge(runOutcome(item).status); }
+      },
+      {
+        label: '通过',
+        cls: 'num',
+        render: function (item) {
+          var c = runCounts(item);
+          var o = runOutcome(item);
+          if (!c.total && o.total) c = { passed: o.passed, total: o.total };
+          return c.total ? esc(c.passed + '/' + c.total) : '—';
+        }
+      },
+      {
+        label: '耗时',
+        cls: 'num',
+        render: function (item) { return esc(fmtDur(item.duration_ms)); }
+      },
+      {
+        label: '开始时间',
+        render: function (item) {
+          var at = item.started_at || item.finished_at;
+          return '<span class="nowrap">' + esc(fmtTs(at)) + '</span>' +
+            '<div class="cell-sub">' + esc(at ? fmtRel(at) : '') + '</div>';
+        }
+      }
+    ];
+  }
+
+  function renderHistory(host, ctx, pid, query) {
+    host.innerHTML = loadingHtml('正在读取运行历史…');
+    return getProject(pid).then(function (project) {
+      if (!ctx.alive()) return;
+      var state = {
+        suite: query.suite || '',
+        status: query.status || 'all',
+        page: pageNumber(query.page)
+      };
+      if (['all', 'passed', 'failed', 'errored', 'done'].indexOf(state.status) < 0) state.status = 'all';
+      if (state.suite && !SID_RE.test(state.suite)) state.suite = '';
+      var suites = Array.isArray(project.suites) ? project.suites : [];
+      var suiteOptions = suites.map(function (s) {
+        return '<option value="' + esc(s.suite_id) + '"' + (s.suite_id === state.suite ? ' selected' : '') + '>' +
+          esc(s.name || s.suite_id) + '</option>';
+      }).join('');
+      if (state.suite && !findSuite(project, state.suite)) {
+        suiteOptions += '<option value="' + esc(state.suite) + '" selected>' + esc(state.suite) + '</option>';
+      }
+
+      host.innerHTML = pageHead(project.name + ' · 历史',
+        '筛选条件写进 URL，刷新不丢。批量运行只包含当前项目。',
+        '<button type="button" class="btn btn-primary" data-act="run-all" data-pid="' + esc(pid) + '">▶ 跑全部套件</button>' +
+        '<a class="btn" href="#/p/' + enc(pid) + '/run">选择套件运行</a>') +
+        '<div class="filter-bar">' +
+          '<div class="field"><label for="hSuite">套件</label><select class="select" id="hSuite">' +
+            '<option value="">全部套件</option>' + suiteOptions + '</select></div>' +
+          '<div class="field"><label for="hStatus">状态</label><select class="select" id="hStatus">' +
+            ['all=全部状态', 'passed=通过', 'failed=失败', 'errored=异常', 'done=已完成'].map(function (pair) {
+              var parts = pair.split('=');
+              return '<option value="' + parts[0] + '"' + (state.status === parts[0] ? ' selected' : '') + '>' + parts[1] + '</option>';
+            }).join('') + '</select></div>' +
+          '<div class="toolbar-spacer"></div>' +
+          '<button type="button" class="btn btn-sm" id="hReload">刷新</button>' +
+          '<button type="button" class="btn btn-sm btn-ghost" id="hClear">清除筛选</button>' +
+        '</div>' +
+        '<div id="historyBody">' + loadingHtml('正在读取运行历史…') + '</div>' +
+        '<div id="historyPager" class="pagination"></div>';
+
+      var body = $('#historyBody', host);
+      var pager = $('#historyPager', host);
+      var reloads = 0;
+      var reqSeq = 0;
+
+      function syncUrl() {
+        var hash = historyHash(pid, state);
+        try { history.replaceState(null, '', hash); } catch (e) { /* noop */ }
+      }
+
+      function load() {
+        var mySeq = ++reqSeq;
+        syncUrl();
+        body.innerHTML = loadingHtml('正在读取运行历史…');
+        var qs = ['project=' + enc(pid), 'offset=' + ((state.page - 1) * PAGE_SIZE), 'limit=' + PAGE_SIZE];
+        if (state.suite) qs.push('suite=' + enc(state.suite));
+        if (state.status && state.status !== 'all') qs.push('status=' + enc(state.status));
+        apiGet(API + 'runs/query?' + qs.join('&')).then(function (payload) {
+          if (!ctx.alive() || mySeq !== reqSeq) return;
+          var items = payload && Array.isArray(payload.items) ? payload.items : [];
+          var total = payload && typeof payload.total === 'number' ? payload.total : items.length;
+          if (total > 0 && items.length === 0 && state.page > 1 && reloads < 1) {
+            // 页码越界（例如筛选变化后），回到最后一页且只纠正一次
+            reloads++;
+            state.page = Math.max(1, Math.ceil(total / PAGE_SIZE));
+            load();
+            return;
+          }
+          reloads = 0;
+          if (!items.length) {
+            if (state.suite || (state.status && state.status !== 'all')) {
+              body.innerHTML = emptyHtml('这个筛选条件没有运行',
+                '换个套件或状态，或者清除筛选查看全部。',
+                '<button type="button" class="btn btn-sm" id="hEmptyClear">清除筛选</button>');
+              var clearBtn = $('#hEmptyClear', body);
+              if (clearBtn) clearBtn.addEventListener('click', clearFilters);
+            } else {
+              body.innerHTML = emptyHtml('这个项目还没有运行记录',
+                '绑定套件后跑一次，历史会按时间倒序出现在这里。',
+                '<a class="btn btn-primary" href="#/p/' + enc(pid) + '/run">去运行</a>');
+            }
+            pager.innerHTML = '<span class="page-info">共 0 条</span>';
+            return;
+          }
+          body.innerHTML = dataTable(historyColumns(project, pid), items, { rowHref: function (item) { return historyRowHref(pid, item); } });
+          var pages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+          pager.innerHTML = '<span class="page-info">第 ' + state.page + ' / ' + pages + ' 页 · 共 ' + total + ' 条</span>' +
+            '<button type="button" class="page-btn" id="hPrev"' + (state.page <= 1 ? ' disabled' : '') + '>上一页</button>' +
+            '<button type="button" class="page-btn" id="hNext"' + (state.page >= pages ? ' disabled' : '') + '>下一页</button>';
+          var prev = $('#hPrev', pager);
+          var next = $('#hNext', pager);
+          if (prev) prev.addEventListener('click', function () {
+            if (state.page > 1) { state.page--; load(); }
+          });
+          if (next) next.addEventListener('click', function () {
+            if (state.page < pages) { state.page++; load(); }
+          });
+        }).catch(function (err) {
+          if (!ctx.alive() || mySeq !== reqSeq) return;
+          body.innerHTML = '<div id="historyError"></div>';
+          renderError($('#historyError', body), err, load, '无法读取运行历史');
+          pager.innerHTML = '';
+        });
+      }
+
+      function clearFilters() {
+        state.suite = '';
+        state.status = 'all';
+        state.page = 1;
+        var s = $('#hSuite', host);
+        var st = $('#hStatus', host);
+        if (s) s.value = '';
+        if (st) st.value = 'all';
+        load();
+      }
+
+      var selSuite = $('#hSuite', host);
+      var selStatus = $('#hStatus', host);
+      if (selSuite) selSuite.addEventListener('change', function () {
+        state.suite = selSuite.value;
+        state.page = 1;
+        load();
+      });
+      if (selStatus) selStatus.addEventListener('change', function () {
+        state.status = selStatus.value;
+        state.page = 1;
+        load();
+      });
+      var reload = $('#hReload', host);
+      if (reload) reload.addEventListener('click', load);
+      var clear = $('#hClear', host);
+      if (clear) clear.addEventListener('click', clearFilters);
+
+      load();
+    });
+  }
+
+  /* ================================================================== */
+  /* 运行详情：失败证据 / 用例 / 步骤                                     */
+  /* ================================================================== */
+  function valOrMissing(value) {
+    if (value === undefined || value === null || value === '') {
+      return '<span class="missing">未提供</span>';
+    }
+    if (typeof value === 'object') {
+      return '<pre class="json-block">' + esc(JSON.stringify(value, null, 2)) + '</pre>';
+    }
+    return esc(String(value));
+  }
 
   function healEventsHtml(events, title) {
-    if (!Array.isArray(events) || events.length === 0) return '';
-    var items = events.map(function (ev) {
-      var okBadge = ev.success
-        ? '<span class="badge ok"><span class="glyph" aria-hidden="true">✓</span>自愈成功</span>'
-        : '<span class="badge bad"><span class="glyph" aria-hidden="true">✕</span>未修复</span>';
-      return '<div class="heal-item">' +
-        '<div class="heal-line">' +
-          '<span class="mono">' + esc(ev.step_id || '未提供') + '</span>' +
-          '<span class="chip">' + esc(ev.kind || 'unknown') + '</span>' +
-          '<span class="chip">' + esc(ev.action || 'unknown') + '</span>' +
-          okBadge +
-        '</div>' +
-        '<div class="heal-reason">' + esc(ev.reason || '未提供原因') + '</div>' +
-        (ev.suggestion ? '<div class="heal-suggest">建议：' + esc(ev.suggestion) + '</div>' : '') +
-      '</div>';
-    }).join('');
-    return '<div class="heal-block"><div class="hb-title">' + esc(title || '自愈事件') + '（' + events.length + '）</div>' + items + '</div>';
+    if (!Array.isArray(events) || !events.length) return '';
+    return '<div class="heal-block"><div class="hb-title">' + esc(title || '自愈事件') + '（' + events.length + '）</div>' +
+      events.map(function (ev) {
+        return '<div class="heal-item">' +
+          '<div class="heal-line"><span class="mono">' + esc(ev.step_id || '未提供') + '</span>' +
+            '<span class="chip">' + esc(ev.kind || 'unknown') + '</span>' +
+            '<span class="chip">' + esc(ev.action || 'unknown') + '</span>' +
+            (ev.success ? badge('passed') : badge('failed')) +
+          '</div>' +
+          '<div class="heal-reason">' + esc(ev.reason || '未提供原因') + '</div>' +
+          (ev.suggestion ? '<div class="heal-suggest">建议：' + esc(ev.suggestion) + '</div>' : '') +
+        '</div>';
+      }).join('') + '</div>';
   }
 
   function stepDetailHtml(step) {
@@ -1279,78 +2100,67 @@
     var failed = step.status === 'failed' || step.status === 'error';
     var msg = hasVal(step.message) ? step.message : err.message;
     var parts = [];
-
     if (failed) {
-      parts.push('' +
-        '<div class="failure-block">' +
-          '<div class="fb-title"><span aria-hidden="true">✕</span>失败原因' +
-            '<button type="button" class="btn btn-sm fb-fix" data-fix-run="1">按此配置修正并重跑</button>' +
-          '</div>' +
-          '<dl class="kv-grid">' +
-            '<dt>原因</dt><dd>' + valOrMissing(msg) + '</dd>' +
-            '<dt>期望</dt><dd>' + valOrMissing(err.expected) + '</dd>' +
-            '<dt>实际</dt><dd>' + valOrMissing(err.actual) + '</dd>' +
-            '<dt>断言路径</dt><dd class="mono">' + valOrMissing(err.path) + '</dd>' +
-            '<dt>错误类型</dt><dd class="mono">' + esc(err.type || err.kind || '未提供') + '</dd>' +
-          '</dl>' +
-        '</div>');
+      parts.push('<div class="failure-block">' +
+        '<div class="fb-title"><span aria-hidden="true">✕</span>失败原因' +
+          '<button type="button" class="btn btn-sm fb-fix" data-fix-run="1">按此配置修正并重跑</button>' +
+        '</div>' +
+        '<dl class="kv-grid">' +
+          '<dt>原因</dt><dd>' + valOrMissing(msg) + '</dd>' +
+          '<dt>期望</dt><dd>' + valOrMissing(err.expected) + '</dd>' +
+          '<dt>实际</dt><dd>' + valOrMissing(err.actual) + '</dd>' +
+          '<dt>断言路径</dt><dd class="mono">' + valOrMissing(err.path) + '</dd>' +
+          '<dt>错误类型</dt><dd class="mono">' + esc(err.type || err.kind || '未提供') + '</dd>' +
+        '</dl></div>');
     }
-
     if (step.skipped_reason) {
       parts.push('<dl class="kv-grid"><dt>跳过原因</dt><dd>' + valOrMissing(step.skipped_reason) + '</dd></dl>');
     }
-
-    if (step.heal && step.heal.length) {
-      parts.push(healEventsHtml(step.heal, '步骤自愈事件'));
-    }
-
+    if (step.heal && step.heal.length) parts.push(healEventsHtml(step.heal, '步骤自愈事件'));
     var inputKeys = step.inputs && typeof step.inputs === 'object' ? Object.keys(step.inputs).length : 0;
     var outputKeys = step.outputs && typeof step.outputs === 'object' ? Object.keys(step.outputs).length : 0;
     parts.push('<details class="raw"><summary>输入参数（' + inputKeys + ' 个键）</summary>' +
       '<pre class="json-block">' + esc(prettyJson(step.inputs || {})) + '</pre></details>');
     parts.push('<details class="raw"><summary>输出（' + outputKeys + ' 个键）</summary>' +
       '<pre class="json-block">' + esc(prettyJson(step.outputs || {})) + '</pre></details>');
-
-    return '<div class="step-detail ' + (failed ? 'fail' : '') + '">' + parts.join('') + '</div>';
+    return parts.join('');
   }
 
-  function stepsTableHtml(caseObj) {
-    var steps = caseObj.steps || [];
-    if (!steps.length) {
-      return '<div class="empty" style="margin:12px 14px"><strong>该用例没有步骤记录</strong><span>report.cases[].steps 为空。</span></div>';
-    }
-    var rows = steps.map(function (step, idx) {
-      var dur = typeof step.duration_ms === 'number' ? fmtMs(step.duration_ms) : '—';
-      var attempts = typeof step.attempts === 'number' ? step.attempts : 1;
-      var retries = typeof step.retries === 'number' ? step.retries : 0;
-      var attemptText = String(attempts) + (retries > 0 ? '（重试 ' + retries + '）' : '');
-      // 失败/异常步骤默认展开：失败证据（message/expected/actual）不该再点一次才能看到
-      var open = step.status === 'failed' || step.status === 'error';
-      return '' +
-        '<tr class="is-clickable" data-step="' + idx + '" tabindex="0">' +
-          '<td class="mono">' + esc(step.step_id || '—') + '</td>' +
-          '<td class="mono">' + esc(step.atom || '—') + '</td>' +
-          '<td>' + badge(step.status) + '</td>' +
-          '<td class="num">' + esc(dur) + '</td>' +
-          '<td class="num">' + esc(attemptText) + '</td>' +
-          '<td class="tight"><button type="button" class="btn btn-icon" data-step-toggle aria-expanded="' + (open ? 'true' : 'false') + '">' +
-            (open ? '收起 ▾' : '明细 ▸') + '</button></td>' +
-        '</tr>' +
-        '<tr class="step-detail-row"' + (open ? '' : ' hidden') + '><td colspan="6">' + stepDetailHtml(step) + '</td></tr>';
-    }).join('');
+  function stepHtml(step, idx) {
+    step = step || {};
+    var failed = step.status === 'failed' || step.status === 'error';
+    var open = failed;
+    var dur = typeof step.duration_ms === 'number' ? fmtMs(step.duration_ms) : '—';
+    var attempts = typeof step.attempts === 'number' ? step.attempts : 1;
+    var retries = typeof step.retries === 'number' ? step.retries : 0;
+    return '<div class="step" data-step="' + idx + '" data-open="' + (open ? 'true' : 'false') + '">' +
+      '<div class="step-head">' +
+        '<span class="step-id">' + esc(step.step_id || ('步骤 ' + (idx + 1))) + '</span>' +
+        '<span class="step-atom">' + esc(step.atom || '—') + '</span>' +
+        badge(step.status) +
+        '<span class="step-meta"><span>' + esc(dur) + '</span><span>尝试 ' + esc(String(attempts)) +
+          (retries > 0 ? '（重试 ' + esc(String(retries)) + '）' : '') + '</span></span>' +
+        '<button type="button" class="btn btn-sm" data-step-toggle aria-expanded="' + (open ? 'true' : 'false') + '">' +
+          (open ? '收起 ▾' : '明细 ▸') + '</button>' +
+      '</div>' +
+      '<div class="step-body">' + stepDetailHtml(step) + '</div>' +
+    '</div>';
+  }
 
-    return '<div class="table-wrap" style="border:0;border-radius:0">' +
-      '<table class="data"><thead><tr>' +
-        '<th>步骤</th><th>原子</th><th>状态</th><th class="num">耗时</th><th class="num">尝试</th><th></th>' +
-      '</tr></thead><tbody>' + rows + '</tbody></table></div>';
+  function stepsHtml(caseObj) {
+    var steps = Array.isArray(caseObj.steps) ? caseObj.steps : [];
+    if (!steps.length) {
+      return '<div class="empty" style="padding:16px"><strong>该用例没有步骤记录</strong><span>report.cases[].steps 为空。</span></div>';
+    }
+    return '<div class="step-list">' + steps.map(stepHtml).join('') + '</div>';
   }
 
   function caseCardHtml(caseObj, idx) {
-    var steps = caseObj.steps || [];
-    var healEvents = caseObj.heal_events || [];
-    var hasFailure = caseObj.status === 'failed' || caseObj.status === 'error';
-    var open = hasFailure ? 'true' : 'false';
-
+    caseObj = caseObj || {};
+    var steps = Array.isArray(caseObj.steps) ? caseObj.steps : [];
+    var heal = Array.isArray(caseObj.heal_events) ? caseObj.heal_events : [];
+    var failed = caseObj.status === 'failed' || caseObj.status === 'error';
+    var open = failed;
     var errorBlock = '';
     if (caseObj.error) {
       var ce = caseObj.error;
@@ -1361,52 +2171,58 @@
           '<dt>类型</dt><dd class="mono">' + esc(ce.type || ce.kind || '未提供') + '</dd>' +
         '</dl></div>';
     }
-
-    return '' +
-      '<article class="case-card" data-open="' + open + '">' +
-        '<button type="button" class="case-head" aria-expanded="' + open + '" aria-controls="case-body-' + idx + '">' +
-          '<span class="caret" aria-hidden="true">' + (open === 'true' ? '▾' : '▸') + '</span>' +
-          badge(caseObj.status) +
-          '<span class="case-name">' + esc(caseObj.name || '(未命名用例)') + '</span>' +
-          '<span class="case-id">' + esc(caseObj.case_id || '') + '</span>' +
-          '<span class="case-meta">' +
-            '<span>' + steps.length + ' 步</span>' +
-            '<span>' + esc(typeof caseObj.duration_ms === 'number' ? fmtMs(caseObj.duration_ms) : '—') + '</span>' +
-            (healEvents.length ? '<span class="badge heal">自愈 ' + healEvents.length + ' 次</span>' : '') +
-          '</span>' +
-        '</button>' +
-        '<div class="case-body" id="case-body-' + idx + '">' +
-          errorBlock +
-          stepsTableHtml(caseObj) +
-          healEventsHtml(healEvents, '用例自愈事件') +
-        '</div>' +
-      '</article>';
+    return '<article class="case-card" data-open="' + (open ? 'true' : 'false') + '">' +
+      '<button type="button" class="case-head" aria-expanded="' + (open ? 'true' : 'false') + '">' +
+        '<span class="caret" aria-hidden="true">' + (open ? '▾' : '▸') + '</span>' +
+        badge(caseObj.status) +
+        '<span class="case-name">' + esc(caseObj.name || '(未命名用例)') + '</span>' +
+        '<span class="case-id">' + esc(caseObj.case_id || '') + '</span>' +
+        '<span class="case-meta"><span>' + steps.length + ' 步</span>' +
+          '<span>' + esc(typeof caseObj.duration_ms === 'number' ? fmtMs(caseObj.duration_ms) : '—') + '</span>' +
+          (heal.length ? '<span class="badge heal">自愈 ' + heal.length + ' 次</span>' : '') +
+        '</span>' +
+      '</button>' +
+      '<div class="case-body">' + errorBlock + stepsHtml(caseObj) + healEventsHtml(heal, '用例自愈事件') + '</div>' +
+    '</article>';
   }
 
-  function planPanelHtml(report) {
-    var plan = report.plan || {};
-    var warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
-    var rows = '' +
-      '<div class="plan-row">' +
-        '<span>计划来源</span><b class="mono">' + esc(plan.source || '未提供') + '</b>' +
-        '<span>规划器</span><b class="mono">' + esc(plan.planner || '未提供') + '</b>' +
-        '<span>用例</span><b class="mono">' + esc(String(plan.case_count !== undefined ? plan.case_count : '—')) + '</b>' +
-        '<span>步骤</span><b class="mono">' + esc(String(plan.step_count !== undefined ? plan.step_count : '—')) + '</b>' +
-      '</div>' +
-      (plan.intent ? '<div class="plan-row"><span>意图</span><b>' + esc(plan.intent) + '</b></div>' : '');
+  function toggleCase(headBtn) {
+    var card = headBtn.closest('.case-card');
+    if (!card) return;
+    var open = card.getAttribute('data-open') === 'true';
+    card.setAttribute('data-open', open ? 'false' : 'true');
+    headBtn.setAttribute('aria-expanded', open ? 'false' : 'true');
+    var caret = headBtn.querySelector('.caret');
+    if (caret) caret.textContent = open ? '▸' : '▾';
+  }
 
-    var envKeys = plan.env && typeof plan.env === 'object' ? Object.keys(plan.env) : [];
-    var envHtml = envKeys.length
-      ? '<details class="raw"><summary>运行环境变量（' + envKeys.length + ' 个）</summary><pre class="json-block">' +
-        esc(prettyJson(plan.env)) + '</pre></details>'
-      : '';
+  function toggleStep(stepEl) {
+    if (!stepEl) return;
+    var open = stepEl.getAttribute('data-open') === 'true';
+    stepEl.setAttribute('data-open', open ? 'false' : 'true');
+    var btn = stepEl.querySelector('[data-step-toggle]');
+    if (btn) {
+      btn.setAttribute('aria-expanded', open ? 'false' : 'true');
+      btn.textContent = open ? '明细 ▸' : '收起 ▾';
+    }
+  }
 
-    var warnHtml = warnings.length
-      ? '<details class="raw"><summary>计划告警（' + warnings.length + ' 条）</summary><ul class="warn-list">' +
-        warnings.map(function (w) { return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></details>'
-      : '';
-
-    return '<div class="panel plan-panel">' + rows + envHtml + warnHtml + '</div>';
+  function bindCaseInteractions(host, signal) {
+    var opts = signal ? { signal: signal } : false;
+    host.addEventListener('click', function (e) {
+      var head = e.target.closest ? e.target.closest('.case-head') : null;
+      if (head) { toggleCase(head); return; }
+      var btn = e.target.closest ? e.target.closest('[data-step-toggle]') : null;
+      if (btn) { toggleStep(btn.closest('.step')); return; }
+      var stepHead = e.target.closest ? e.target.closest('.step-head') : null;
+      if (stepHead) { toggleStep(stepHead.closest('.step')); }
+    }, opts);
+    host.addEventListener('keydown', function (e) {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      if (e.target.closest && e.target.closest('button, a')) return;
+      var stepEl = e.target.closest ? e.target.closest('.step-head') : null;
+      if (stepEl) { e.preventDefault(); toggleStep(stepEl.closest('.step')); }
+    }, opts);
   }
 
   function firstFailure(report) {
@@ -1449,35 +2265,179 @@
     return null;
   }
 
-  /* 运行详情的失败修正入口：放在页头下方，先看错误再决定改什么 */
-  function fixRunPanelHtml(report, id) {
+  function failureRowsHtml(f) {
+    if (!f) return '<dt>错误</dt><dd>用例失败（报告未提供 message）</dd>';
+    return '<dt>用例</dt><dd>' + valOrMissing(f.case) + '</dd>' +
+      (f.step ? '<dt>步骤</dt><dd>' + valOrMissing(f.step) + '</dd>' : '') +
+      '<dt>原因</dt><dd>' + valOrMissing(f.message) + '</dd>' +
+      '<dt>期望</dt><dd>' + valOrMissing(f.expected) + '</dd>' +
+      '<dt>实际</dt><dd>' + valOrMissing(f.actual) + '</dd>';
+  }
+
+  function fixRunPanelHtml(report) {
     var f = firstFailure(report);
     if (!f) return '';
-    var rows = fixErrorRows(f);
-    return '<div class="fix-panel fix-panel-top" role="region" aria-label="失败修正入口">' +
+    return '<div class="fix-panel" role="region" aria-label="失败修正入口">' +
       '<div class="fix-panel-main">' +
         '<div class="fix-kicker">这次运行没有通过</div>' +
         '<h2>先看错误，再按这套配置改完重跑</h2>' +
-        '<dl class="kv-grid compact">' + (rows || '<dt>错误</dt><dd>用例失败（报告未提供 message）</dd>') + '</dl>' +
+        '<dl class="kv-grid compact">' + failureRowsHtml(f) + '</dl>' +
       '</div>' +
       '<div class="fix-panel-actions">' +
-        '<button type="button" class="btn btn-primary" data-fix-run="' + esc(id) + '">按此配置修正并重跑</button>' +
-        '<span class="fix-panel-note">预填同一套配置，可改 env / 意图后另存为新任务。</span>' +
+        '<button type="button" class="btn btn-primary" data-fix-run="1">按此配置修正并重跑</button>' +
+        '<span class="fix-panel-note">保留同一次运行的配置；可改环境变量后重跑。</span>' +
       '</div>' +
     '</div>';
   }
 
+  function planPanelHtml(report) {
+    var plan = (report && report.plan) || {};
+    var warnings = Array.isArray(plan.warnings) ? plan.warnings : [];
+    var rows = '<div class="plan-row">' +
+      '<span>计划来源</span><b class="mono">' + esc(plan.source || '未提供') + '</b>' +
+      '<span>规划器</span><b class="mono">' + esc(plan.planner || '未提供') + '</b>' +
+      '<span>用例</span><b class="mono">' + esc(String(plan.case_count === undefined ? '—' : plan.case_count)) + '</b>' +
+      '<span>步骤</span><b class="mono">' + esc(String(plan.step_count === undefined ? '—' : plan.step_count)) + '</b>' +
+    '</div>' +
+    (plan.intent ? '<div class="plan-row"><span>意图</span><b>' + esc(plan.intent) + '</b></div>' : '');
+    var envKeys = plan.env && typeof plan.env === 'object' ? Object.keys(plan.env) : [];
+    var envHtml = envKeys.length
+      ? '<details class="raw"><summary>运行环境变量（' + envKeys.length + ' 个）</summary><pre class="json-block">' +
+        esc(prettyJson(plan.env)) + '</pre></details>'
+      : '';
+    var warnHtml = warnings.length
+      ? '<details class="raw"><summary>计划告警（' + warnings.length + ' 条）</summary><ul class="warn-list">' +
+        warnings.map(function (w) { return '<li>' + esc(w) + '</li>'; }).join('') + '</ul></details>'
+      : '';
+    return '<div class="panel plan-panel">' + rows + envHtml + warnHtml + '</div>';
+  }
+
+  function stripCell(label, value) {
+    var v = (value === undefined || value === null) ? 0 : value;
+    return '<div class="cell"><dt>' + esc(label) + '</dt><dd>' + esc(String(v)) + '</dd></div>';
+  }
+
+  function detailHtml(data, id, pid, legacy) {
+    var report = data.report || {};
+    var summary = report.summary || {};
+    var conclusion = report.conclusion || {};
+    var cases = Array.isArray(report.cases) ? report.cases : [];
+    var plan = report.plan || {};
+    var meta = report.meta || {};
+    var verdict = conclusion.verdict || (summary.success ? '通过' : '存在失败');
+    var verdictOk = conclusion.success === true;
+    var projectId = meta.project_id || '';
+    var suiteId = meta.suite_id || '';
+    var project = projectId ? APP.projectCache[projectId] : (pid ? APP.projectCache[pid] : null);
+    var backHref = pid ? ('#/p/' + enc(pid) + '/history') : '#/projects';
+    var backLabel = pid ? '返回历史' : '返回项目';
+
+    var projectNotice = '';
+    if (legacy) {
+      projectNotice = '<div class="notice"><span aria-hidden="true">ⓘ</span><div>这是一次未归类运行（没有项目归属），只读展示。' +
+        (projectId ? '归属项目 <a href="#/p/' + enc(projectId) + '/runs/' + enc(id) + '">' + esc(project && project.name ? project.name : projectId) + '</a>。' : '') +
+        '</div></div>';
+    } else if (projectId && projectId !== pid) {
+      projectNotice = '<div class="notice"><span aria-hidden="true">ⓘ</span><div>该运行归属项目 <a href="#/p/' + enc(projectId) + '/runs/' + enc(id) + '">' +
+        esc(project && project.name ? project.name : projectId) + '</a>，与当前地址中的项目不同。</div></div>';
+    }
+
+    var header = '<div class="detail-head">' +
+      '<div class="detail-head-main">' +
+        '<div class="title-line">' +
+          '<h1>run ' + esc(id) + '</h1>' +
+          '<span class="badge ' + (verdictOk ? 'ok' : 'bad') + '">' +
+            '<span class="glyph" aria-hidden="true">' + (verdictOk ? '✓' : '✕') + '</span>' + esc(verdict) + '</span>' +
+          (summary.healed_cases ? '<span class="badge heal">自愈 ' + esc(String(summary.healed_cases)) + ' 个用例</span>' : '') +
+        '</div>' +
+        '<div class="detail-meta">' +
+          '<span>开始 <b>' + esc(fmtTs(report.started_at)) + '</b></span>' +
+          '<span>结束 <b>' + esc(fmtTs(report.finished_at)) + '</b></span>' +
+          '<span>耗时 <b>' + esc(fmtMs(report.duration_ms)) + '</b></span>' +
+          '<span>计划来源 <b class="mono">' + esc(plan.source || '未提供') + '</b></span>' +
+          '<span>规划器 <b class="mono">' + esc(plan.planner || '未提供') + '</b></span>' +
+          (projectId ? '<span>项目 <b>' + esc(project && project.name ? project.name : projectId) + '</b></span>' : '<span>项目 <b>未归类</b></span>') +
+          (suiteId ? '<span>套件 <b>' + esc(suiteLabel(project, suiteId)) + '</b></span>' : '') +
+        '</div>' +
+      '</div>' +
+      '<div class="detail-actions">' +
+        '<a class="btn btn-sm" href="' + API + 'runs/' + enc(id) + '/junit.xml" download="panguverse-' + esc(id) + '.xml">下载 JUnit</a>' +
+        '<a class="btn btn-sm" href="' + API + 'runs/' + enc(id) + '/report.html" target="_blank" rel="noopener">打开 HTML 报告</a>' +
+        '<a class="btn btn-sm btn-ghost" href="' + backHref + '">' + esc(backLabel) + '</a>' +
+      '</div>' +
+    '</div>';
+
+    var strip = '<dl class="summary-strip">' +
+      stripCell('用例', summary.total) +
+      stripCell('通过', summary.passed) +
+      stripCell('失败', summary.failed) +
+      stripCell('异常', summary.errored) +
+      stripCell('跳过', summary.skipped) +
+      stripCell('自愈用例', summary.healed_cases) +
+      stripCell('步骤', summary.steps) +
+      stripCell('HTTP', summary.http_requests) +
+    '</dl>';
+
+    var caseHtml = cases.length
+      ? cases.map(caseCardHtml).join('')
+      : emptyHtml('该运行没有用例记录', 'report.json 中 cases 为空，请查看 HTML 报告或服务端日志。');
+
+    return projectNotice + header + strip + insightBlockHtml() + fixRunPanelHtml(report) +
+      '<section class="section"><div class="section-head"><h2>计划</h2><span class="hint">来自 report.plan</span></div>' +
+        (Object.keys(plan).length ? planPanelHtml(report) : emptyHtml('没有计划信息', 'report.plan 为空。')) +
+      '</section>' +
+      '<section class="section"><div class="section-head"><h2>用例</h2>' +
+        '<span class="hint">点击用例展开步骤；失败步骤默认展开，含 message / expected / actual</span></div>' +
+        '<div class="case-list">' + caseHtml + '</div>' +
+      '</section>';
+  }
+
+  function renderDetail(host, ctx, pid, rid, legacy) {
+    var id = rid || '';
+    if (!RUN_ID_RE.test(id)) {
+      host.innerHTML = pageHead('无法打开运行详情', 'run_id 不合法') +
+        errorHtml(new ApiError('run_id 不合法：只允许 6-32 位十六进制字符', 400, 'bad_request'), '无法打开运行详情');
+      return;
+    }
+    host.innerHTML = loadingHtml('正在读取运行 ' + id + '…');
+    return apiGet(API + 'runs/' + enc(id)).then(function (data) {
+      if (!ctx.alive()) return;
+      if (!data || typeof data !== 'object' || !data.report) {
+        throw new ApiError('响应缺少 report 字段', 500, 'bad_response');
+      }
+      var meta = data.report.meta || {};
+      if (meta.project_id && PID_RE.test(meta.project_id) && !APP.projectCache[meta.project_id]) {
+        getProject(meta.project_id).catch(function () {});
+      }
+      host.innerHTML = detailHtml(data, id, pid, legacy);
+      bindCaseInteractions(host, ctx.signal);
+      initInsight(host, ctx, id);
+      host.addEventListener('click', function (e) {
+        var btn = e.target.closest ? e.target.closest('[data-fix-run]') : null;
+        if (!btn) return;
+        e.preventDefault();
+        openRerunDialog(pid, id, data);
+      }, ctx.signal ? { signal: ctx.signal } : false);
+    }).catch(function (err) {
+      if (!ctx.alive()) return;
+      host.innerHTML = pageHead('run ' + id, '无法读取该运行',
+        '<a class="btn" href="' + (pid ? '#/p/' + enc(pid) + '/history' : '#/projects') + '">返回</a>') +
+        '<div id="detailError"></div>';
+      renderError($('#detailError', host), err, function () { render(); }, '无法读取运行详情');
+    });
+  }
+
   /* ================================================================== */
-  /* 10.5 AI 总结（LLM 可选 + 规则兜底）                                  */
+  /* AI 总结（LLM 可选 + 规则兜底；来源必须诚实标注）                      */
   /* ================================================================== */
   var INSIGHT_PRIORITY = {
-    P0: { label: '先修（阻断）', hint: '这些问题会让后续结果不可信' },
-    P1: { label: '重要', hint: '影响覆盖范围或稳定性' },
-    P2: { label: '改进', hint: '补强断言与可维护性' }
+    P0: { label: '先修（阻断）' },
+    P1: { label: '重要' },
+    P2: { label: '改进' }
   };
 
-  /* 最小 markdown 渲染：输入先 esc()，再用白名单标签拼接。
-   * 不解析链接/图片/内联 HTML，summary_md 里的标签只会作为文本显示。 */
+  /* 最小 markdown：输入先 esc()，再按白名单拼接标签。
+   * 不解析链接/图片/内联 HTML；summary_md 里的标签只作为文本显示。 */
   function insightInline(escaped) {
     var codes = [];
     var text = escaped.replace(/`([^`]+)`/g, function (_, code) {
@@ -1563,29 +2523,20 @@
         kind: 'llm',
         label: 'AI 模型总结' + (model ? '（' + model + '）' : '（模型未标注）'),
         title: 'AI 总结',
-        model: model
+        model: model,
+        glyph: '✦'
       };
     }
     if (p.source === 'rules') {
-      return {
-        kind: 'rules',
-        label: '离线规则总结',
-        title: '运行总结',
-        model: ''
-      };
+      return { kind: 'rules', label: '离线规则总结', title: '运行总结', model: '', glyph: '⚙' };
     }
-    return {
-      kind: 'unknown',
-      label: '来源未标注',
-      title: '运行总结',
-      model: ''
-    };
+    return { kind: 'unknown', label: '来源未标注', title: '运行总结', model: '', glyph: '?' };
   }
 
   function insightCasesHtml(ids) {
     if (!Array.isArray(ids) || !ids.length) return '';
     return '<div class="insight-cases">' + ids.map(function (id) {
-      return '<span class="chip">' + esc(id) + '</span>';
+      return '<span class="chip mono">' + esc(id) + '</span>';
     }).join('') + '</div>';
   }
 
@@ -1601,30 +2552,25 @@
       ['总耗时', (typeof stats.duration_ms === 'number') ? fmtMs(stats.duration_ms) : stats.duration_ms]
     ].filter(function (row) { return row[1] !== undefined && row[1] !== null; });
     if (!rows.length) return '';
-    return '<div class="insight-stats-wrap">' +
-      '<table class="insight-stats"><caption>统计核对 <span>与 report.summary 对应</span></caption><tbody>' +
+    return '<div class="insight-stats-wrap"><table class="insight-stats">' +
+      '<caption>统计核对 <span>与 report.summary 对应</span></caption><tbody>' +
       rows.map(function (row) {
         return '<tr><th scope="row">' + esc(row[0]) + '</th><td class="mono">' + esc(String(row[1])) + '</td></tr>';
       }).join('') +
-      '</tbody></table>' +
-    '</div>';
+    '</tbody></table></div>';
   }
 
   function insightFindingsHtml(findings) {
     if (!Array.isArray(findings) || !findings.length) return '';
     return '<details class="insight-findings-block">' +
       '<summary>关键发现（' + findings.length + '）<span>来自报告里的失败归类</span></summary>' +
-      '<ul class="insight-findings">' +
-      findings.map(function (f) {
+      '<ul class="insight-findings">' + findings.map(function (f) {
         f = f || {};
-        return '<li>' +
-          '<div class="insight-finding-title"><span class="chip">' + esc(f.kind || 'finding') + '</span>' + esc(f.title || '未命名发现') + '</div>' +
+        return '<li><div class="insight-finding-title"><span class="chip">' + esc(f.kind || 'finding') + '</span>' +
+          esc(f.title || '未命名发现') + '</div>' +
           (f.detail ? '<div class="insight-finding-detail">' + esc(f.detail) + '</div>' : '') +
-          insightCasesHtml(f.case_ids) +
-        '</li>';
-      }).join('') +
-      '</ul>' +
-    '</details>';
+          insightCasesHtml(f.case_ids) + '</li>';
+      }).join('') + '</ul></details>';
   }
 
   function insightSuggestionsHtml(suggestions) {
@@ -1649,32 +2595,27 @@
       keys.map(function (key) {
         var meta = INSIGHT_PRIORITY[key];
         var list = groups[key];
-        return '<div class="insight-sugg-group" data-priority="' + esc(key) + '">' +
+        return '<div class="insight-sugg-group">' +
           '<div class="insight-sugg-head">' +
             '<span class="prio prio-' + esc(key.toLowerCase()) + '">' + esc(key) + '</span>' +
             '<span class="insight-sugg-label">' + esc(meta ? meta.label : '其他') + '</span>' +
             '<span class="insight-sugg-count">' + list.length + ' 条</span>' +
-          '</div>' +
-          '<ul class="insight-sugg-list">' +
+          '</div><ul class="insight-sugg-list">' +
           list.map(function (s) {
-            return '<li>' +
-              '<div class="insight-sugg-title">' + esc(s.title || '未命名建议') + '</div>' +
+            return '<li><div class="insight-sugg-title">' + esc(s.title || '未命名建议') + '</div>' +
               (s.detail ? '<div class="insight-sugg-detail">' + esc(s.detail) + '</div>' : '') +
-              insightCasesHtml(s.case_ids) +
-            '</li>';
+              insightCasesHtml(s.case_ids) + '</li>';
           }).join('') +
-          '</ul>' +
-        '</div>';
+          '</ul></div>';
       }).join('');
   }
 
   function insightPayloadHtml(payload) {
-    var meta = insightSourceMeta(payload);
     var p = payload || {};
+    var meta = insightSourceMeta(p);
     var out = '<div class="insight-source-line">' +
       '<span class="insight-source insight-source-' + meta.kind + '">' +
-        '<span aria-hidden="true">' + (meta.kind === 'llm' ? '✦' : '⚙') + '</span>' + esc(meta.label) +
-      '</span>' +
+        '<span aria-hidden="true">' + meta.glyph + '</span> ' + esc(meta.label) + '</span>' +
       (meta.kind === 'rules' ? '<span class="insight-offline">未调用模型 · 由报告规则推导</span>' : '') +
       '<span class="insight-when">生成于 ' + esc(fmtTs(p.generated_at)) + '</span>' +
     '</div>';
@@ -1692,15 +2633,12 @@
   function insightBlockHtml() {
     return '<section class="insight-block" id="insightBlock" data-state="loading" aria-labelledby="insightTitle">' +
       '<div class="insight-head">' +
-        '<div class="insight-head-main">' +
-          '<h2 id="insightTitle">AI 总结</h2>' +
-          '<span class="insight-source" id="insightSource" hidden></span>' +
-        '</div>' +
+        '<div class="insight-head-main"><h2 id="insightTitle">AI 总结</h2>' +
+          '<span class="insight-source" id="insightSource" hidden></span></div>' +
         '<div class="insight-actions" id="insightActions"></div>' +
       '</div>' +
-      '<div class="insight-body" id="insightBody">' +
-        '<div class="insight-loading"><span class="spinner" aria-hidden="true"></span>正在读取总结缓存…</div>' +
-      '</div>' +
+      '<div class="insight-body" id="insightBody"><div class="insight-loading">' +
+        '<span class="spinner" aria-hidden="true"></span>正在读取总结缓存…</div></div>' +
     '</section>';
   }
 
@@ -1711,7 +2649,7 @@
     var sourceEl = $('#insightSource', block);
     var bodyEl = $('#insightBody', block);
     var actionsEl = $('#insightActions', block);
-    var path = API + 'runs/' + encodeURIComponent(id) + '/insight';
+    var path = API + 'runs/' + enc(id) + '/insight';
     var state = { phase: 'loading', payload: null, error: null };
     var timer = null;
     var startedAt = 0;
@@ -1719,22 +2657,16 @@
     function clearTimer() {
       if (timer) { clearInterval(timer); timer = null; }
     }
-    function elapsedText() {
-      return ((Date.now() - startedAt) / 1000).toFixed(1) + ' s';
-    }
+    function elapsedText() { return ((Date.now() - startedAt) / 1000).toFixed(1) + ' s'; }
     function startTimer() {
       startedAt = Date.now();
       clearTimer();
       timer = setInterval(function () {
         if (!ctx.alive()) { clearTimer(); return; }
-        $$('[data-insight-elapsed]', block).forEach(function (el) {
-          el.textContent = elapsedText();
-        });
+        $$('[data-insight-elapsed]', block).forEach(function (el) { el.textContent = elapsedText(); });
       }, 100);
     }
-    if (ctx.signal && ctx.signal.addEventListener) {
-      ctx.signal.addEventListener('abort', clearTimer);
-    }
+    if (ctx.signal && ctx.signal.addEventListener) ctx.signal.addEventListener('abort', clearTimer);
 
     function setSource(meta) {
       if (!meta) {
@@ -1745,59 +2677,45 @@
       }
       sourceEl.hidden = false;
       sourceEl.className = 'insight-source insight-source-' + meta.kind;
-      sourceEl.innerHTML = '<span aria-hidden="true">' + (meta.kind === 'llm' ? '✦' : '⚙') + '</span>' + esc(meta.label);
+      sourceEl.innerHTML = '<span aria-hidden="true">' + meta.glyph + '</span> ' + esc(meta.label);
     }
 
     function renderActions() {
-      if (state.phase === 'loading') {
-        actionsEl.innerHTML = '<span class="insight-elapsed">读取中…</span>';
-        return;
-      }
+      if (state.phase === 'loading') { actionsEl.innerHTML = '<span class="insight-elapsed">读取中…</span>'; return; }
       if (state.phase === 'generating') {
         actionsEl.innerHTML = '<button type="button" class="btn btn-sm" disabled>' +
           '<span class="spinner" aria-hidden="true"></span>生成中 <span class="insight-elapsed" data-insight-elapsed>0.0 s</span></button>';
         return;
       }
       if (state.payload) {
-        actionsEl.innerHTML =
-          '<button type="button" class="btn btn-sm btn-ghost" data-insight-copy>复制总结</button>' +
+        actionsEl.innerHTML = '<button type="button" class="btn btn-sm btn-ghost" data-insight-copy>复制总结</button>' +
           '<button type="button" class="btn btn-sm" data-insight-refresh>重新生成</button>';
         return;
       }
       actionsEl.innerHTML = '<span class="insight-elapsed">尚未生成</span>';
     }
 
-    function emptyHtml() {
-      return '<div class="insight-empty">' +
-        '<div>' +
-          '<strong>还没有生成过总结</strong>' +
-          '<p>总结会先尝试调用已配置的模型；没有可用密钥时自动降级为离线规则，并在上方明确标注来源。结果会缓存在运行目录，刷新页面不会重复消耗。</p>' +
-        '</div>' +
-        '<button type="button" class="btn btn-primary" data-insight-generate>生成总结</button>' +
-      '</div>';
+    function emptyHtml2() {
+      return '<div class="insight-empty"><div><strong>还没有生成过总结</strong>' +
+        '<p>总结会先尝试调用已配置的模型；没有可用密钥时自动降级为离线规则，并在来源处明确标注。结果缓存在运行目录，刷新页面不会重复消耗。</p></div>' +
+        '<button type="button" class="btn btn-primary" data-insight-generate>生成总结</button></div>';
     }
 
-    function insightErrorHtml(err, canReload) {
+    function insightErrorHtml2(err, canReload) {
       var msg = err && err.message ? err.message : '未知错误';
       var hint = '';
-      if (err && err.status === 404) {
-        hint = '提示：当前后端尚未提供 AI 总结接口（GET/POST .../insight 返回 404），升级后端后再试。';
-      } else if (err && (err.code === 'network' || err.status === 0)) {
-        hint = '提示：后端未启动或端口不通。确认 panguverse serve 仍在运行后重试。';
-      } else if (err && err.status >= 500) {
-        hint = '提示：服务端生成异常，详细原因见服务端日志。';
-      }
+      if (err && err.status === 404) hint = '提示：当前后端尚未提供 AI 总结接口（GET/POST .../insight 返回 404）。';
+      else if (err && (err.code === 'network' || err.status === 0)) hint = '提示：后端未启动或端口不通。';
+      else if (err && err.status >= 500) hint = '提示：服务端生成异常，详细原因见服务端日志。';
       return '<div class="insight-error" role="alert">' +
         '<div class="insight-error-title"><span aria-hidden="true">⚠</span>总结生成失败</div>' +
         '<div class="insight-error-msg">' + esc(msg) + '</div>' +
         (hint ? '<div class="insight-error-hint">' + esc(hint) + '</div>' : '') +
-        '<div class="insight-error-actions">' +
-          '<button type="button" class="btn btn-sm" data-insight-' + (canReload ? 'reload' : 'retry') + '>重试</button>' +
-        '</div>' +
-      '</div>';
+        '<div class="insight-error-actions"><button type="button" class="btn btn-sm" data-insight-' +
+          (canReload ? 'reload' : 'retry') + '>重试</button></div></div>';
     }
 
-    function render() {
+    function renderState() {
       block.setAttribute('data-state', state.phase);
       var p = state.payload;
       if (state.phase === 'loading') {
@@ -1809,8 +2727,7 @@
         return;
       }
       if (state.phase === 'generating') {
-        bodyEl.innerHTML = '<div class="insight-loading"><span class="spinner" aria-hidden="true"></span>' +
-          '正在生成总结…首次生成可能需要几秒' +
+        bodyEl.innerHTML = '<div class="insight-loading"><span class="spinner" aria-hidden="true"></span>正在生成总结…首次生成可能需要几秒' +
           '<span class="insight-elapsed" data-insight-elapsed>' + esc(elapsedText()) + '</span></div>';
         renderActions();
         return;
@@ -1819,7 +2736,7 @@
         block.removeAttribute('data-source');
         if (titleEl) titleEl.textContent = 'AI 总结';
         setSource(null);
-        bodyEl.innerHTML = emptyHtml();
+        bodyEl.innerHTML = emptyHtml2();
         renderActions();
         return;
       }
@@ -1832,18 +2749,17 @@
         renderActions();
         return;
       }
-      // error：有缓存内容时保留展示，错误条放在顶部，绝不静默
       if (p) {
         var pmeta = insightSourceMeta(p);
         block.setAttribute('data-source', pmeta.kind);
         if (titleEl) titleEl.textContent = pmeta.title;
         setSource(pmeta);
-        bodyEl.innerHTML = insightErrorHtml(state.error, false) + insightPayloadHtml(p);
+        bodyEl.innerHTML = insightErrorHtml2(state.error, false) + insightPayloadHtml(p);
       } else {
         block.removeAttribute('data-source');
         if (titleEl) titleEl.textContent = 'AI 总结';
         setSource(null);
-        bodyEl.innerHTML = insightErrorHtml(state.error, true);
+        bodyEl.innerHTML = insightErrorHtml2(state.error, true);
       }
       renderActions();
     }
@@ -1852,21 +2768,17 @@
       state.phase = 'loading';
       state.payload = null;
       state.error = null;
-      render();
+      renderState();
       apiGet(path).then(function (resp) {
         if (!ctx.alive()) return;
-        if (resp && resp.available === true) {
-          state.phase = 'ready';
-          state.payload = resp;
-        } else {
-          state.phase = 'empty';
-        }
-        render();
+        if (resp && resp.available === true) { state.phase = 'ready'; state.payload = resp; }
+        else { state.phase = 'empty'; }
+        renderState();
       }).catch(function (err) {
         if (!ctx.alive()) return;
         state.phase = 'error';
         state.error = err;
-        render();
+        renderState();
       });
     }
 
@@ -1879,7 +2791,7 @@
       if (titleEl) titleEl.textContent = 'AI 总结';
       setSource(null);
       startTimer();
-      render();
+      renderState();
       apiPost(path, { refresh: !!refresh }).then(function (resp) {
         if (!ctx.alive()) return;
         clearTimer();
@@ -1887,12 +2799,12 @@
           state.phase = 'error';
           state.payload = previous;
           state.error = new ApiError('服务端没有返回可用的总结（available=false）', 200, 'bad_payload');
-          render();
+          renderState();
           return;
         }
         state.phase = 'ready';
         state.payload = resp;
-        render();
+        renderState();
         toast(refresh ? '总结已重新生成' : '总结已生成', 'ok');
       }).catch(function (err) {
         if (!ctx.alive()) return;
@@ -1900,7 +2812,7 @@
         state.phase = 'error';
         state.payload = previous;
         state.error = err;
-        render();
+        renderState();
       });
     }
 
@@ -1920,11 +2832,8 @@
         });
       }
       lines.push('', '来源：' + meta.label + (p.degraded_reason ? ' · ' + p.degraded_reason : ''));
-      copyToClipboard(lines.join('\n')).then(function () {
-        toast('总结已复制到剪贴板', 'ok');
-      }).catch(function () {
-        toast('复制失败：浏览器拒绝了剪贴板访问，可手动选中文本复制', 'error');
-      });
+      copyToClipboard(lines.join('\n')).then(function () { toast('总结已复制到剪贴板', 'ok'); })
+        .catch(function () { toast('复制失败：浏览器拒绝了剪贴板访问，可手动选中文本复制', 'error'); });
     }
 
     block.addEventListener('click', function (e) {
@@ -1940,147 +2849,395 @@
     load();
   }
 
-  function detailHtml(data, id) {
-    var report = data.report || {};
-    var summary = report.summary || {};
-    var conclusion = report.conclusion || {};
-    var cases = Array.isArray(report.cases) ? report.cases : [];
-    var plan = report.plan || {};
-    var verdict = conclusion.verdict || (summary.success ? '通过' : '存在失败');
-    var verdictOk = conclusion.success === true;
+  /* ================================================================== */
+  /* 修正重跑                                                            */
+  /* ================================================================== */
+  function openRerunDialog(pid, rid, data) {
+    var report = (data && data.report) || {};
+    var meta = report.meta || {};
+    var failure = firstFailure(report);
+    var projectId = meta.project_id || (pid && PID_RE.test(pid) ? pid : '');
+    var suiteId = meta.suite_id || '';
+    var useProject = !!(projectId && suiteId && PID_RE.test(projectId));
+    var project = projectId ? APP.projectCache[projectId] : null;
 
-    var header = '' +
-      '<div class="detail-head">' +
-        '<div>' +
-          '<div class="title-line">' +
-            '<h1>run ' + esc(id) + '</h1>' +
-            '<span class="badge ' + (verdictOk ? 'ok' : 'bad') + '">' +
-              '<span class="glyph" aria-hidden="true">' + (verdictOk ? '✓' : '✕') + '</span>' + esc(verdict) + '</span>' +
-            (summary.healed_cases ? '<span class="badge heal">自愈 ' + esc(String(summary.healed_cases)) + ' 个用例</span>' : '') +
+    apiGet(API + 'runs/' + enc(rid) + '/config').catch(function () { return { env: {} }; }).then(function (cfg) {
+      var env = (cfg && cfg.env && typeof cfg.env === 'object') ? cfg.env : {};
+      var entries = Object.keys(env).sort().map(function (key) {
+        var val = env[key];
+        return {
+          key: key,
+          value: '',
+          existing: false,
+          placeholder: val === '***' ? '***（沿用）' : ('当前：' + stringifyMaybe(val))
+        };
+      });
+      var destination = useProject
+        ? '将作为项目「' + (project && project.name ? project.name : projectId) + '」的套件「' + suiteLabel(project, suiteId) + '」重新运行，结果自动归属项目。'
+        : '这是一次未归类运行；重跑结果仍为未归类运行（可在运行详情里查看）。';
+
+      openModal({
+        title: '按此运行修正并重跑',
+        subtitle: failure ? ('失败：' + (failure.case || '') + (failure.step ? ' / ' + failure.step : '')) : '',
+        okLabel: '提交重跑',
+        wide: true,
+        bodyHtml:
+          '<div class="modal-failure">' +
+            '<div class="row" style="margin-bottom:8px"><b>失败证据</b>' +
+              (failure ? '<span class="badge bad"><span class="glyph" aria-hidden="true">✕</span>未通过</span>' : '') +
+            '</div>' +
+            '<dl class="kv-grid">' + failureRowsHtml(failure) + '</dl>' +
           '</div>' +
-          '<div class="detail-meta">' +
-            '<span>开始 ' + esc(fmtTs(report.started_at)) + '</span>' +
-            '<span>结束 ' + esc(fmtTs(report.finished_at)) + '</span>' +
-            '<span>耗时 ' + esc(fmtMs(report.duration_ms)) + '</span>' +
-            '<span>计划来源 <span class="mono">' + esc(plan.source || '未提供') + '</span></span>' +
-            '<span>规划器 <span class="mono">' + esc(plan.planner || '未提供') + '</span></span>' +
+          '<div class="field"><span class="field-label">环境变量修正（留空沿用原运行/项目默认）</span>' +
+            envEditorBlock({
+              entries: entries,
+              note: useProject
+                ? '只发送填写的值；同名变量以套件/项目默认值为准，要改默认值请先在「设置」里修改。'
+                : '只发送填写的值；密钥原值不会显示。'
+            }) +
           '</div>' +
-        '</div>' +
-        '<div class="actions">' +
-          '<a class="btn btn-sm" href="' + API + 'runs/' + encodeURIComponent(id) + '/junit.xml" download="panguverse-' + esc(id) + '.xml">下载 JUnit</a>' +
-          '<a class="btn btn-sm" href="' + API + 'runs/' + encodeURIComponent(id) + '/report.html" target="_blank" rel="noopener">打开 HTML 报告</a>' +
-          '<a class="btn btn-sm btn-ghost" href="#/history">返回历史</a>' +
-        '</div>' +
-      '</div>';
-
-    var strip = '<dl class="summary-strip">' +
-      stripCell('用例', summary.total) +
-      stripCell('通过', summary.passed) +
-      stripCell('失败', summary.failed) +
-      stripCell('异常', summary.errored) +
-      stripCell('跳过', summary.skipped) +
-      stripCell('自愈用例', summary.healed_cases) +
-      stripCell('步骤', summary.steps) +
-      stripCell('HTTP', summary.http_requests) +
-      '</dl>';
-
-    var caseHtml = cases.length
-      ? cases.map(caseCardHtml).join('')
-      : '<div class="empty"><strong>该运行没有用例记录</strong><span>report.json 中 cases 为空，请查看 HTML 报告或服务端日志。</span></div>';
-
-    return header + strip + insightBlockHtml() + fixRunPanelHtml(report, id) +
-      '<div class="section"><div class="section-head"><h2>计划</h2><span class="hint">来自 report.plan</span></div>' +
-        (Object.keys(plan).length ? planPanelHtml(report) : '<div class="empty"><strong>没有计划信息</strong><span>report.plan 为空。</span></div>') +
-      '</div>' +
-      '<div class="section"><div class="section-head"><h2>用例</h2><span class="hint">点击用例展开步骤；点击步骤查看 message / expected / actual</span></div>' +
-        '<div id="caseList">' + caseHtml + '</div>' +
-      '</div>';
-  }
-
-  function stripCell(label, value) {
-    var v = (typeof value === 'number') ? value : (value === undefined || value === null ? 0 : value);
-    return '<div class="cell"><dt>' + esc(label) + '</dt><dd>' + esc(String(v)) + '</dd></div>';
-  }
-
-  function toggleCase(headBtn) {
-    var card = headBtn.closest('.case-card');
-    if (!card) return;
-    var open = card.getAttribute('data-open') === 'true';
-    card.setAttribute('data-open', open ? 'false' : 'true');
-    headBtn.setAttribute('aria-expanded', open ? 'false' : 'true');
-    var caret = headBtn.querySelector('.caret');
-    if (caret) caret.textContent = open ? '▸' : '▾';
-  }
-
-  function toggleStep(btn) {
-    if (!btn) return;
-    var tr = btn.closest('tr');
-    if (!tr) return;
-    var detail = tr.nextElementSibling;
-    if (!detail || detail.className.indexOf('step-detail-row') < 0) return;
-    var willOpen = detail.hidden;
-    detail.hidden = !willOpen;
-    btn.setAttribute('aria-expanded', willOpen ? 'true' : 'false');
-    btn.textContent = willOpen ? '收起 ▾' : '明细 ▸';
-  }
-
-  function bindCaseInteractions(host, signal) {
-    var opts = signal ? { signal: signal } : false;
-    host.addEventListener('click', function (e) {
-      var head = e.target.closest ? e.target.closest('.case-head') : null;
-      if (head) { toggleCase(head); return; }
-      var btn = e.target.closest ? e.target.closest('[data-step-toggle]') : null;
-      if (btn) { toggleStep(btn); return; }
-      var row = e.target.closest ? e.target.closest('tr[data-step]') : null;
-      if (row) toggleStep(row.querySelector('[data-step-toggle]'));
-    }, opts);
-    host.addEventListener('keydown', function (e) {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      var row = e.target.closest ? e.target.closest('tr[data-step]') : null;
-      if (!row) return;
-      e.preventDefault();
-      toggleStep(row.querySelector('[data-step-toggle]'));
-    }, opts);
-  }
-
-  function renderDetail(host, ctx, id) {
-    if (!RUN_ID_RE.test(id)) {
-      renderError(host, new ApiError('run_id 不合法：只允许 6-32 位十六进制字符', 400, 'bad_request'), function () {
-        location.hash = '#/history';
-      }, '无法打开运行详情');
-      return;
-    }
-    host.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取运行 ' + esc(id) + '…</div>';
-    apiGet(API + 'runs/' + encodeURIComponent(id)).then(function (data) {
-      if (!ctx.alive()) return;
-      if (!data || typeof data !== 'object' || !data.report) {
-        throw new ApiError('响应缺少 report 字段', 500, 'bad_response');
-      }
-      host.innerHTML = detailHtml(data, id);
-      bindCaseInteractions(host, ctx.signal);
-      initInsight(host, ctx, id);
-      host.addEventListener('click', function (e) {
-        var btn = e.target.closest ? e.target.closest('[data-fix-run]') : null;
-        if (!btn) return;
-        e.preventDefault();
-        location.hash = '#/tasks/new?run=' + encodeURIComponent(id);
-      }, ctx.signal ? { signal: ctx.signal } : false);
+          '<div class="notice info"><span aria-hidden="true">ⓘ</span><div>' + esc(destination) + '</div></div>',
+        onMount: function (rootEl) {
+          var editor = mountEnvEditor($('[data-env-editor]', rootEl), entries, { placeholder: '值' });
+          rootEl._envEditor = editor;
+        },
+        onSubmit: function (rootEl) {
+          var overrides = rootEl._envEditor ? rootEl._envEditor.collect({ existing: false }) : {};
+          if (useProject) {
+            return startBatch(projectId, [suiteId], overrides).then(function (res) {
+              var bid = res && res.batch_id;
+              if (!bid) throw new ApiError('服务端没有返回 batch_id', 500, 'bad_payload');
+              setTimeout(function () { go('#/p/' + enc(projectId) + '/run?batch=' + enc(bid)); }, 0);
+              toast('已提交修正后的运行', 'ok');
+              return true;
+            });
+          }
+          return apiPost(API + 'runs/' + enc(rid) + '/rerun', { env: overrides }).then(function (res) {
+            var jobId = res && res.job_id;
+            if (!jobId) throw new ApiError('服务端没有返回 job_id', 500, 'bad_payload');
+            setTimeout(function () {
+              watchJob(jobId, {
+                label: '修正重跑',
+                hrefFor: function (job) { return job && job.run_id ? '#/runs/' + enc(job.run_id) : ''; }
+              });
+            }, 0);
+            toast('已提交重跑任务', 'ok');
+            return true;
+          });
+        }
+      });
     }).catch(function (err) {
-      if (!ctx.alive()) return;
-      host.innerHTML = '<div class="page-head"><div><h1>run ' + esc(id) + '</h1>' +
-        '<div class="sub">无法读取该运行</div></div>' +
-        '<div class="actions"><a class="btn" href="#/history">返回运行历史</a></div></div><div id="detailError"></div>';
-      renderError($('#detailError', host), err, function () { render(); }, '无法读取运行详情');
+      toast('无法读取运行配置：' + (err && err.message ? err.message : '未知错误'), 'error');
     });
   }
 
   /* ================================================================== */
-  /* 11. 原子库                                                          */
+  /* 后台任务浮层                                                        */
+  /* ================================================================== */
+  function stopJobWatcher(hide) {
+    if (APP.job.timer) { clearTimeout(APP.job.timer); APP.job.timer = null; }
+    if (APP.job.hideTimer) { clearTimeout(APP.job.hideTimer); APP.job.hideTimer = null; }
+    APP.job.id = null;
+    var dock = $('#jobDock');
+    if (dock && hide !== false) { dock.hidden = true; dock.innerHTML = ''; }
+  }
+
+  function jobHref(job, opts) {
+    if (opts && typeof opts.hrefFor === 'function') return opts.hrefFor(job);
+    return job && job.run_id ? '#/runs/' + enc(job.run_id) : '';
+  }
+
+  function renderJobDock(job, opts, error) {
+    var dock = $('#jobDock');
+    if (!dock) return;
+    dock.hidden = false;
+    var status = job ? job.status : (error ? 'failed' : 'queued');
+    var done = status === 'done' || status === 'failed' || !!error;
+    var href = jobHref(job, opts);
+    var phases = (job && Array.isArray(job.phases)) ? job.phases.slice(-5) : [];
+    dock.innerHTML = '<div class="job-card">' +
+      '<div class="job-head">' +
+        (done ? '' : '<span class="spinner" aria-hidden="true"></span>') +
+        '<b>' + esc((opts && opts.label) || '后台任务') + '</b>' +
+        jobBadge(status) +
+        '<button type="button" class="btn btn-icon" data-act="job-close" aria-label="关闭任务面板">✕</button>' +
+      '</div>' +
+      '<div class="job-body">' +
+        (error
+          ? '<div class="error-msg">' + esc(error) + '</div>'
+          : '<div class="job-status-line">' + esc(done ? (status === 'done' ? '任务已完成' : '任务失败') : '正在执行，可继续浏览其他页面…') + '</div>' +
+            (job && job.summary ? '<div class="hint">用例 ' + esc(String(num(job.summary.passed))) + '/' + esc(String(num(job.summary.total))) + '</div>' : '') +
+            (job && job.error ? '<div class="error-msg">' + esc(job.error) + '</div>' : '')) +
+        (phases.length
+          ? '<div class="job-phases">' + phases.map(function (ph) {
+              return '<span>' + esc(ph.name || '') + ' · ' + esc(ph.status || '') + (ph.detail ? ' — ' + esc(ph.detail) : '') + '</span>';
+            }).join('') + '</div>'
+          : '') +
+        (href ? '<a class="btn btn-sm btn-primary" href="' + href + '">查看运行详情</a>' : '') +
+      '</div>' +
+    '</div>';
+  }
+
+  function watchJob(jobId, opts) {
+    stopJobWatcher();
+    opts = opts || {};
+    APP.job.id = jobId;
+    if (APP.job.hideTimer) { clearTimeout(APP.job.hideTimer); APP.job.hideTimer = null; }
+    var finished = false;
+    renderJobDock({ status: 'queued', job_id: jobId }, opts);
+
+    function tick() {
+      if (APP.job.id !== jobId) return;
+      apiGet(API + 'jobs/' + enc(jobId)).then(function (job) {
+        if (APP.job.id !== jobId) return;
+        if (!job) throw new ApiError('job 不存在', 404, 'not_found');
+        renderJobDock(job, opts);
+        if (job.status === 'done' || job.status === 'failed') {
+          APP.job.timer = null;
+          if (!finished) {
+            finished = true;
+            if (typeof opts.onDone === 'function') opts.onDone(job);
+            toast(job.status === 'done' ? '任务已完成' : '任务失败，请查看详情', job.status === 'done' ? 'ok' : 'error');
+            // 完成后再停留 12 秒，避免在手机/详情页长期遮挡内容；可手动关闭
+            APP.job.hideTimer = setTimeout(function () {
+              if (APP.job.id === jobId) stopJobWatcher();
+            }, 12000);
+          }
+          return;
+        }
+        APP.job.timer = setTimeout(tick, 1200);
+      }).catch(function (err) {
+        if (APP.job.id !== jobId) return;
+        APP.job.timer = null;
+        renderJobDock(null, opts, err && err.status === 404 ? '任务记录已丢失（后端可能重启过）' : ('读取任务失败：' + (err && err.message ? err.message : '未知错误')));
+      });
+    }
+
+    // 首次延迟一点，给提交接口落库留出时间
+    APP.job.timer = setTimeout(tick, 500);
+  }
+
+  /* ================================================================== */
+  /* 项目设置（基本信息 + 套件管理）                                      */
+  /* ================================================================== */
+  function loadScenarios(force) {
+    if (APP.scenarios && !force) return Promise.resolve(APP.scenarios);
+    return apiGet(API + 'scenarios').then(function (list) {
+      APP.scenarios = Array.isArray(list) ? list : [];
+      return APP.scenarios;
+    });
+  }
+
+  function scenarioOptionsHtml(list, current) {
+    var out = '<option value="">选择场景文件…</option>';
+    var found = false;
+    (list || []).forEach(function (s) {
+      if (!s || !s.id) return;
+      if (s.id === current) found = true;
+      var label = (s.name || s.id) + ' · ' + s.id + (s.source === 'builtin' ? '（内置）' : '') + (s.error ? '（解析失败）' : '');
+      out += '<option value="' + esc(s.id) + '"' + (s.id === current ? ' selected' : '') + (s.error ? ' disabled' : '') + '>' + esc(label) + '</option>';
+    });
+    if (current && !found) {
+      out += '<option value="' + esc(current) + '" selected>' + esc(current) + '（当前值）</option>';
+    }
+    return out;
+  }
+
+  function suiteAdminRowHtml(suite) {
+    var tags = Array.isArray(suite.tags) ? suite.tags : [];
+    var envCount = suite.env && typeof suite.env === 'object' ? Object.keys(suite.env).length : 0;
+    return '<div class="suite-admin-row" data-suite-id="' + esc(suite.suite_id) + '">' +
+      '<div class="suite-admin-main"><span class="suite-admin-name">' + esc(suite.name || suite.suite_id) + '</span>' +
+        '<span class="suite-scenario">' + esc(suite.scenario || '未配置场景') + '</span>' +
+        '<span class="chips">' + tags.map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('') +
+          (envCount ? '<span class="chip">env ' + envCount + ' 项</span>' : '') + '</span></div>' +
+      '<div class="suite-admin-actions">' +
+        '<button type="button" class="btn btn-sm" data-suite-edit="' + esc(suite.suite_id) + '">编辑</button>' +
+        '<button type="button" class="btn btn-sm btn-ghost" data-suite-del="' + esc(suite.suite_id) + '">删除</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function renderSettings(host, ctx, pid) {
+    host.innerHTML = loadingHtml('正在读取项目设置…');
+    return getProject(pid, true).then(function (project) {
+      if (!ctx.alive()) return;
+      var suites = Array.isArray(project.suites) ? project.suites : [];
+      var env = project.env && typeof project.env === 'object' ? project.env : {};
+      var entries = envEntriesFromObject(env, true);
+
+      host.innerHTML = pageHead(project.name + ' · 设置',
+        '项目保存站点与默认环境；套件把场景文件绑定到项目。删除套件或项目都不会删除历史运行。',
+        '<a class="btn" href="#/p/' + enc(pid) + '/overview">返回概览</a>') +
+        '<div class="settings-grid">' +
+          '<section class="panel">' +
+            '<div class="panel-head"><h2>基本信息</h2></div>' +
+            '<form id="projectSettingsForm" class="stack">' +
+              '<div class="field"><label for="sName">项目名称</label>' +
+                '<input class="input" id="sName" value="' + esc(project.name || '') + '" maxlength="80" autocomplete="off"></div>' +
+              '<div class="field"><label for="sBase">站点地址 base_url</label>' +
+                '<input class="input mono" id="sBase" value="' + esc(project.base_url || '') + '" autocomplete="off" spellcheck="false"></div>' +
+              '<div class="field"><span class="field-label">项目默认环境变量</span>' +
+                envEditorBlock({ entries: entries, note: '密钥以 *** 返回；留空沿用，点 ✕ 删除该键。套件 env 会覆盖同名项目变量。' }) +
+              '</div>' +
+              '<div class="form-actions"><button type="submit" class="btn btn-primary" id="sSave">保存设置</button>' +
+                '<span class="hint" id="sSaveHint"></span></div>' +
+            '</form>' +
+          '</section>' +
+          '<section class="panel">' +
+            '<div class="panel-head"><h2>套件</h2><span class="hint">' + suites.length + ' 个</span>' +
+              '<button type="button" class="btn btn-sm btn-primary row-end" data-act="new-suite" data-pid="' + esc(pid) + '">＋ 绑定套件</button></div>' +
+            (suites.length
+              ? '<div class="suite-admin-list" id="suiteAdminList">' + suites.map(suiteAdminRowHtml).join('') + '</div>'
+              : emptyHtml('还没有绑定套件', '绑定一个场景文件（scenarios/...）后即可在项目内运行。',
+                  '<button type="button" class="btn btn-primary" data-act="new-suite" data-pid="' + esc(pid) + '">绑定套件</button>')) +
+          '</section>' +
+        '</div>' +
+        '<section class="panel danger-zone" style="margin-top:16px">' +
+          '<div class="panel-head"><h2>危险操作</h2></div>' +
+          '<div class="danger-row"><p>删除项目只删除项目配置与套件绑定，<b>不会删除任何历史运行</b>。此操作不可撤销。</p>' +
+            '<button type="button" class="btn btn-danger" data-act="delete-project" data-pid="' + esc(pid) + '">删除项目</button></div>' +
+        '</section>';
+
+      var form = $('#projectSettingsForm', host);
+      if (form) {
+        var editor = mountEnvEditor($('[data-env-editor]', form), entries, { placeholder: '值' });
+        form.addEventListener('submit', function (e) {
+          e.preventDefault();
+          var nameEl = $('#sName', form);
+          var baseEl = $('#sBase', form);
+          var save = $('#sSave', form);
+          var hint = $('#sSaveHint', form);
+          var name = nameEl ? nameEl.value.trim() : '';
+          if (!name) {
+            if (nameEl) nameEl.focus();
+            if (hint) hint.textContent = '项目名称不能为空';
+            return;
+          }
+          var envPatch = editor.collect({ existing: true });
+          if (save) { save.disabled = true; save.innerHTML = '<span class="spinner" aria-hidden="true"></span>保存中…'; }
+          if (hint) hint.textContent = '';
+          apiPatch(API + 'projects/' + enc(pid), { name: name, base_url: baseEl ? baseEl.value.trim() : '', env: envPatch }).then(function (updated) {
+            if (!ctx.alive()) return;
+            var merged = updated && updated.project_id ? updated : project;
+            if (!merged.suites) merged.suites = suites;
+            APP.projectCache[pid] = merged;
+            APP.projectsPromise = null;
+            loadProjects(true).catch(function () {});
+            renderTopbar(parseRoute());
+            if (save) { save.disabled = false; save.textContent = '保存设置'; }
+            if (hint) hint.textContent = '已保存';
+            toast('项目设置已保存', 'ok');
+          }).catch(function (err) {
+            if (save) { save.disabled = false; save.textContent = '保存设置'; }
+            if (hint) hint.textContent = '保存失败：' + (err && err.message ? err.message : '未知错误');
+          });
+        });
+      }
+
+      var list = $('#suiteAdminList', host);
+      if (list) {
+        list.addEventListener('click', function (e) {
+          var edit = e.target.closest ? e.target.closest('[data-suite-edit]') : null;
+          var del = e.target.closest ? e.target.closest('[data-suite-del]') : null;
+          if (edit) {
+            var sid = edit.getAttribute('data-suite-edit');
+            var suite = findSuite(project, sid);
+            if (suite) openSuiteModal(pid, project, suite);
+            return;
+          }
+          if (del) {
+            var dsid = del.getAttribute('data-suite-del');
+            var dsuite = findSuite(project, dsid);
+            if (!dsuite) return;
+            confirmDialog({
+              title: '删除套件',
+              bodyHtml: '确定解除套件「' + esc(dsuite.name || dsid) + '」与项目的绑定？<br>历史运行不会被删除。',
+              okLabel: '删除套件',
+              danger: true
+            }).then(function (ok) {
+              if (!ok) return;
+              apiDelete(API + 'projects/' + enc(pid) + '/suites/' + enc(dsid)).then(function () {
+                invalidateProject(pid);
+                loadProjects(true).catch(function () {});
+                toast('套件已删除', 'ok');
+                render();
+              }).catch(function (err) {
+                toast('删除失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+              });
+            });
+          }
+        });
+      }
+    });
+  }
+
+  function openSuiteModal(pid, project, suite) {
+    var editing = !!suite;
+    loadScenarios().then(function (scenarios) {
+      var env = editing && suite.env && typeof suite.env === 'object' ? suite.env : {};
+      var entries = envEntriesFromObject(env, true);
+      var tags = editing && Array.isArray(suite.tags) ? suite.tags.join(', ') : '';
+      openModal({
+        title: editing ? '编辑套件' : '绑定套件',
+        subtitle: '套件把场景文件与项目绑定；env 覆盖项目默认。',
+        okLabel: editing ? '保存套件' : '绑定套件',
+        wide: true,
+        bodyHtml:
+          '<div class="form-grid">' +
+            '<div class="field"><label for="suiteName">套件名称</label>' +
+              '<input class="input" id="suiteName" value="' + esc(editing ? (suite.name || '') : '') + '" placeholder="例如 站点只读巡检" maxlength="80" autocomplete="off"></div>' +
+            '<div class="field"><label for="suiteTags">标签（逗号分隔）</label>' +
+              '<input class="input" id="suiteTags" value="' + esc(tags) + '" placeholder="smoke, read-only" autocomplete="off"></div>' +
+          '</div>' +
+          '<div class="field"><label for="suiteScenario">场景文件</label>' +
+            '<select class="select mono" id="suiteScenario">' + scenarioOptionsHtml(scenarios, editing ? suite.scenario : '') + '</select>' +
+            '<span class="hint">来自 workspace/scenarios 或内置场景；越界路径会被后端拒绝。</span></div>' +
+          '<div class="field"><span class="field-label">套件环境变量（覆盖项目默认）</span>' +
+            envEditorBlock({ entries: entries, note: editing ? '已有密钥显示为 ***；留空沿用，点 ✕ 删除该键。' : '可选。这里的同名变量会覆盖项目默认。' }) + '</div>',
+        onMount: function (rootEl) {
+          var editor = mountEnvEditor($('[data-env-editor]', rootEl), entries, { placeholder: '值' });
+          rootEl._envEditor = editor;
+        },
+        onSubmit: function (rootEl) {
+          var nameEl = $('#suiteName', rootEl);
+          var scenarioEl = $('#suiteScenario', rootEl);
+          var tagsEl = $('#suiteTags', rootEl);
+          var name = nameEl ? nameEl.value.trim() : '';
+          var scenario = scenarioEl ? scenarioEl.value : '';
+          if (!name) { if (nameEl) nameEl.focus(); return Promise.reject(new ApiError('请填写套件名称', 0, 'validation')); }
+          if (!scenario) { if (scenarioEl) scenarioEl.focus(); return Promise.reject(new ApiError('请选择场景文件', 0, 'validation')); }
+          var tagsValue = tagsEl ? tagsEl.value.split(/[,，\s]+/).map(function (t) { return t.trim(); }).filter(Boolean) : [];
+          var body = {
+            name: name,
+            scenario: scenario,
+            tags: tagsValue,
+            env: rootEl._envEditor ? rootEl._envEditor.collect({ existing: true }) : {}
+          };
+          var req = editing
+            ? apiPatch(API + 'projects/' + enc(pid) + '/suites/' + enc(suite.suite_id), body)
+            : apiPost(API + 'projects/' + enc(pid) + '/suites', body);
+          return req.then(function () {
+            invalidateProject(pid);
+            loadProjects(true).catch(function () {});
+            setTimeout(render, 0);
+            toast(editing ? '套件已更新' : '套件已绑定', 'ok');
+            return true;
+          });
+        }
+      });
+    }).catch(function (err) {
+      toast('无法读取场景列表：' + (err && err.message ? err.message : '未知错误'), 'error');
+    });
+  }
+
+  /* ================================================================== */
+  /* 平台 · 原子库                                                       */
   /* ================================================================== */
   function uniq(list) {
     var seen = {};
     var out = [];
-    list.forEach(function (v) {
+    (list || []).forEach(function (v) {
       if (!hasVal(v)) return;
       var k = String(v);
       if (seen[k]) return;
@@ -2092,1544 +3249,545 @@
 
   function collectTags(atoms) {
     var tags = [];
-    atoms.forEach(function (a) {
-      if (Array.isArray(a.tags)) tags = tags.concat(a.tags);
+    (atoms || []).forEach(function (a) {
+      if (a && Array.isArray(a.tags)) tags = tags.concat(a.tags);
     });
     return uniq(tags);
   }
 
   function optionList(values, current, allLabel) {
-    var html = '<option value="">' + esc(allLabel || '全部') + '</option>';
-    values.forEach(function (v) {
-      html += '<option value="' + esc(v) + '"' + (v === current ? ' selected' : '') + '>' + esc(v) + '</option>';
-    });
-    return html;
+    return '<option value="">' + esc(allLabel || '全部') + '</option>' + (values || []).map(function (v) {
+      return '<option value="' + esc(v) + '"' + (v === current ? ' selected' : '') + '>' + esc(v) + '</option>';
+    }).join('');
   }
 
   function portsTable(ports, emptyText) {
-    if (!Array.isArray(ports) || ports.length === 0) {
+    if (!Array.isArray(ports) || !ports.length) {
       return '<div class="field-hint">' + esc(emptyText || '无端口') + '</div>';
     }
-    var rows = ports.map(function (p) {
-      return '<tr>' +
-        '<td class="mono">' + esc(p.name || '—') + '</td>' +
-        '<td class="mono">' + esc(p.type || '—') + '</td>' +
-        '<td>' + (p.required
-          ? '<span class="req-yes">必填</span>'
-          : '<span class="req-no">可选</span>') + '</td>' +
-      '</tr>';
-    }).join('');
-    return '<table class="port-table"><thead><tr><th>端口</th><th>类型</th><th>必填</th></tr></thead><tbody>' + rows + '</tbody></table>';
+    return '<table class="ports"><thead><tr><th>端口</th><th>类型</th><th>必填</th></tr></thead><tbody>' +
+      ports.map(function (p) {
+        return '<tr><td class="mono">' + esc(p.name || '—') + '</td><td class="mono">' + esc(p.type || '—') + '</td>' +
+          '<td>' + (p.required ? '<span class="req-yes">必填</span>' : '<span class="req-no">可选</span>') + '</td></tr>';
+      }).join('') + '</tbody></table>';
   }
 
-  function atomDrawerHtml(atom) {
+  function atomDetailHtml(atom) {
     var effects = Array.isArray(atom.effects) && atom.effects.length
       ? atom.effects.map(function (e) { return '<span class="chip">' + esc(e) + '</span>'; }).join('')
       : '<span class="missing">未提供</span>';
     var required = Array.isArray(atom.required) && atom.required.length
-      ? atom.required.map(function (r) { return '<span class="chip">' + esc(r) + '</span>'; }).join('')
+      ? atom.required.map(function (r) { return '<span class="chip mono">' + esc(r) + '</span>'; }).join('')
       : '<span class="missing">无必填输入</span>';
     var aliases = Array.isArray(atom.aliases) && atom.aliases.length
-      ? atom.aliases.map(function (a) { return '<span class="chip">' + esc(a) + '</span>'; }).join('')
+      ? atom.aliases.map(function (a) { return '<span class="chip mono">' + esc(a) + '</span>'; }).join('')
       : '<span class="missing">未提供</span>';
     var tags = Array.isArray(atom.tags) && atom.tags.length
       ? atom.tags.map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join('')
       : '<span class="missing">未提供</span>';
-
-    return '' +
+    return '<div class="atom-detail">' +
       '<div class="field"><span class="field-label">描述</span><p>' + esc(atom.description || '未提供描述') + '</p></div>' +
-      '<div class="field"><span class="field-label">元信息</span>' +
-        '<div>' +
-          '<span class="chip">分类 ' + esc(atom.category || '—') + '</span>' +
-          '<span class="chip">领域 ' + esc(atom.domain || '—') + '</span>' +
-          '<span class="chip">包 ' + esc(atom.pack || '—') + '</span>' +
-          '<span class="chip">版本 ' + esc(atom.version || '—') + '</span>' +
-        '</div>' +
-      '</div>' +
-      '<div class="field"><span class="field-label">标签</span><div>' + tags + '</div></div>' +
+      '<div class="field"><span class="field-label">元信息</span><div class="chips">' +
+        '<span class="chip">分类 ' + esc(atom.category || '—') + '</span>' +
+        '<span class="chip">领域 ' + esc(atom.domain || '—') + '</span>' +
+        '<span class="chip">包 ' + esc(atom.pack || '—') + '</span>' +
+        '<span class="chip">版本 ' + esc(atom.version || '—') + '</span>' +
+      '</div></div>' +
+      '<div class="field"><span class="field-label">标签</span><div class="chips">' + tags + '</div></div>' +
       '<div class="field"><span class="field-label">输入端口</span>' + portsTable(atom.input_ports, '该原子没有声明输入端口') + '</div>' +
       '<div class="field"><span class="field-label">输出端口</span>' + portsTable(atom.output_ports, '该原子没有声明输出端口') + '</div>' +
-      '<div class="field"><span class="field-label">副作用 effects</span><div>' + effects + '</div></div>' +
-      '<div class="field"><span class="field-label">必填输入</span><div>' + required + '</div></div>' +
-      '<div class="field"><span class="field-label">别名</span><div>' + aliases + '</div></div>' +
+      '<div class="field"><span class="field-label">副作用 effects</span><div class="chips">' + effects + '</div></div>' +
+      '<div class="field"><span class="field-label">必填输入</span><div class="chips">' + required + '</div></div>' +
+      '<div class="field"><span class="field-label">别名</span><div class="chips">' + aliases + '</div></div>' +
       '<details class="raw"><summary>inputs 契约（原始）</summary><pre class="json-block">' + esc(prettyJson(atom.inputs || {})) + '</pre></details>' +
-      '<details class="raw"><summary>outputs 契约（原始）</summary><pre class="json-block">' + esc(prettyJson(atom.outputs || {})) + '</pre></details>';
+      '<details class="raw"><summary>outputs 契约（原始）</summary><pre class="json-block">' + esc(prettyJson(atom.outputs || {})) + '</pre></details>' +
+    '</div>';
   }
 
   function atomsTableHtml(list) {
     if (!list.length) {
-      return '<div class="empty"><strong>当前过滤条件没有匹配的原子</strong>' +
-        '<span>清空 domain / tag / category 后重试。</span>' +
-        '<button type="button" class="btn btn-sm" data-act="atoms-reset">清除筛选</button></div>';
+      return emptyHtml('当前条件没有匹配的原子', '清空 domain / tag / category 或搜索词后重试。',
+        '<button type="button" class="btn btn-sm" data-act="atoms-reset">清除筛选</button>');
     }
-    var rows = list.map(function (atom, idx) {
-      var req = Array.isArray(atom.required) && atom.required.length ? atom.required.join(', ') : '—';
-      var tags = Array.isArray(atom.tags) ? atom.tags.join(' ') : '';
-      var effects = Array.isArray(atom.effects) ? atom.effects.join(' ') : '';
-      return '<tr class="is-clickable" data-atom-idx="' + idx + '" tabindex="0">' +
-        '<td class="mono">' + esc(atom.name || '—') + '</td>' +
-        '<td>' + esc(atom.category || '—') + '</td>' +
-        '<td>' + esc(atom.domain || '—') + '</td>' +
-        '<td class="mono">' + esc(req) + '</td>' +
-        '<td>' + esc(tags || '—') + '</td>' +
-        '<td>' + esc(effects || '—') + '</td>' +
-        '<td class="mono">' + esc(atom.version || '—') + '</td>' +
-      '</tr>';
-    }).join('');
-    return '<div class="table-wrap"><table class="data">' +
-      '<thead><tr><th>原子</th><th>分类</th><th>领域</th><th>必填输入</th><th>标签</th><th>副作用</th><th>版本</th></tr></thead>' +
-      '<tbody>' + rows + '</tbody></table></div>';
+    return dataTable([
+      { label: '原子', render: function (a) { return '<span class="atom-name">' + esc(a.name || '—') + '</span>'; } },
+      { label: '分类', render: function (a) { return esc(a.category || '—'); } },
+      { label: '领域', render: function (a) { return esc(a.domain || '—'); } },
+      { label: '必填输入', render: function (a) {
+          var req = Array.isArray(a.required) && a.required.length ? a.required.join(', ') : '—';
+          return '<span class="mono">' + esc(req) + '</span>';
+        } },
+      { label: '标签', render: function (a) {
+          var tags = Array.isArray(a.tags) ? a.tags : [];
+          return tags.length ? tags.slice(0, 5).map(function (t) { return '<span class="chip">' + esc(t) + '</span>'; }).join(' ') : '—';
+        } }
+    ], list, {
+      rowHref: function (a) { return '#atom:' + (a.name || ''); }
+    });
   }
 
   function renderAtoms(host, ctx) {
-    host.innerHTML = '' +
-      '<div class="page-head">' +
-        '<div><h1>原子库</h1><div class="sub">原子是可编排的最小动作；点击行查看输入/输出端口契约与副作用。</div></div>' +
-      '</div>' +
-      '<div class="filter-bar" id="atomFilters">' +
+    host.innerHTML = pageHead('原子库', '原子是可编排的最小动作；点击任意一行查看输入/输出端口契约与副作用。') +
+      '<div class="filter-bar">' +
         '<div class="field"><label for="filterDomain">domain</label><select class="select" id="filterDomain"></select></div>' +
         '<div class="field"><label for="filterTag">tag</label><select class="select" id="filterTag"></select></div>' +
         '<div class="field"><label for="filterCategory">category</label><select class="select" id="filterCategory"></select></div>' +
-        '<div class="filter-count" id="atomCount">—</div>' +
+        '<label class="search" aria-label="搜索原子"><span aria-hidden="true">⌕</span>' +
+          '<input type="search" data-search="atoms" placeholder="搜索名称或描述，按 / 聚焦" autocomplete="off"></label>' +
+        '<span class="filter-count" id="atomCount">—</span>' +
       '</div>' +
-      '<div id="atomBody"><div class="loading"><span class="spinner"></span>正在读取原子库…</div></div>';
+      '<div id="atomBody">' + loadingHtml('正在读取原子库…') + '</div>';
 
     var body = $('#atomBody', host);
-    var countEl = $('#atomCount', host);
-    var filterState = APP.atomFilters;
-    var currentList = [];
+    var filters = APP.atomFilters;
+    var query = '';
+    var current = [];
 
-    var applyFilters = function (atoms) {
-      currentList = Array.isArray(atoms) ? atoms : [];
-      body.innerHTML = atomsTableHtml(currentList);
-      if (countEl) countEl.textContent = '共 ' + currentList.length + ' 个原子';
-    };
-
-    var loadFiltered = function () {
-      var qs = [];
-      ['domain', 'tag', 'category'].forEach(function (k) {
-        if (filterState[k]) qs.push(k + '=' + encodeURIComponent(filterState[k]));
+    function apply(list) {
+      var q = query.trim().toLowerCase();
+      current = (list || []).filter(function (a) {
+        if (filters.domain && a.domain !== filters.domain) return false;
+        if (filters.tag && (!Array.isArray(a.tags) || a.tags.indexOf(filters.tag) < 0)) return false;
+        if (filters.category && a.category !== filters.category) return false;
+        if (q) {
+          var hay = ((a.name || '') + ' ' + (a.description || '') + ' ' + (Array.isArray(a.tags) ? a.tags.join(' ') : '')).toLowerCase();
+          if (hay.indexOf(q) < 0) return false;
+        }
+        return true;
       });
-      var url = API + 'atoms' + (qs.length ? '?' + qs.join('&') : '');
-      apiGet(url).then(function (list) {
-        if (!ctx.alive()) return;
-        applyFilters(Array.isArray(list) ? list : []);
-      }).catch(function (err) {
-        if (!ctx.alive()) return;
-        body.innerHTML = '<div id="atomError"></div>';
-        renderError($('#atomError', body), err, loadFiltered, '无法读取原子列表');
-      });
-    };
-
-    var bindFilters = function (atoms) {
-      var dSel = $('#filterDomain', host);
-      var tSel = $('#filterTag', host);
-      var cSel = $('#filterCategory', host);
-      if (!dSel || !tSel || !cSel) return;
-      dSel.innerHTML = optionList(uniq(atoms.map(function (a) { return a.domain; })), filterState.domain, '全部领域');
-      tSel.innerHTML = optionList(collectTags(atoms), filterState.tag, '全部标签');
-      cSel.innerHTML = optionList(uniq(atoms.map(function (a) { return a.category; })), filterState.category, '全部分类');
-      var onChange = function () {
-        filterState.domain = dSel.value;
-        filterState.tag = tSel.value;
-        filterState.category = cSel.value;
-        loadFiltered();
-      };
-      dSel.addEventListener('change', onChange);
-      tSel.addEventListener('change', onChange);
-      cSel.addEventListener('change', onChange);
-    };
+      body.innerHTML = atomsTableHtml(current);
+      var count = $('#atomCount', host);
+      if (count) count.textContent = '共 ' + current.length + ' 个原子';
+    }
 
     apiGet(API + 'atoms').then(function (atoms) {
       if (!ctx.alive()) return;
       var list = Array.isArray(atoms) ? atoms : [];
-      APP.atomsAll = list;
-      bindFilters(list);
-      applyFilters(list);
+      APP.atoms = list;
+      var dSel = $('#filterDomain', host);
+      var tSel = $('#filterTag', host);
+      var cSel = $('#filterCategory', host);
+      if (dSel) dSel.innerHTML = optionList(uniq(list.map(function (a) { return a.domain; })), filters.domain, '全部领域');
+      if (tSel) tSel.innerHTML = optionList(collectTags(list), filters.tag, '全部标签');
+      if (cSel) cSel.innerHTML = optionList(uniq(list.map(function (a) { return a.category; })), filters.category, '全部分类');
+      function onChange() {
+        filters.domain = dSel ? dSel.value : '';
+        filters.tag = tSel ? tSel.value : '';
+        filters.category = cSel ? cSel.value : '';
+        apply(list);
+      }
+      if (dSel) dSel.addEventListener('change', onChange);
+      if (tSel) tSel.addEventListener('change', onChange);
+      if (cSel) cSel.addEventListener('change', onChange);
+      apply(list);
     }).catch(function (err) {
       if (!ctx.alive()) return;
       body.innerHTML = '<div id="atomError"></div>';
-      renderError($('#atomError', body), err, function () { render(); }, '无法读取原子库');
+      renderError($('#atomError', body), err, function () { renderAtoms(host, ctx); }, '无法读取原子库');
+    });
+
+    var search = $('[data-search="atoms"]', host);
+    if (search) search.addEventListener('input', function () {
+      query = search.value;
+      apply(APP.atoms || []);
     });
 
     host.addEventListener('click', function (e) {
       var reset = e.target.closest ? e.target.closest('[data-act="atoms-reset"]') : null;
       if (reset) {
-        filterState.domain = '';
-        filterState.tag = '';
-        filterState.category = '';
+        filters.domain = '';
+        filters.tag = '';
+        filters.category = '';
+        query = '';
         $$('.filter-bar select', host).forEach(function (s) { s.value = ''; });
-        loadFiltered();
+        if (search) search.value = '';
+        apply(APP.atoms || []);
         return;
       }
-      var row = e.target.closest ? e.target.closest('tr[data-atom-idx]') : null;
+      var row = e.target.closest ? e.target.closest('tr[data-href^="#atom:"]') : null;
       if (!row) return;
-      var idx = Number(row.getAttribute('data-atom-idx'));
-      var source = currentList[idx];
-      if (!source) return;
-      openDrawer(esc(source.name || 'atom'), atomDrawerHtml(source), row);
-    }, ctx.signal ? { signal: ctx.signal } : false);
-    host.addEventListener('keydown', function (e) {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      var row = e.target.closest ? e.target.closest('tr[data-atom-idx]') : null;
-      if (!row) return;
-      e.preventDefault();
-      row.click();
+      var name = row.getAttribute('data-href').slice(6);
+      var atom = (APP.atoms || []).filter(function (a) { return a.name === name; })[0];
+      if (!atom) return;
+      openModal({ title: atom.name || '原子', subtitle: atom.category || '', okLabel: null, cancelLabel: '关闭', wide: true, bodyHtml: atomDetailHtml(atom) });
     }, ctx.signal ? { signal: ctx.signal } : false);
   }
 
   /* ================================================================== */
-  /* 12. 领域包                                                          */
+  /* 平台 · 领域包                                                       */
   /* ================================================================== */
   function packCardHtml(pack) {
-    var caps = Array.isArray(pack.capabilities) && pack.capabilities.length
-      ? pack.capabilities.join(' / ') : '无额外能力';
+    var caps = Array.isArray(pack.capabilities) && pack.capabilities.length ? pack.capabilities.join(' / ') : '无额外能力';
     var tags = Array.isArray(pack.tags) ? pack.tags.join(' ') : '';
-    return '' +
-      '<button type="button" class="pack-card" data-pack="' + esc(pack.name) + '">' +
-        '<div class="pack-top">' +
-          '<span class="pack-name">' + esc(pack.name || '未命名包') + '</span>' +
-          '<span class="badge dim">v' + esc(pack.version || '—') + '</span>' +
-          (pack.builtin ? '<span class="badge">内置</span>' : '<span class="badge warn">工作区</span>') +
-          '<span class="badge">' + esc(pack.domain || '未标注领域') + '</span>' +
-        '</div>' +
-        '<div class="pack-desc">' + esc(pack.description || '未提供描述') + '</div>' +
-        '<div class="pack-foot">' +
-          '<span class="pack-count">' + esc(String(typeof pack.atom_count === 'number' ? pack.atom_count : '—')) + ' 个原子</span>' +
-          '<span>' + esc(caps) + '</span>' +
-          (tags ? '<span class="mono">' + esc(tags) + '</span>' : '') +
-        '</div>' +
-      '</button>';
-  }
-
-  function packDrawerHtml(pack) {
-    var atoms = Array.isArray(pack.atoms) ? pack.atoms : [];
-    var atomItems = atoms.map(function (a) {
-      if (typeof a === 'string') {
-        return '<div class="atom-item"><div class="atom-name">' + esc(a) + '</div></div>';
-      }
-      return '<div class="atom-item">' +
-        '<div class="atom-name">' + esc(a.name || '—') + '</div>' +
-        '<div class="atom-desc">' + esc(a.description || '未提供描述') + '</div>' +
-      '</div>';
-    }).join('');
-    var caps = Array.isArray(pack.capabilities) && pack.capabilities.length
-      ? pack.capabilities.map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('')
-      : '<span class="missing">未提供</span>';
-    var requires = Array.isArray(pack.requires) && pack.requires.length
-      ? pack.requires.map(function (r) { return '<span class="chip">' + esc(r) + '</span>'; }).join('')
-      : '<span class="missing">无</span>';
-
-    return '' +
-      '<div class="field"><span class="field-label">描述</span><p>' + esc(pack.description || '未提供描述') + '</p></div>' +
-      '<div class="field"><span class="field-label">元信息</span><div>' +
-        '<span class="chip">version ' + esc(pack.version || '—') + '</span>' +
-        '<span class="chip">domain ' + esc(pack.domain || '—') + '</span>' +
-        '<span class="chip">' + (pack.builtin ? '内置包' : '工作区包') + '</span>' +
-      '</div></div>' +
-      '<div class="field"><span class="field-label">语义 semantics</span><p class="mono">' + esc(pack.semantics || '未提供') + '</p></div>' +
-      '<div class="field"><span class="field-label">能力 capabilities</span><div>' + caps + '</div></div>' +
-      '<div class="field"><span class="field-label">依赖 requires</span><div>' + requires + '</div></div>' +
-      '<div class="field"><span class="field-label">原子清单（' + atoms.length + '）</span>' +
-        (atomItems ? '<div class="atom-list">' + atomItems + '</div>' : '<div class="field-hint">该包没有原子</div>') +
+    return '<button type="button" class="pack-card" data-pack="' + esc(pack.name) + '" data-search-text="' +
+      esc(((pack.name || '') + ' ' + (pack.description || '') + ' ' + (pack.domain || '')).toLowerCase()) + '">' +
+      '<div class="pack-top"><span class="pack-name">' + esc(pack.name || '未命名包') + '</span>' +
+        '<span class="badge dim">v' + esc(pack.version || '—') + '</span>' +
+        (pack.builtin ? '<span class="badge">内置</span>' : '<span class="badge warn">工作区</span>') +
+        '<span class="badge">' + esc(pack.domain || '未标注领域') + '</span>' +
       '</div>' +
-      '<details class="raw"><summary>manifest（原始）</summary><pre class="json-block">' +
-        esc(prettyJson(pack.manifest || {})) + '</pre></details>';
-  }
-
-  function renderPacks(host, ctx) {
-    host.innerHTML = '' +
-      '<div class="page-head">' +
-        '<div><h1>领域包</h1><div class="sub">领域包把原子按业务语义组织起来；点击卡片查看原子清单与 manifest。</div></div>' +
+      '<div class="pack-desc">' + esc(pack.description || '未提供描述') + '</div>' +
+      '<div class="pack-foot"><span class="pack-count">' + esc(String(typeof pack.atom_count === 'number' ? pack.atom_count : '—')) + ' 个原子</span>' +
+        '<span>' + esc(caps) + '</span>' +
+        (tags ? '<span class="mono">' + esc(tags) + '</span>' : '') +
       '</div>' +
-      '<div id="packBody"><div class="loading"><span class="spinner"></span>正在读取领域包…</div></div>';
-
-    var body = $('#packBody', host);
-
-    var load = function () {
-      if (!ctx.alive()) return;
-      body.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取领域包…</div>';
-      apiGet(API + 'packs').then(function (packs) {
-        if (!ctx.alive()) return;
-        if (!Array.isArray(packs) || packs.length === 0) {
-          body.innerHTML = '<div class="empty"><strong>没有可用领域包</strong>' +
-            '<span>工作区里没有发现包定义；内置包应随安装提供。</span></div>';
-          return;
-        }
-        body.innerHTML = '<div class="pack-grid">' + packs.map(packCardHtml).join('') + '</div>';
-      }).catch(function (err) {
-        if (!ctx.alive()) return;
-        body.innerHTML = '<div id="packError"></div>';
-        renderError($('#packError', body), err, load, '无法读取领域包');
-      });
-    };
-    load();
-
-    var openPack = function (name, opener) {
-      openDrawer(esc(name), '<div class="loading"><span class="spinner"></span>正在读取包详情…</div>', opener);
-      apiGet(API + 'packs/' + encodeURIComponent(name)).then(function (pack) {
-        if (!pack || typeof pack !== 'object') throw new ApiError('响应格式不正确', 500, 'bad_response');
-        setDrawerBody(packDrawerHtml(pack));
-      }).catch(function (err) {
-        setDrawerBody(errorHtml(err, '无法读取包 ' + name));
-        var retry = $('#drawerRoot [data-retry]');
-        if (retry) {
-          retry.addEventListener('click', function () { openPack(name, opener); });
-        }
-      });
-    };
-
-    host.addEventListener('click', function (e) {
-      var card = e.target.closest ? e.target.closest('[data-pack]') : null;
-      if (!card) return;
-      openPack(card.getAttribute('data-pack'), card);
-    }, ctx.signal ? { signal: ctx.signal } : false);
-    host.addEventListener('keydown', function (e) {
-      if (e.key !== 'Enter' && e.key !== ' ') return;
-      var card = e.target.closest ? e.target.closest('[data-pack]') : null;
-      if (!card) return;
-      e.preventDefault();
-      card.click();
-    }, ctx.signal ? { signal: ctx.signal } : false);
-  }
-
-
-  /* ================================================================== */
-  /* 13. 任务（CRUD）与从历史修正重跑                                    */
-  /* ================================================================== */
-  var TASK_ID_RE = /^t-[0-9a-f]{6,12}$/;
-
-  var TASK_MODE_HINTS = {
-    demo: '内置演示闭环：7 个用例，适合先验证环境是否可用。',
-    scenario: '选一个场景 YAML 直接执行，配置可反复复用。',
-    intent: '用一句话描述目标，由规划层生成用例（无密钥时走离线规则）。',
-    regression: '复用已沉淀的回归库，不重新规划。'
-  };
-
-  function shortRunId(id) { return id ? String(id).slice(0, 8) : ''; }
-
-  function fileBase(path) {
-    var s = String(path || '');
-    var i = s.lastIndexOf('/');
-    return i >= 0 ? s.slice(i + 1) : s;
-  }
-
-  function stringifyMaybe(v) {
-    if (v === null || v === undefined) return '';
-    if (typeof v === 'object') {
-      try { return JSON.stringify(v); } catch (e) { return String(v); }
-    }
-    return String(v);
-  }
-
-  function taskModeBadge(mode) {
-    var label = MODE_LABEL[mode] || mode || '未知';
-    var cls = mode === 'regression' ? 'heal' : (mode === 'intent' ? 'run' : 'dim');
-    return '<span class="badge ' + cls + '">' + esc(label) + '</span>';
-  }
-
-  function taskTargetHtml(t) {
-    if (t.mode === 'scenario') {
-      var full = t.scenario || '';
-      if (!full) return '<span class="missing">未指定场景</span>';
-      return '<span class="task-target" title="' + esc(full) + '">' + esc(fileBase(full)) + '</span>';
-    }
-    if (t.mode === 'intent') {
-      var intent = (t.intent || '').trim();
-      if (!intent) return '<span class="missing">未填写意图</span>';
-      return '<span class="task-target" title="' + esc(intent) + '">' + esc(intent) + '</span>';
-    }
-    if (t.mode === 'regression') return '<span class="task-target">回归库（复用已沉淀用例）</span>';
-    return '<span class="task-target">内置演示闭环</span>';
-  }
-
-  /* ---------- 确认对话框 ---------- */
-  var confirmState = { resolve: null, opener: null };
-
-  function closeConfirm(result) {
-    var root = $('#confirmRoot');
-    if (!root || root.hidden) return;
-    root.hidden = true;
-    root.innerHTML = '';
-    var resolve = confirmState.resolve;
-    var opener = confirmState.opener;
-    confirmState.resolve = null;
-    confirmState.opener = null;
-    if (opener && typeof opener.focus === 'function') {
-      try { opener.focus(); } catch (e) { /* noop */ }
-    }
-    if (resolve) resolve(result);
-  }
-
-  function confirmDialog(opts) {
-    opts = opts || {};
-    var root = $('#confirmRoot');
-    if (!root) return Promise.resolve(false);
-    if (!root.hidden) closeConfirm(false);
-    return new Promise(function (resolve) {
-      confirmState.resolve = resolve;
-      confirmState.opener = document.activeElement;
-      root.hidden = false;
-      root.innerHTML = '' +
-        '<button type="button" class="confirm-backdrop" data-confirm-cancel tabindex="-1" aria-label="取消"></button>' +
-        '<div class="confirm-box" role="alertdialog" aria-modal="true" aria-labelledby="confirmTitle" aria-describedby="confirmMsg">' +
-          '<h2 id="confirmTitle">' + esc(opts.title || '确认操作') + '</h2>' +
-          '<p id="confirmMsg">' + esc(opts.message || '') + '</p>' +
-          '<div class="confirm-actions">' +
-            '<button type="button" class="btn" data-confirm-cancel>' + esc(opts.cancelLabel || '取消') + '</button>' +
-            '<button type="button" class="btn ' + (opts.danger ? 'btn-danger' : 'btn-primary') + '" data-confirm-ok>' +
-              esc(opts.confirmLabel || '确认') + '</button>' +
-          '</div>' +
-        '</div>';
-      var okBtn = $('[data-confirm-ok]', root);
-      var cancelBtn = $('.confirm-box [data-confirm-cancel]', root);
-      var focusTarget = opts.danger ? cancelBtn : (okBtn || cancelBtn);
-      if (focusTarget) focusTarget.focus();
-      if (okBtn) okBtn.addEventListener('click', function () { closeConfirm(true); }, { once: true });
-      $$('[data-confirm-cancel]', root).forEach(function (b) {
-        b.addEventListener('click', function () { closeConfirm(false); }, { once: true });
-      });
-    });
-  }
-
-  /* ---------- 任务列表 ---------- */
-  function taskRowHtml(t) {
-    var envKeys = Array.isArray(t.env_keys) ? t.env_keys : [];
-    var last = '<span class="missing">未运行</span>';
-    if (t.last_run_id) {
-      last = '<span class="last-run"><a class="row-link" href="#/runs/' + encodeURIComponent(t.last_run_id) + '">' +
-        esc(shortRunId(t.last_run_id)) + '</a>' +
-        (t.last_status ? ' ' + jobBadge(t.last_status) : '') + '</span>';
-    }
-    return '<tr data-task-row="' + esc(t.task_id) + '">' +
-      '<td><div class="task-name">' + esc(t.name || '(未命名任务)') + '</div>' +
-        '<div class="task-id mono">' + esc(t.task_id) + (envKeys.length ? ' · env ' + envKeys.length + ' 项' : '') + '</div></td>' +
-      '<td>' + taskModeBadge(t.mode) + '</td>' +
-      '<td>' + taskTargetHtml(t) + '</td>' +
-      '<td class="tight">' + last + '</td>' +
-      '<td class="tight">' + esc(fmtTs(t.updated_at)) + '</td>' +
-      '<td class="tight"><div class="row-actions">' +
-        '<button type="button" class="btn btn-sm" data-task-run="' + esc(t.task_id) + '" data-task-mode="' + esc(t.mode || '') +
-          '" data-task-name="' + esc(t.name || '') + '">运行</button>' +
-        '<button type="button" class="btn btn-sm" data-task-edit="' + esc(t.task_id) + '">编辑</button>' +
-        '<button type="button" class="btn btn-sm btn-danger-ghost" data-task-del="' + esc(t.task_id) +
-          '" data-task-name="' + esc(t.name || '') + '">删除</button>' +
-      '</div></td>' +
-    '</tr>';
-  }
-
-  function tasksTableHtml(tasks) {
-    return '<div class="table-wrap"><table class="data tasks-table">' +
-      '<thead><tr><th>名称</th><th>模式</th><th>目标</th><th>上次运行</th><th>更新时间</th><th>操作</th></tr></thead>' +
-      '<tbody>' + tasks.map(taskRowHtml).join('') + '</tbody></table></div>';
-  }
-
-  function tasksEmptyHtml() {
-    return '<div class="empty tasks-empty">' +
-      '<strong>还没有保存的任务</strong>' +
-      '<span>任务 = 一套可复用的运行配置（模式 / 场景或意图 / 环境变量）。建好之后一键运行，不必每次重填。</span>' +
-      '<span>也可以从运行历史里挑一条，把当时的配置存成任务再修正重跑。</span>' +
-      '<div class="empty-actions">' +
-        '<button type="button" class="btn btn-primary btn-sm" data-act="task-new">新建任务</button>' +
-        '<button type="button" class="btn btn-sm" data-act="pick-run">从历史挑一条</button>' +
-      '</div>' +
-    '</div>';
-  }
-
-  function deleteTask(taskId, name, reload, btn) {
-    confirmDialog({
-      title: '删除任务「' + (name || taskId) + '」？',
-      message: '只删配置，历史运行保留：仅删除这条任务定义，所有运行记录、报告与回归库都不受影响。此操作不可撤销。',
-      confirmLabel: '删除配置',
-      danger: true
-    }).then(function (ok) {
-      if (!ok) return;
-      if (btn) { btn.disabled = true; btn.textContent = '删除中…'; }
-      apiDelete(API + 'tasks/' + encodeURIComponent(taskId)).then(function () {
-        toast('已删除任务配置：' + (name || taskId), 'ok');
-        if (typeof reload === 'function') reload();
-      }).catch(function (err) {
-        showBanner('error', '<strong>删除失败：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
-      }).then(function () {
-        if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '删除'; }
-      });
-    });
-  }
-
-  function runTaskById(taskId, mode, name, btn) {
-    if (jobIsActive()) {
-      showBanner('warn', '<strong>已有任务在运行。</strong> 完成前不能提交新任务。', 8000);
-      return;
-    }
-    if (btn) { btn.disabled = true; btn.textContent = '提交中…'; }
-    apiPost(API + 'tasks/' + encodeURIComponent(taskId) + '/run', {}).then(function (res) {
-      if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
-      attachJob(res.job_id, mode || '');
-      showBanner('info', '<strong>已提交任务：</strong>' + esc(name || taskId) + ' · ' + esc(res.job_id) + '。进度见右下角面板。', 6000);
-    }).catch(function (err) {
-      if (err && err.code === 'busy') { showBanner('warn', '<strong>已有任务在运行。</strong>', 8000); return; }
-      showBanner('error', '<strong>无法运行任务：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
-    }).then(function () {
-      if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = '运行'; }
-    });
-  }
-
-  function renderTasks(host, ctx) {
-    host.innerHTML = '' +
-      '<div class="page-head">' +
-        '<div><h1>任务</h1><div class="sub">保存运行配置，一键复用；运行不会改动配置，历史运行全部保留。</div></div>' +
-        '<div class="actions">' +
-          '<button type="button" class="btn" data-act="tasks-refresh">刷新</button>' +
-          '<button type="button" class="btn btn-primary" data-act="task-new">新建任务</button>' +
-        '</div>' +
-      '</div>' +
-      '<div id="tasksError"></div>' +
-      '<div id="tasksBody"><div class="loading"><span class="spinner"></span>正在读取任务…</div></div>';
-
-    var body = $('#tasksBody', host);
-    var errHost = $('#tasksError', host);
-
-    var load = function () {
-      if (!ctx.alive()) return;
-      if (errHost) errHost.innerHTML = '';
-      body.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取任务…</div>';
-      apiGet(API + 'tasks').then(function (res) {
-        if (!ctx.alive()) return;
-        var tasks = res && Array.isArray(res.tasks) ? res.tasks : (Array.isArray(res) ? res : []);
-        body.innerHTML = tasks.length ? tasksTableHtml(tasks) : tasksEmptyHtml();
-      }).catch(function (err) {
-        if (!ctx.alive()) return;
-        body.innerHTML = '';
-        renderError(errHost, err, load, '无法读取任务列表');
-      });
-    };
-    load();
-    APP.tasksReload = load;
-
-    host.addEventListener('click', function (e) {
-      var t = e.target;
-      if (!t || !t.closest) return;
-
-      if (t.closest('[data-act="tasks-refresh"]')) { load(); return; }
-      if (t.closest('[data-act="task-new"]')) { location.hash = '#/tasks/new'; return; }
-      if (t.closest('[data-act="pick-run"]')) { openRunsPicker(); return; }
-
-      var runBtn = t.closest('[data-task-run]');
-      if (runBtn) {
-        runTaskById(runBtn.getAttribute('data-task-run'), runBtn.getAttribute('data-task-mode'), runBtn.getAttribute('data-task-name'), runBtn);
-        return;
-      }
-      var editBtn = t.closest('[data-task-edit]');
-      if (editBtn) {
-        location.hash = '#/tasks/' + encodeURIComponent(editBtn.getAttribute('data-task-edit')) + '/edit';
-        return;
-      }
-      var delBtn = t.closest('[data-task-del]');
-      if (delBtn) {
-        deleteTask(delBtn.getAttribute('data-task-del'), delBtn.getAttribute('data-task-name'), load, delBtn);
-        return;
-      }
-    }, ctx.signal ? { signal: ctx.signal } : false);
-  }
-
-  /* ---------- 从历史挑一条（空态入口） ---------- */
-  function pickRunRowHtml(r) {
-    var s = r.summary || {};
-    var verdict = (r.conclusion && r.conclusion.verdict) || (s.success ? '通过' : '存在失败');
-    var ok = !!(s.success === true || (r.conclusion && r.conclusion.success === true));
-    return '<button type="button" class="pick-run" data-pick-run="' + esc(r.run_id) + '">' +
-      '<span class="pick-run-top"><span class="mono">' + esc(r.run_id) + '</span>' +
-        '<span class="badge ' + (ok ? 'ok' : 'bad') + '">' + esc(verdict) + '</span></span>' +
-      '<span class="pick-run-meta">' + esc(fmtTs(r.started_at)) + ' · ' +
-        esc(typeof s.total === 'number' ? s.total + ' 个用例' : '用例数未知') + ' · ' +
-        esc(fmtMs(r.duration_ms)) + '</span>' +
     '</button>';
   }
 
-  function openRunsPicker() {
-    openDrawer('从历史挑一条', '<div class="loading"><span class="spinner"></span>正在读取运行历史…</div>', document.activeElement);
-    var root = $('#drawerRoot');
-    if (!root) return;
-    apiGet(API + 'runs?limit=30').then(function (runs) {
-      if (!runs || !runs.length) {
-        setDrawerBody('<div class="empty"><strong>还没有运行记录</strong><span>先跑一次演示或场景，再回来把配置存成任务。</span><a class="btn btn-sm" href="#/history">打开运行历史</a></div>');
-        return;
-      }
-      setDrawerBody('<p class="drawer-hint">选择一条运行，用它的配置预填任务表单；密钥值会显示为 <code>***</code>。</p>' +
-        '<div class="pick-list">' + runs.map(pickRunRowHtml).join('') + '</div>');
-      root.addEventListener('click', function (e) {
-        var btn = e.target.closest ? e.target.closest('[data-pick-run]') : null;
-        if (!btn) return;
-        var runId = btn.getAttribute('data-pick-run');
-        closeDrawer();
-        location.hash = '#/tasks/new?run=' + encodeURIComponent(runId);
-      }, drawerState.ctrl ? { signal: drawerState.ctrl.signal } : false);
-    }).catch(function (err) {
-      setDrawerBody(errorHtml(err, '无法读取运行历史'));
-      var retry = $('#drawerRoot [data-retry]');
-      if (retry) retry.addEventListener('click', function () { openRunsPicker(); });
-    });
-  }
-
-  /* ---------- 任务表单（新建 / 编辑 / 从运行预填） ---------- */
-  function missingSpan() { return '<span class="missing">未提供</span>'; }
-
-  /* 契约要求原错误固定展示：用例 / 步骤 / message / expected / actual */
-  function fixErrorRows(err) {
-    if (!err) return '';
-    return '' +
-      '<dt>用例</dt><dd>' + (hasVal(err.case) ? esc(err.case) : missingSpan()) + '</dd>' +
-      '<dt>步骤</dt><dd class="mono">' + (hasVal(err.step) ? esc(err.step) : missingSpan()) + '</dd>' +
-      '<dt>错误</dt><dd class="mono">' + (hasVal(err.message) ? esc(err.message) : missingSpan()) + '</dd>' +
-      '<dt>期望</dt><dd>' + (hasVal(err.expected) ? esc(stringifyMaybe(err.expected)) : missingSpan()) + '</dd>' +
-      '<dt>实际</dt><dd>' + (hasVal(err.actual) ? esc(stringifyMaybe(err.actual)) : missingSpan()) + '</dd>';
-  }
-
-  function fixContextHtml(state) {
-    if (!state.runId) return '';
-    var cfg = state.config || {};
-    var err = cfg.error;
-    var rows = fixErrorRows(err);
-    return '<div class="fix-context" role="region" aria-label="原运行错误">' +
-      '<div class="fix-panel">' +
-        '<div class="fix-panel-main">' +
-          '<div class="fix-kicker">按原运行修正 · run <span class="mono">' + esc(state.runId) + '</span></div>' +
-          '<h2>' + (err ? '原运行失败在这里' : '原运行全部通过') + '</h2>' +
-          (rows
-            ? '<dl class="kv-grid compact">' + rows + '</dl>'
-            : '<p class="fix-empty">' + (err ? '服务端未提供更细的错误字段。' : '这条运行没有失败用例，可以直接把当前配置存成任务复用。') + '</p>') +
-          '<p class="fix-hint">改完下面的配置后点「保存并运行」；带 <code>***</code> 的密钥会沿用原运行的真实值。</p>' +
-        '</div>' +
-        '<div class="fix-panel-actions">' +
-          '<a class="btn btn-sm" href="#/runs/' + encodeURIComponent(state.runId) + '">查看原运行</a>' +
-        '</div>' +
+  function packDetailHtml(pack) {
+    var atoms = Array.isArray(pack.atoms) ? pack.atoms : [];
+    var caps = Array.isArray(pack.capabilities) ? pack.capabilities : [];
+    return '<div class="stack">' +
+      '<p>' + esc(pack.description || '未提供描述') + '</p>' +
+      '<div class="chips">' +
+        '<span class="chip">domain ' + esc(pack.domain || '—') + '</span>' +
+        '<span class="chip">v' + esc(pack.version || '—') + '</span>' +
+        '<span class="chip">' + (pack.builtin ? '内置' : '工作区') + '</span>' +
+        '<span class="chip">' + esc(String(pack.atom_count !== undefined ? pack.atom_count : atoms.length)) + ' 个原子</span>' +
       '</div>' +
+      (caps.length ? '<div class="field"><span class="field-label">能力</span><div class="chips">' +
+        caps.map(function (c) { return '<span class="chip">' + esc(c) + '</span>'; }).join('') + '</div></div>' : '') +
+      '<div class="field"><span class="field-label">包含原子</span><div class="chips">' +
+        (atoms.length ? atoms.map(function (a) { return '<span class="chip mono">' + esc(a) + '</span>'; }).join('') : '<span class="missing">未提供</span>') +
+      '</div></div>' +
+      (pack.manifest ? '<details class="raw"><summary>manifest（原始）</summary><pre class="json-block">' + esc(prettyJson(pack.manifest)) + '</pre></details>' : '') +
     '</div>';
   }
 
-  function taskFormHtml(state, seed) {
-    var isEdit = state.kind === 'edit';
-    var fromRun = !!state.runId;
-    var title = isEdit ? '编辑任务' : (fromRun ? '按运行配置新建任务' : '新建任务');
-    var sub = isEdit
-      ? '保存后立即生效；不会改动任何历史运行。'
-      : (fromRun ? '预填自运行 ' + state.runId + '；保存会创建一条新任务。' : '任务保存后可在列表里一键运行。');
-    var modes = ['demo', 'scenario', 'intent', 'regression'].map(function (m) {
-      return '<label><input type="radio" name="mode" value="' + m + '"' +
-        (seed.mode === m ? ' checked' : '') + '><span>' + esc(MODE_LABEL[m]) + '</span></label>';
-    }).join('');
-
-    var envNote = isEdit
-      ? '带 <code>***</code> 的是已保存的密钥：留空或保持 <code>***</code> 表示沿用已保存值；删除整行表示移除该键。'
-      : (fromRun
-        ? (APP.saveAsTaskSupported === false
-          ? '当前后端不支持从历史直存（<code>save_as_task</code> 返回 404）：<strong>「仅保存配置」会跳过带 <code>***</code> 的密钥，保存后直接运行会因缺密钥失败</strong>；请改用「保存并运行」，或保存后手动补齐。'
-          : '带 <code>***</code> 的值来自原运行：「仅保存配置」由服务端复制真实值并应用上方修改（不运行），「保存并运行」会沿用原值。')
-        : '键值对会作为运行时环境传入（如 BASE_URL、API_USERNAME）。留空的行会被忽略。');
-
-    var saveLabel = fromRun ? '仅保存配置' : '保存';
-
-    return '' +
-      '<div class="page-head">' +
-        '<div><h1>' + esc(title) + '</h1><div class="sub">' + esc(sub) + '</div></div>' +
-        '<div class="actions"><a class="btn btn-sm btn-ghost" href="#/tasks">返回任务列表</a></div>' +
-      '</div>' +
-      fixContextHtml(state) +
-      '<form class="form-grid task-form" id="taskForm" novalidate>' +
-        '<div class="field">' +
-          '<label for="taskName">任务名称</label>' +
-          '<input class="input" id="taskName" maxlength="80" autocomplete="off" placeholder="例如：订单闭环冒烟" value="' + esc(seed.name || '') + '">' +
-          '<div class="field-error" data-err="name" hidden></div>' +
-          '<div class="field-hint">1–80 个字符；同名任务允许存在，用 task id 区分。</div>' +
-        '</div>' +
-        '<div class="field">' +
-          '<span class="field-label" id="taskModeLabel">运行模式</span>' +
-          '<div class="segmented" role="radiogroup" aria-labelledby="taskModeLabel">' + modes + '</div>' +
-          '<div class="field-hint" id="taskModeHint"></div>' +
-        '</div>' +
-        '<div class="field" data-when="scenario" hidden>' +
-          '<label for="taskScenario">场景文件</label>' +
-          '<select class="select" id="taskScenario"><option value="">加载中…</option></select>' +
-          '<div class="field-hint" id="taskScenarioNote">正在读取场景列表…</div>' +
-          '<div class="field-error" data-err="scenario" hidden></div>' +
-        '</div>' +
-        '<div class="field" data-when="intent" hidden>' +
-          '<label for="taskIntent">意图描述</label>' +
-          '<textarea class="textarea" id="taskIntent" autocomplete="off" placeholder="例如：检查健康状态并验证登录下单">' + esc(seed.intent || '') + '</textarea>' +
-          '<div class="field-hint">一句话目标；无模型密钥时由离线规则生成计划。</div>' +
-          '<div class="field-error" data-err="intent" hidden></div>' +
-        '</div>' +
-        '<div class="field">' +
-          '<span class="field-label">环境变量</span>' +
-          '<div class="env-rows" id="taskEnvRows"></div>' +
-          '<div><button type="button" class="btn btn-sm" id="taskAddEnv">+ 添加环境变量</button></div>' +
-          '<div class="field-hint">' + envNote + '</div>' +
-          '<div class="field-error" data-err="env" hidden></div>' +
-        '</div>' +
-        '<div class="field">' +
-          '<label class="checkbox"><input type="checkbox" id="taskRegression"' + (seed.regression ? ' checked' : '') + '><span>运行后执行回归（regression）</span></label>' +
-          '<label class="checkbox"><input type="checkbox" id="taskNoLlm"' + (seed.no_llm ? ' checked' : '') + '><span>强制离线规则规划（no_llm）</span></label>' +
-        '</div>' +
-        '<div class="form-actions">' +
-          '<button type="submit" class="btn btn-primary" id="taskSave" data-label="' + esc(saveLabel) + '">' + esc(saveLabel) + '</button>' +
-          '<button type="button" class="btn" id="taskSaveRun">保存并运行</button>' +
-          '<button type="button" class="btn btn-ghost" id="taskCancel">取消</button>' +
-          '<span class="form-note" id="taskNote">保存后可在任务列表一键运行。</span>' +
-        '</div>' +
-        '<div id="taskFormError" aria-live="assertive"></div>' +
-      '</form>';
-  }
-
-  function taskSeed(state) {
-    if (state.task) {
-      var t = state.task;
-      return {
-        name: t.name || '',
-        mode: MODE_LABEL[t.mode] ? t.mode : 'demo',
-        scenario: t.scenario || '',
-        intent: t.intent || '',
-        env: t.env && typeof t.env === 'object' ? t.env : {},
-        regression: !!t.regression,
-        no_llm: !!t.no_llm
-      };
-    }
-    if (state.config) {
-      var c = state.config;
-      return {
-        name: '修正重跑 · ' + shortRunId(state.runId),
-        mode: MODE_LABEL[c.mode] ? c.mode : 'scenario',
-        scenario: c.scenario || '',
-        intent: c.intent || '',
-        env: c.env && typeof c.env === 'object' ? c.env : {},
-        regression: !!c.regression,
-        no_llm: !!c.no_llm
-      };
-    }
-    return { name: '', mode: 'demo', scenario: '', intent: '', env: {}, regression: false, no_llm: false };
-  }
-
-  function clearTaskErrors(form) {
-    $$('[data-err]', form).forEach(function (el) { el.textContent = ''; el.hidden = true; });
-    var host = $('#taskFormError', form);
-    if (host) host.innerHTML = '';
-  }
-
-  function setTaskFieldError(form, key, msg) {
-    var el = $('[data-err="' + key + '"]', form);
-    if (el) { el.textContent = msg || ''; el.hidden = !msg; }
-    if (!msg) return;
-    var target = key === 'name' ? $('#taskName', form)
-      : key === 'scenario' ? $('#taskScenario', form)
-      : key === 'intent' ? $('#taskIntent', form)
-      : key === 'env' ? $('[data-env-key]', form) : null;
-    if (target && typeof target.focus === 'function') target.focus();
-  }
-
-  function collectTaskPayload(form) {
-    var nameEl = $('#taskName', form);
-    var name = nameEl ? nameEl.value.trim() : '';
-    if (!name) return { error: '任务名称不能为空。', field: 'name' };
-    if (name.length > 80) return { error: '任务名称最长 80 个字符。', field: 'name' };
-
-    var mode = getMode(form);
-    var scenario = '';
-    var intent = '';
-    if (mode === 'scenario') {
-      var sel = $('#taskScenario', form);
-      scenario = sel ? sel.value : '';
-      if (!scenario) return { error: '场景模式必须选择一个场景文件。', field: 'scenario' };
-    }
-    if (mode === 'intent') {
-      var intentEl = $('#taskIntent', form);
-      intent = intentEl ? intentEl.value.trim() : '';
-      if (!intent) return { error: '意图模式必须填写一句话目标。', field: 'intent' };
-    }
-
-    var envResult = collectEnv(form);
-    if (envResult.errors.length) return { error: envResult.errors.join('；'), field: 'env' };
-
-    return {
-      payload: {
-        name: name,
-        mode: mode,
-        scenario: scenario,
-        intent: intent,
-        env: envResult.env,
-        regression: !!($('#taskRegression', form) && $('#taskRegression', form).checked),
-        no_llm: !!($('#taskNoLlm', form) && $('#taskNoLlm', form).checked)
+  function renderPacks(host, ctx) {
+    host.innerHTML = pageHead('领域包', '领域包把一组原子与能力语义打包；点击查看包含的原子与 manifest。') +
+      '<div id="packBody">' + loadingHtml('正在读取领域包…') + '</div>';
+    var body = $('#packBody', host);
+    apiGet(API + 'packs').then(function (packs) {
+      if (!ctx.alive()) return;
+      var list = Array.isArray(packs) ? packs : [];
+      if (!list.length) {
+        body.innerHTML = emptyHtml('还没有注册领域包', '内置包会随发行版提供；工作区包放在 packs/ 下。');
+        return;
       }
-    };
-  }
-
-  function taskBodyFromPayload(payload) {
-    return {
-      name: payload.name,
-      mode: payload.mode,
-      scenario: payload.scenario,
-      intent: payload.intent,
-      env: payload.env,
-      regression: payload.regression,
-      no_llm: payload.no_llm
-    };
-  }
-
-  function mergeEnvForPatch(env, originalEnv) {
-    var out = {};
-    Object.keys(env).forEach(function (k) { out[k] = env[k]; });
-    Object.keys(originalEnv || {}).forEach(function (k) {
-      if (!Object.prototype.hasOwnProperty.call(env, k)) out[k] = null;
-    });
-    return out;
-  }
-
-  function runTaskAfterSave(saved, mode) {
-    var id = saved && saved.task_id;
-    if (!id) return Promise.reject(new ApiError('服务端未返回 task_id，无法提交运行', 500, 'bad_response'));
-    return apiPost(API + 'tasks/' + encodeURIComponent(id) + '/run', {}).then(function (res) {
-      if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
-      attachJob(res.job_id, mode || (saved && saved.mode) || '');
-      return res.job_id;
-    });
-  }
-
-  function setTaskBusy(form, busy) {
-    if (!form) return;
-    ['#taskSave', '#taskSaveRun', '#taskCancel'].forEach(function (sel) {
-      var b = $(sel, form);
-      if (b) b.disabled = busy;
-    });
-    var save = $('#taskSave', form);
-    var saveRun = $('#taskSaveRun', form);
-    if (save) save.textContent = busy ? '提交中…' : (save.getAttribute('data-label') || '保存');
-    if (saveRun) saveRun.textContent = busy ? '提交中…' : '保存并运行';
-    var note = $('#taskNote', form);
-    if (note) note.textContent = busy ? '正在提交，请勿重复点击。' : '保存后可在任务列表一键运行。';
-  }
-
-  function submitTaskForm(form, state, thenRun) {
-    if (state.busy) return;
-    clearTaskErrors(form);
-
-    var collected = collectTaskPayload(form);
-    if (collected.error) {
-      setTaskFieldError(form, collected.field, collected.error);
-      return;
-    }
-
-    if (thenRun && jobIsActive()) {
-      showBanner('warn', '<strong>已有任务在运行。</strong> 完成前不能提交新任务；可以先只保存配置。', 8000);
-      return;
-    }
-
-    var payload = collected.payload;
-    state.busy = true;
-    setTaskBusy(form, true);
-
-    var done = function (saved, opts) {
-      opts = opts || {};
-      state.busy = false;
-      setTaskBusy(form, false);
-      var name = (saved && saved.name) || payload.name;
-      if (opts.degraded) {
-        goRoute('#/tasks', {
-          kind: 'warn',
-          ttl: 0,
-          html: '<strong>任务已保存，但当前后端不支持从历史直存（HTTP 404）。</strong> 已跳过密钥：<b>' +
-            esc((opts.skipped || []).join('、')) +
-            '</b>。该任务直接运行会因缺密钥失败；请到编辑页补齐，或改用「保存并运行」。'
+      body.innerHTML = '<div class="toolbar"><label class="search" aria-label="搜索领域包"><span aria-hidden="true">⌕</span>' +
+        '<input type="search" data-search="packs" placeholder="搜索名称或描述，按 / 聚焦" autocomplete="off"></label>' +
+        '<span class="toolbar-spacer"></span><span class="filter-count">共 ' + list.length + ' 个领域包</span></div>' +
+        '<div class="pack-grid" id="packGrid">' + list.map(packCardHtml).join('') + '</div>';
+      var input = $('[data-search="packs"]', host);
+      if (input) input.addEventListener('input', function () {
+        var q = input.value.trim().toLowerCase();
+        $$('.pack-card', body).forEach(function (card) {
+          card.hidden = !!q && (card.getAttribute('data-search-text') || '').indexOf(q) < 0;
         });
-      } else if (opts.viaEndpoint) {
-        if (opts.patchError) {
-          goRoute('#/tasks', {
-            kind: 'warn',
-            ttl: 0,
-            html: '<strong>任务已保存：</strong>' + esc(name) +
-              '（env 已从原运行复制），但表单里的修改未生效：' + esc(opts.patchError) +
-              '。请到编辑页重新保存。'
-          });
-        } else {
-          goRoute('#/tasks', {
-            kind: 'info',
-            html: '<strong>任务已保存：</strong>' + esc(name) + '（含原运行的完整环境变量）',
-            ttl: 8000
-          });
-        }
-      } else if (opts.job) {
-        var jobExtra = '';
-        if (opts.skipped && opts.skipped.length) {
-          jobExtra = ' 注意：' + esc(opts.skipped.join('、')) + ' 的值不会回传前端，新任务里需要重新填写。';
-        }
-        goRoute('#/tasks', {
-          kind: 'info',
-          html: '<strong>' + (opts.rerun ? '已按原配置修正并提交运行：' : '任务已保存并提交运行：') + '</strong>' +
-            esc(name) + ' · ' + esc(opts.job) + jobExtra,
-          ttl: 8000
+      });
+      body.addEventListener('click', function (e) {
+        var card = e.target.closest ? e.target.closest('[data-pack]') : null;
+        if (!card) return;
+        var name = card.getAttribute('data-pack');
+        apiGet(API + 'packs/' + enc(name)).then(function (pack) {
+          openModal({ title: pack.name || name, subtitle: pack.domain || '', okLabel: null, cancelLabel: '关闭', wide: true, bodyHtml: packDetailHtml(pack) });
+        }).catch(function (err) {
+          toast('无法读取领域包：' + (err && err.message ? err.message : '未知错误'), 'error');
         });
-      } else {
-        var extra = '';
-        if (opts.skipped && opts.skipped.length) {
-          extra = ' 注意：' + esc(opts.skipped.join('、')) + ' 的值不会回传前端，未写入新任务，请在编辑页补齐。';
-        }
-        goRoute('#/tasks', { kind: 'info', html: '<strong>任务已保存：</strong>' + esc(name) + extra, ttl: 8000 });
-      }
-    };
+      }, ctx.signal ? { signal: ctx.signal } : false);
+    }).catch(function (err) {
+      if (!ctx.alive()) return;
+      body.innerHTML = '<div id="packError"></div>';
+      renderError($('#packError', body), err, function () { renderPacks(host, ctx); }, '无法读取领域包');
+    });
+  }
 
-    var fail = function (err) {
-      state.busy = false;
-      setTaskBusy(form, false);
-      var host = $('#taskFormError', form);
-      if (host) {
-        host.innerHTML = errorHtml(err, '保存失败');
-        var retry = $('[data-retry]', host);
-        if (retry) retry.addEventListener('click', function () { submitTaskForm(form, state, thenRun); });
-      }
-      if (err && err.status === 409) {
-        showBanner('warn', '<strong>任务重复或已有运行：</strong>' + esc(err.message || ''), 8000);
-      }
-    };
+  /* ================================================================== */
+  /* 平台 · 任务模板                                                     */
+  /* ================================================================== */
+  var MODE_LABEL = { demo: '演示', scenario: '场景', intent: '意图', regression: '回归' };
 
-    /* 从运行的配置新建任务 */
-    if (state.runId && !state.task) {
-      var masked = Object.keys(payload.env).filter(function (k) { return payload.env[k] === '***'; });
-      var cfg = state.config || {};
-      var coreChanged = payload.mode !== (cfg.mode || payload.mode) ||
-        (payload.mode === 'scenario' && payload.scenario !== (cfg.scenario || '')) ||
-        (payload.mode === 'intent' && payload.intent !== (cfg.intent || ''));
+  function taskTarget(task) {
+    if (task.mode === 'scenario') return task.scenario || '未配置场景';
+    if (task.mode === 'intent') return task.intent || '未配置意图';
+    return MODE_LABEL[task.mode] || task.mode || '—';
+  }
 
-      if (thenRun) {
-        if (!coreChanged) {
-          // 服务端以磁盘真实 env 为基线，*** 表示沿用；顺带把本次覆盖写成任务
-          apiPost(API + 'runs/' + encodeURIComponent(state.runId) + '/rerun', {
-            env: payload.env,
-            save_as_task: true,
-            name: payload.name
-          }).then(function (res) {
-            if (!res || !res.job_id) throw new ApiError('服务端未返回 job_id，无法跟踪任务状态', 500, 'bad_response');
-            attachJob(res.job_id, payload.mode);
-            done({ name: payload.name }, { job: res.job_id, rerun: true });
-          }).catch(fail);
+  function tasksHtml(tasks) {
+    if (!tasks.length) {
+      return emptyHtml('还没有任务模板', '任务模板适合固定场景的一键运行；项目内的套件更适合多套件编排。',
+        '<button type="button" class="btn btn-primary" data-act="new-task">新建任务</button>');
+    }
+    return dataTable([
+      { label: '任务', render: function (t) {
+          return '<span class="cell-main">' + esc(t.name || t.task_id) + '</span>' +
+            '<div class="cell-sub">' + esc(MODE_LABEL[t.mode] || t.mode || '—') + ' · ' + esc(t.task_id) + '</div>';
+        } },
+      { label: '目标', render: function (t) { return '<span class="mono word-break">' + esc(taskTarget(t)) + '</span>'; } },
+      { label: '最近状态', render: function (t) {
+          return t.last_status ? badge(t.last_status === 'done' ? 'passed' : t.last_status) : '<span class="missing">未运行</span>';
+        } },
+      { label: '更新时间', render: function (t) { return '<span class="nowrap">' + esc(fmtTs(t.updated_at)) + '</span>'; } },
+      { label: '操作', cls: 'tight', render: function (t) {
+          return '<span class="row">' +
+            '<button type="button" class="btn btn-sm" data-task-run="' + esc(t.task_id) + '">运行</button>' +
+            '<button type="button" class="btn btn-sm" data-task-edit="' + esc(t.task_id) + '">编辑</button>' +
+            '<button type="button" class="btn btn-sm btn-ghost" data-task-del="' + esc(t.task_id) + '">删除</button>' +
+          '</span>';
+        } }
+    ], tasks);
+  }
+
+  function renderTasks(host, ctx) {
+    host.innerHTML = pageHead('任务模板', '固定的单场景/意图任务，适合一键回归；项目内的套件用于多套件编排。',
+      '<button type="button" class="btn btn-primary" data-act="new-task">＋ 新建任务</button>') +
+      '<div id="taskBody">' + loadingHtml('正在读取任务模板…') + '</div>';
+    var body = $('#taskBody', host);
+    var tasks = [];
+
+    function refresh() {
+      body.innerHTML = loadingHtml('正在读取任务模板…');
+      return apiGet(API + 'tasks').then(function (payload) {
+        if (!ctx.alive()) return;
+        tasks = payload && Array.isArray(payload.tasks) ? payload.tasks : [];
+        APP.tasks = tasks;
+        if (!tasks.length) {
+          body.innerHTML = tasksHtml(tasks);
           return;
         }
-        // 模式/场景/意图有改动：rerun 无法表达，只能新建任务（密钥需重新填写）
-        var runBody = taskBodyFromPayload(payload);
-        masked.forEach(function (k) { delete runBody.env[k]; });
-        apiPost(API + 'tasks', runBody).then(function (saved) {
-          return runTaskAfterSave(saved, payload.mode).then(function (jobId) {
-            done(saved, { job: jobId, skipped: masked });
-          });
-        }).catch(fail);
-        return;
-      }
-
-      var fallbackSave = function () {
-        var body = taskBodyFromPayload(payload);
-        masked.forEach(function (k) { delete body.env[k]; });
-        apiPost(API + 'tasks', body).then(function (saved) {
-          done(saved, { skipped: masked, degraded: masked.length > 0 });
-        }).catch(fail);
-      };
-
-      // v2.0.2：优先让服务端从磁盘复制真实 env（不运行、不产生新 run）
-      if (APP.saveAsTaskSupported === false) {
-        fallbackSave();
-        return;
-      }
-      apiPost(API + 'runs/' + encodeURIComponent(state.runId) + '/save_as_task', {
-        name: payload.name
-      }).then(function (saved) {
-        APP.saveAsTaskSupported = true;
-        // 端点只收 name：把预填表单里改过的 env / 模式叠加到已复制的真实 env 上
-        var cfg = state.config || {};
-        var patch = {
-          mode: payload.mode,
-          scenario: payload.scenario,
-          intent: payload.intent,
-          regression: payload.regression,
-          no_llm: payload.no_llm,
-          env: mergeEnvForPatch(payload.env, cfg.env || {})
-        };
-        return apiPatch(API + 'tasks/' + encodeURIComponent(saved.task_id), patch).then(function (updated) {
-          done(updated || saved, { viaEndpoint: true });
-        }).catch(function (err) {
-          done(saved, { viaEndpoint: true, patchError: err && err.message ? err.message : '未知错误' });
+        body.innerHTML = '<div class="toolbar"><label class="search" aria-label="搜索任务"><span aria-hidden="true">⌕</span>' +
+          '<input type="search" data-search="tasks" placeholder="搜索任务名称，按 / 聚焦" autocomplete="off"></label>' +
+          '<span class="toolbar-spacer"></span><span class="filter-count">共 ' + tasks.length + ' 个任务</span></div>' +
+          '<div id="taskTable">' + tasksHtml(tasks) + '</div>';
+        var input = $('[data-search="tasks"]', body);
+        if (input) input.addEventListener('input', function () {
+          var q = input.value.trim().toLowerCase();
+          var filtered = tasks.filter(function (t) { return ((t.name || '') + ' ' + (t.task_id || '')).toLowerCase().indexOf(q) >= 0; });
+          var table = $('#taskTable', body);
+          if (table) table.innerHTML = tasksHtml(filtered);
         });
       }).catch(function (err) {
-        if (err && err.status === 404) {
-          // 旧后端没有该端点：退回旧行为，但用常驻横幅明确风险
-          APP.saveAsTaskSupported = false;
-          fallbackSave();
-          return;
-        }
-        fail(err);
-      });
-      return;
-    }
-
-    /* 编辑已有任务 */
-    if (state.task) {
-      var patchBody = taskBodyFromPayload(payload);
-      patchBody.env = mergeEnvForPatch(payload.env, state.task.env || {});
-      apiPatch(API + 'tasks/' + encodeURIComponent(state.taskId), patchBody).then(function (saved) {
-        var safeSaved = saved || { task_id: state.taskId, name: payload.name };
-        if (!thenRun) { done(safeSaved, {}); return; }
-        return runTaskAfterSave(safeSaved, payload.mode).then(function (jobId) {
-          done(safeSaved, { job: jobId });
-        });
-      }).catch(fail);
-      return;
-    }
-
-    /* 新建任务 */
-    apiPost(API + 'tasks', taskBodyFromPayload(payload)).then(function (saved) {
-      if (!thenRun) { done(saved, {}); return; }
-      return runTaskAfterSave(saved, payload.mode).then(function (jobId) {
-        done(saved, { job: jobId });
-      });
-    }).catch(fail);
-  }
-
-  function buildTaskForm(host, ctx, state, seed) {
-    host.innerHTML = taskFormHtml(state, seed);
-    var form = $('#taskForm', host);
-    if (!form) return;
-
-    var envRows = $('#taskEnvRows', form);
-    var seedKeys = Object.keys(seed.env || {});
-    if (seedKeys.length) {
-      seedKeys.forEach(function (k) {
-        var v = seed.env[k];
-        addEnvRow(envRows, k, v, { masked: v === '***' });
-      });
-      addEnvRow(envRows);
-    } else {
-      addEnvRow(envRows);
-    }
-
-    if (state.runId && !state.task && APP.saveAsTaskSupported === false) {
-      var maskedKeys = seedKeys.filter(function (k) { return seed.env[k] === '***'; });
-      if (maskedKeys.length) {
-        var warn = document.createElement('div');
-        warn.className = 'form-warning';
-        warn.setAttribute('role', 'alert');
-        warn.innerHTML = '<strong>降级模式：</strong>当前后端没有 <code>save_as_task</code> 端点（HTTP 404）。' +
-          '「仅保存配置」会跳过这些密钥：<b>' + esc(maskedKeys.join('、')) + '</b>；' +
-          '保存后直接运行会因缺密钥失败。请改用「保存并运行」，或保存后到编辑页补齐。';
-        var envField = envRows && envRows.parentNode;
-        if (envField) envField.appendChild(warn);
-      }
-    }
-
-    var addBtn = $('#taskAddEnv', form);
-    if (addBtn) {
-      addBtn.addEventListener('click', function () {
-        addEnvRow(envRows);
-        var inputs = $$('[data-env-key]', envRows);
-        if (inputs.length) inputs[inputs.length - 1].focus();
-      });
-    }
-    if (envRows) {
-      envRows.addEventListener('click', function (e) {
-        var btn = e.target.closest ? e.target.closest('[data-remove-env]') : null;
-        if (!btn) return;
-        var row = btn.closest('.env-row');
-        if (row && row.parentNode) row.parentNode.removeChild(row);
-      });
-    }
-
-    var applyMode = function () {
-      var mode = getMode(form);
-      $$('[data-when]', form).forEach(function (block) {
-        var modes = (block.getAttribute('data-when') || '').split(/\s+/);
-        block.hidden = modes.indexOf(mode) < 0;
-      });
-      var hint = $('#taskModeHint', form);
-      if (hint) hint.textContent = TASK_MODE_HINTS[mode] || '';
-      setTaskFieldError(form, 'scenario', '');
-      setTaskFieldError(form, 'intent', '');
-      setTaskFieldError(form, 'env', '');
-    };
-    $$('input[name="mode"]', form).forEach(function (r) { r.addEventListener('change', applyMode); });
-    applyMode();
-
-    form.addEventListener('submit', function (e) {
-      e.preventDefault();
-      submitTaskForm(form, state, false);
-    });
-    var saveRun = $('#taskSaveRun', form);
-    if (saveRun) saveRun.addEventListener('click', function () { submitTaskForm(form, state, true); });
-    var cancel = $('#taskCancel', form);
-    if (cancel) cancel.addEventListener('click', function () {
-      if (state.busy) return;
-      location.hash = '#/tasks';
-    });
-
-    loadScenarios($('#taskScenario', form), $('#taskScenarioNote', form), ctx, seed.scenario || '');
-
-    // 键盘优先：进入表单即把焦点放到第一个可编辑字段
-    var nameEl = $('#taskName', form);
-    if (nameEl) nameEl.focus();
-  }
-
-  function renderTaskForm(host, ctx, route) {
-    var state = {
-      kind: route.mode,
-      taskId: route.id || '',
-      runId: (route.query && route.query.run) || '',
-      task: null,
-      config: null,
-      busy: false
-    };
-
-    if (state.kind === 'edit' && !TASK_ID_RE.test(state.taskId)) {
-      renderError(host, new ApiError('task_id 不合法：应以 t- 开头并跟 6–12 位十六进制字符', 400, 'bad_request'), function () {
-        location.hash = '#/tasks';
-      }, '无法编辑任务');
-      return;
-    }
-    if (state.runId && !RUN_ID_RE.test(state.runId)) {
-      renderError(host, new ApiError('run_id 不合法，无法读取运行配置', 400, 'bad_request'), function () {
-        location.hash = '#/tasks';
-      }, '无法读取运行配置');
-      return;
-    }
-
-    host.innerHTML = '<div class="loading"><span class="spinner"></span>正在读取任务配置…</div>';
-
-    var prepare;
-    if (state.kind === 'edit') {
-      prepare = apiGet(API + 'tasks/' + encodeURIComponent(state.taskId)).then(function (t) {
-        if (!t || typeof t !== 'object') throw new ApiError('响应缺少任务字段', 500, 'bad_response');
-        state.task = t;
-        if (t.task_id && t.task_id !== state.taskId) state.taskId = t.task_id;
-      });
-    } else if (state.runId) {
-      prepare = apiGet(API + 'runs/' + encodeURIComponent(state.runId) + '/config').then(function (cfg) {
-        if (!cfg || typeof cfg !== 'object') throw new ApiError('响应缺少运行配置', 500, 'bad_response');
-        state.config = cfg;
-      });
-    } else {
-      prepare = Promise.resolve();
-    }
-
-    prepare.then(function () {
-      if (!ctx.alive()) return;
-      buildTaskForm(host, ctx, state, taskSeed(state));
-    }).catch(function (err) {
-      if (!ctx.alive()) return;
-      host.innerHTML = '<div class="page-head"><div><h1>任务</h1><div class="sub">无法读取配置</div></div>' +
-        '<div class="actions"><a class="btn" href="#/tasks">返回任务列表</a></div></div><div id="taskLoadError"></div>';
-      renderError($('#taskLoadError', host), err, function () { render(); }, '无法读取任务配置');
-    });
-  }
-
-
-  /* ================================================================== */
-  /* 13.6 登录认证                                                       */
-  /* ================================================================== */
-  function showBoot() {
-    var app = $('#appShell');
-    if (app) app.hidden = true;
-    var login = $('#loginRoot');
-    if (login) { login.hidden = true; login.innerHTML = ''; }
-    var boot = $('#bootRoot');
-    if (boot) boot.hidden = false;
-  }
-
-  function setAuthChrome() {
-    var who = $('#whoami');
-    var out = $('#logoutBtn');
-    var show = !!(APP.auth.authenticated && !APP.auth.legacy);
-    if (who) {
-      who.hidden = !show;
-      who.textContent = show ? (APP.auth.user || '') : '';
-      who.title = show && APP.auth.user ? '当前账号：' + APP.auth.user : '';
-    }
-    if (out) out.hidden = !show;
-  }
-
-  function showAppView() {
-    var boot = $('#bootRoot');
-    if (boot) boot.hidden = true;
-    var login = $('#loginRoot');
-    if (login) { login.hidden = true; login.innerHTML = ''; }
-    var app = $('#appShell');
-    if (app) app.hidden = false;
-    var skip = $('.skip-link');
-    if (skip) skip.hidden = false;
-    setAuthChrome();
-  }
-
-  function loginCardHtml(opts) {
-    opts = opts || {};
-    return '' +
-      '<div class="login-card" role="main" aria-labelledby="loginTitle">' +
-        '<div class="login-brand">' +
-          '<svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true" focusable="false">' +
-            '<path d="M7 24L16 6l9 18z" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linejoin="round"></path>' +
-            '<path d="M11.5 19h9" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"></path>' +
-          '</svg>' +
-          '<div><h1 id="loginTitle">登录 PanguVerse</h1><div class="sub">自动化编排控制台</div></div>' +
-        '</div>' +
-        (opts.notice ? '<div class="login-notice" role="status">' + esc(opts.notice) + '</div>' : '') +
-        '<div class="login-error" id="loginError" role="alert"' + (opts.error ? '' : ' hidden') + '>' +
-          esc(opts.error || '') + '</div>' +
-        '<form class="login-form" id="loginForm" novalidate>' +
-          '<div class="field">' +
-            '<label for="loginUser">账号</label>' +
-            '<input class="input" id="loginUser" name="username" autocomplete="username" spellcheck="false" placeholder="admin" value="' + esc(opts.user || '') + '">' +
-          '</div>' +
-          '<div class="field">' +
-            '<label for="loginPass">密码</label>' +
-            '<input class="input" id="loginPass" name="password" type="password" autocomplete="current-password" spellcheck="false" placeholder="输入密码">' +
-          '</div>' +
-          '<button type="submit" class="btn btn-primary" id="loginSubmit">登录</button>' +
-          (opts.retry ? '<button type="button" class="btn btn-sm btn-ghost" data-auth-retry>重新检测服务端</button>' : '') +
-        '</form>' +
-        '<div class="login-foot">会话有效期 12 小时；刷新页面会校验服务端会话。</div>' +
-      '</div>';
-  }
-
-  function setLoginError(message) {
-    var el = $('#loginError');
-    if (!el) return;
-    el.textContent = message || '';
-    el.hidden = !message;
-  }
-
-  function bindLoginView(root) {
-    var form = $('#loginForm', root);
-    if (form) {
-      form.addEventListener('submit', function (e) {
-        e.preventDefault();
-        submitLogin(form);
-      });
-    }
-    var retry = $('[data-auth-retry]', root);
-    if (retry) retry.addEventListener('click', function () { initAuth(); });
-  }
-
-  function showLoginView(opts) {
-    opts = opts || {};
-    var boot = $('#bootRoot');
-    if (boot) boot.hidden = true;
-    var app = $('#appShell');
-    if (app) app.hidden = true;
-    var skip = $('.skip-link');
-    if (skip) skip.hidden = true;
-    var root = $('#loginRoot');
-    if (!root) return;
-    root.hidden = false;
-    root.innerHTML = loginCardHtml(opts);
-    bindLoginView(root);
-    document.title = '登录 · PanguVerse';
-    var userEl = $('#loginUser', root);
-    var pwdEl = $('#loginPass', root);
-    if (userEl && !userEl.value) userEl.focus();
-    else if (pwdEl) pwdEl.focus();
-  }
-
-  function submitLogin(form) {
-    if (!form || form.dataset.busy === '1') return;
-    var userEl = $('#loginUser', form);
-    var pwdEl = $('#loginPass', form);
-    var btn = $('#loginSubmit', form);
-    var username = userEl ? userEl.value.trim() : '';
-    var password = pwdEl ? pwdEl.value : '';
-
-    if (!username || !password) {
-      setLoginError('请输入账号和密码。');
-      if (!username && userEl) userEl.focus();
-      else if (pwdEl) pwdEl.focus();
-      return;
-    }
-
-    form.dataset.busy = '1';
-    setLoginError('');
-    if (btn) { btn.disabled = true; btn.textContent = '登录中…'; }
-
-    apiPost(API + 'auth/login', { username: username, password: password }).then(function (res) {
-      if (pwdEl) pwdEl.value = '';
-      form.dataset.busy = '';
-      APP.auth.authenticated = true;
-      APP.auth.user = (res && res.user) || username;
-      APP.auth.legacy = false;
-      APP.auth.redirecting = false;
-
-      var next = APP.auth.next;
-      APP.auth.next = null;
-      if (!next || next.charAt(0) !== '#' || next === '#') next = '#/overview';
-
-      showAppView();
-      restoreJob();
-      if (location.hash !== next) location.hash = next;
-      else render();
-      refreshStatus();
-      toast('已登录：' + (APP.auth.user || username), 'ok');
-    }).catch(function (err) {
-      if (pwdEl) pwdEl.value = '';
-      form.dataset.busy = '';
-      if (btn) { btn.disabled = false; btn.textContent = '登录'; }
-      setLoginError(err && err.message ? err.message : '登录失败');
-      if (pwdEl) pwdEl.focus();
-    });
-  }
-
-  function resetClientState() {
-    stopJobTimers();
-    APP.job = { id: null, mode: '', data: null, error: null, lost: false, startedLocal: 0, poll: null, tick: null, dismiss: false, notified: null };
-    try { localStorage.removeItem('pv.activeJob'); } catch (e) { /* noop */ }
-    APP.status = null;
-    APP.atomsAll = null;
-    APP.atomFilters = { domain: '', tag: '', category: '' };
-    APP.pendingBanner = null;
-    APP.bannerRoute = null;
-    APP.lastRoute = null;
-    APP.tasksReload = null;
-    APP.saveAsTaskSupported = null;
-    APP.seq++;
-    if (APP.controller) {
-      try { APP.controller.abort(); } catch (e) { /* noop */ }
-      APP.controller = null;
-    }
-    hideBanner();
-    closeDrawer();
-    var confirmRoot = $('#confirmRoot');
-    if (confirmRoot && !confirmRoot.hidden) closeConfirm(false);
-    var dock = $('#jobDock');
-    if (dock) { dock.hidden = true; dock.innerHTML = ''; }
-    var view = $('#view');
-    if (view) view.innerHTML = '';
-    var toasts = $('#toasts');
-    if (toasts) toasts.innerHTML = '';
-  }
-
-  function handleUnauthorized() {
-    if (!APP.auth.authenticated || APP.auth.redirecting) return;
-    APP.auth.redirecting = true;
-    APP.auth.legacy = false;
-    var h = location.hash;
-    APP.auth.next = (h && h.charAt(0) === '#' && h !== '#' && h !== '#/overview') ? h : null;
-    APP.auth.authenticated = false;
-    APP.auth.user = '';
-    resetClientState();
-    showLoginView({ notice: '登录已过期，请重新登录' });
-    setTimeout(function () { APP.auth.redirecting = false; }, 0);
-  }
-
-  function doLogout(btn) {
-    if (APP.auth.loggingOut) return;
-    APP.auth.loggingOut = true;
-    if (btn) { btn.disabled = true; btn.textContent = '退出中…'; }
-    apiPost(API + 'auth/logout', {}).then(finishLogout).catch(function (err) {
-      if (err && err.status === 401) { finishLogout(); return; }
-      APP.auth.loggingOut = false;
-      if (btn) { btn.disabled = false; btn.textContent = '退出登录'; }
-      showBanner('error', '<strong>退出失败：</strong>' + esc(err && err.message ? err.message : '未知错误'), 0);
-    });
-
-    function finishLogout() {
-      APP.auth.loggingOut = false;
-      APP.auth.authenticated = false;
-      APP.auth.user = '';
-      APP.auth.legacy = false;
-      APP.auth.next = null;
-      APP.auth.redirecting = false;
-      resetClientState();
-      showLoginView({ notice: '已退出登录' });
-      if (btn) { btn.disabled = false; btn.textContent = '退出登录'; }
-    }
-  }
-
-  function initAuth() {
-    showBoot();
-    apiGet(API + 'auth/status').then(function (st) {
-      var disabled = !!(st && (st.auth_disabled === true || st.auth_enabled === false));
-      if (st && (st.authenticated === true || disabled)) {
-        APP.auth.authenticated = true;
-        APP.auth.user = st.user || '';
-        APP.auth.legacy = disabled;
-        var h = location.hash;
-        APP.auth.next = (!disabled && h && h.indexOf('#/') === 0 && h !== '#/overview') ? h : null;
-        showAppView();
-        restoreJob();
-        render();
-        if (parseRoute().name !== 'overview') refreshStatus();
-        return;
-      }
-      APP.auth.authenticated = false;
-      APP.auth.user = '';
-      APP.auth.legacy = false;
-      var cur = location.hash;
-      APP.auth.next = (cur && cur.indexOf('#/') === 0 && cur !== '#/overview') ? cur : null;
-      showLoginView({});
-    }).catch(function (err) {
-      if (err && err.status === 404) {
-        // 旧后端或 --no-auth 未暴露 auth/status：按无认证模式继续
-        APP.auth.authenticated = true;
-        APP.auth.legacy = true;
-        APP.auth.user = '';
-        showAppView();
-        restoreJob();
-        render();
-        if (parseRoute().name !== 'overview') refreshStatus();
-        return;
-      }
-      if (err && err.status === 401) {
-        APP.auth.authenticated = false;
-        APP.auth.legacy = false;
-        showLoginView({});
-        return;
-      }
-      showLoginView({
-        error: '无法读取登录状态：' + (err && err.message ? err.message : '未知错误'),
-        retry: true
-      });
-    });
-  }
-
-  /* ================================================================== */
-  /* 14. 路由                                                            */
-  /* ================================================================== */
-  function parseQuery(qs) {
-    var out = {};
-    if (!qs) return out;
-    qs.split('&').forEach(function (pair) {
-      if (!pair) return;
-      var i = pair.indexOf('=');
-      var k = i < 0 ? pair : pair.slice(0, i);
-      var v = i < 0 ? '' : pair.slice(i + 1);
-      try {
-        out[decodeURIComponent(k)] = decodeURIComponent(v.replace(/\+/g, ' '));
-      } catch (e) {
-        out[k] = v;
-      }
-    });
-    return out;
-  }
-
-  function parseRoute() {
-    var raw = (location.hash || '').replace(/^#/, '');
-    var qIndex = raw.indexOf('?');
-    var h = qIndex >= 0 ? raw.slice(0, qIndex) : raw;
-    var query = parseQuery(qIndex >= 0 ? raw.slice(qIndex + 1) : '');
-    if (!h || h === '/') return { name: 'overview' };
-    var m = /^\/runs\/([^\/?#]+)\/?$/.exec(h);
-    if (m) return { name: 'run-detail', id: decodeURIComponent(m[1]) };
-    if (h === '/tasks' || h === '/tasks/') return { name: 'tasks' };
-    if (h === '/tasks/new' || h === '/tasks/new/') return { name: 'task-form', mode: 'new', query: query };
-    var mEdit = /^\/tasks\/([^\/]+)\/edit\/?$/.exec(h);
-    if (mEdit) return { name: 'task-form', mode: 'edit', id: decodeURIComponent(mEdit[1]), query: query };
-    if (h === '/overview' || h === '/run' || h === '/history' || h === '/atoms' || h === '/packs') {
-      return { name: h.slice(1) };
-    }
-    return { name: 'notfound', path: h };
-  }
-
-  function setNav(activeName) {
-    var navKey = activeName === 'run-detail' ? 'history' : (activeName === 'task-form' ? 'tasks' : activeName);
-    $$('[data-nav]').forEach(function (a) {
-      if (a.getAttribute('data-nav') === navKey) {
-        a.setAttribute('aria-current', 'page');
-      } else {
-        a.removeAttribute('aria-current');
-      }
-    });
-  }
-
-  function notFoundHtml(path) {
-    return '' +
-      '<div class="page-head"><div><h1>页面不存在</h1>' +
-        '<div class="sub">没有匹配的路由：<span class="mono">' + esc(path) + '</span></div></div></div>' +
-      '<div class="empty"><strong>可用视图</strong>' +
-        '<span><a href="#/overview">#/overview</a> · <a href="#/run">#/run</a> · <a href="#/tasks">#/tasks</a> · ' +
-        '<a href="#/history">#/history</a> · <a href="#/runs/&lt;run_id&gt;">#/runs/&lt;run_id&gt;</a> · ' +
-        '<a href="#/atoms">#/atoms</a> · <a href="#/packs">#/packs</a></span>' +
-      '</div>';
-  }
-
-  function render() {
-    if (!APP.auth.authenticated) return;
-    var seq = ++APP.seq;
-    var route = parseRoute();
-    var host = $('#view');
-    if (!host) return;
-
-    if (APP.controller) {
-      try { APP.controller.abort(); } catch (e) { /* noop */ }
-    }
-    APP.controller = (typeof AbortController === 'function') ? new AbortController() : null;
-
-    var routeKey = route.name + ':' + (route.id || '');
-    if (APP.lastRoute !== routeKey && APP.lastRoute !== null) {
-      try { window.scrollTo(0, 0); } catch (e) { /* noop */ }
-    }
-    if (APP.bannerRoute && APP.bannerRoute !== routeKey) hideBanner();
-    APP.lastRoute = routeKey;
-
-    closeDrawer();
-    var confirmRoot = $('#confirmRoot');
-    if (confirmRoot && !confirmRoot.hidden) closeConfirm(false);
-    setNav(route.name);
-
-    if (APP.pendingBanner) {
-      var pb = APP.pendingBanner;
-      APP.pendingBanner = null;
-      showBanner(pb.kind, pb.html, pb.ttl);
-    }
-
-    var title = ROUTE_TITLE[route.name] || 'PanguVerse';
-    var crumb = $('#crumb');
-    if (crumb) crumb.textContent = title;
-    document.title = title + ' · PanguVerse';
-
-    var ctx = {
-      alive: function () { return seq === APP.seq; },
-      signal: APP.controller ? APP.controller.signal : undefined
-    };
-
-    host.innerHTML = '<div class="loading"><span class="spinner"></span>加载中…</div>';
-    if (route.name !== 'tasks') APP.tasksReload = null;
-
-    var task;
-    if (route.name === 'overview') task = renderOverview(host, ctx);
-    else if (route.name === 'run') task = renderRun(host, ctx);
-    else if (route.name === 'tasks') task = renderTasks(host, ctx);
-    else if (route.name === 'task-form') task = renderTaskForm(host, ctx, route);
-    else if (route.name === 'history') task = renderHistory(host, ctx);
-    else if (route.name === 'run-detail') task = renderDetail(host, ctx, route.id);
-    else if (route.name === 'atoms') task = renderAtoms(host, ctx);
-    else if (route.name === 'packs') task = renderPacks(host, ctx);
-    else { host.innerHTML = notFoundHtml(route.path || ''); return; }
-
-    if (task && typeof task.catch === 'function') {
-      task.catch(function (err) {
         if (!ctx.alive()) return;
-        host.innerHTML = '<div id="routeError"></div>';
-        renderError($('#routeError', host), err, function () { render(); }, '页面渲染失败');
+        body.innerHTML = '<div id="taskError"></div>';
+        renderError($('#taskError', body), err, refresh, '无法读取任务模板');
       });
     }
+
+    body.addEventListener('click', function (e) {
+      var run = e.target.closest ? e.target.closest('[data-task-run]') : null;
+      var edit = e.target.closest ? e.target.closest('[data-task-edit]') : null;
+      var del = e.target.closest ? e.target.closest('[data-task-del]') : null;
+      if (run) { runTaskById(run.getAttribute('data-task-run'), run, refresh); return; }
+      if (edit) { openTaskModal(edit.getAttribute('data-task-edit'), refresh); return; }
+      if (del) {
+        var id = del.getAttribute('data-task-del');
+        var task = tasks.filter(function (t) { return t.task_id === id; })[0];
+        confirmDialog({
+          title: '删除任务模板',
+          bodyHtml: '确定删除任务「' + esc(task ? (task.name || id) : id) + '」？<br>历史运行不会被删除。',
+          okLabel: '删除任务',
+          danger: true
+        }).then(function (ok) {
+          if (!ok) return;
+          apiDelete(API + 'tasks/' + enc(id)).then(function () {
+            toast('任务已删除', 'ok');
+            refresh();
+          }).catch(function (err) {
+            toast('删除失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+          });
+        });
+      }
+    }, ctx.signal ? { signal: ctx.signal } : false);
+
+    refresh();
   }
 
-  /* ================================================================== */
-  /* 14. 全局事件与启动                                                  */
-  /* ================================================================== */
-  function startDemo() {
-    startRun({ mode: 'demo' }).then(function () {
-      showBanner('info', '<strong>已提交内置演示任务。</strong> 进度显示在右下角任务面板，完成后点击「查看运行详情」。', 6000);
+  function runTaskById(taskId, btn, onDone) {
+    if (btn && btn.disabled) return;
+    if (btn) { btn.disabled = true; btn.innerHTML = '<span class="spinner" aria-hidden="true"></span>'; }
+    apiPost(API + 'tasks/' + enc(taskId) + '/run', {}).then(function (res) {
+      var jobId = res && res.job_id;
+      if (!jobId) throw new ApiError('服务端没有返回 job_id', 500, 'bad_payload');
+      watchJob(jobId, {
+        label: '任务运行',
+        hrefFor: function (job) { return job && job.run_id ? '#/runs/' + enc(job.run_id) : ''; },
+        onDone: function () { if (typeof onDone === 'function') onDone(); }
+      });
+      toast('已提交任务运行', 'ok');
     }).catch(function (err) {
-      if (err && err.code === 'busy') return;
-      showBanner('error', '<strong>无法启动演示：</strong>' + esc(err.message), 0);
+      toast('提交失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+    }).then(function () {
+      if (btn) { btn.disabled = false; btn.textContent = '运行'; }
     });
   }
 
-  function startRegression() {
-    startRun({ mode: 'regression' }).then(function () {
-      showBanner('info', '<strong>已提交回归任务。</strong> 复用回归库执行，不重新规划。', 6000);
+  function openTaskModal(taskId, onSaved) {
+    var editing = !!taskId;
+    var loadTask = editing ? apiGet(API + 'tasks/' + enc(taskId)) : Promise.resolve(null);
+    Promise.all([loadTask, loadScenarios()]).then(function (results) {
+      var task = results[0];
+      var scenarios = results[1];
+      var mode = task && task.mode ? task.mode : 'scenario';
+      var fixedMode = mode === 'demo' || mode === 'regression';
+      var env = task && task.env && typeof task.env === 'object' ? task.env : {};
+      var entries = envEntriesFromObject(env, editing);
+      var envKeysOnly = task && Array.isArray(task.env_keys) ? task.env_keys : [];
+      if (editing && !Object.keys(env).length && envKeysOnly.length) {
+        // 旧后端只给键名时，仍展示可覆盖输入（留空沿用）
+        entries = envKeysOnly.map(function (k) { return { key: k, value: '', existing: true }; });
+      }
+      var scenarioField = '<div class="field" id="taskScenarioField"' + (mode === 'intent' || fixedMode ? ' hidden' : '') + '>' +
+        '<label for="taskScenario">场景文件</label><select class="select mono" id="taskScenario">' +
+        scenarioOptionsHtml(scenarios, task ? task.scenario : '') + '</select></div>';
+      var intentField = '<div class="field" id="taskIntentField"' + (mode === 'intent' ? '' : ' hidden') + '>' +
+        '<label for="taskIntent">意图</label><textarea class="textarea" id="taskIntent" placeholder="用一句自然语言描述要测什么">' +
+        esc(task ? (task.intent || '') : '') + '</textarea></div>';
+      var modeField = fixedMode
+        ? '<div class="notice info"><span aria-hidden="true">ⓘ</span><div>这是' + esc(MODE_LABEL[mode] || mode) + '任务，只能修改名称与环境变量；运行目标保持原样。</div></div>'
+        : '<div class="field"><label for="taskMode">运行模式</label><select class="select" id="taskMode">' +
+            '<option value="scenario"' + (mode === 'scenario' ? ' selected' : '') + '>场景（固定 YAML）</option>' +
+            '<option value="intent"' + (mode === 'intent' ? ' selected' : '') + '>意图（自然语言）</option>' +
+          '</select></div>';
+
+      openModal({
+        title: editing ? '编辑任务' : '新建任务',
+        subtitle: '任务模板是单场景/意图的一键入口；多套件编排请使用项目。',
+        okLabel: editing ? '保存任务' : '创建任务',
+        wide: true,
+        bodyHtml:
+          '<div class="field"><label for="taskName">任务名称</label>' +
+            '<input class="input" id="taskName" value="' + esc(task ? (task.name || '') : '') + '" placeholder="例如 站点冒烟" maxlength="80" autocomplete="off"></div>' +
+          modeField + scenarioField + intentField +
+          '<div class="field"><span class="field-label">环境变量</span>' +
+            envEditorBlock({ entries: entries, note: '密钥以 *** 返回；留空沿用，点 ✕ 删除该键。' }) + '</div>' +
+          '<div class="row">' +
+            '<label class="check"><input type="checkbox" id="taskRegression"' + (task && task.regression ? ' checked' : '') + '> 复用回归库</label>' +
+            '<label class="check"><input type="checkbox" id="taskNoLlm"' + (task && task.no_llm ? ' checked' : '') + '> 不调用模型</label>' +
+          '</div>',
+        onMount: function (rootEl) {
+          var editor = mountEnvEditor($('[data-env-editor]', rootEl), entries, { placeholder: '值' });
+          rootEl._envEditor = editor;
+          var modeSel = $('#taskMode', rootEl);
+          if (modeSel) {
+            modeSel.addEventListener('change', function () {
+              var sf = $('#taskScenarioField', rootEl);
+              var inf = $('#taskIntentField', rootEl);
+              if (sf) sf.hidden = modeSel.value !== 'scenario';
+              if (inf) inf.hidden = modeSel.value !== 'intent';
+            });
+          }
+        },
+        onSubmit: function (rootEl) {
+          var nameEl = $('#taskName', rootEl);
+          var name = nameEl ? nameEl.value.trim() : '';
+          if (!name) { if (nameEl) nameEl.focus(); return Promise.reject(new ApiError('请填写任务名称', 0, 'validation')); }
+          var body = {
+            name: name,
+            env: rootEl._envEditor ? rootEl._envEditor.collect({ existing: editing }) : {},
+            regression: !!($('#taskRegression', rootEl) && $('#taskRegression', rootEl).checked),
+            no_llm: !!($('#taskNoLlm', rootEl) && $('#taskNoLlm', rootEl).checked)
+          };
+          if (!fixedMode) {
+            var modeSel = $('#taskMode', rootEl);
+            var targetMode = modeSel ? modeSel.value : 'scenario';
+            body.mode = targetMode;
+            if (targetMode === 'scenario') {
+              var sc = $('#taskScenario', rootEl);
+              if (!sc || !sc.value) return Promise.reject(new ApiError('请选择场景文件', 0, 'validation'));
+              body.scenario = sc.value;
+            } else {
+              var intentEl = $('#taskIntent', rootEl);
+              var intent = intentEl ? intentEl.value.trim() : '';
+              if (!intent) return Promise.reject(new ApiError('请填写意图', 0, 'validation'));
+              body.intent = intent;
+            }
+          }
+          var req = editing ? apiPatch(API + 'tasks/' + enc(taskId), body) : apiPost(API + 'tasks', body);
+          return req.then(function () {
+            toast(editing ? '任务已更新' : '任务已创建', 'ok');
+            if (typeof onSaved === 'function') setTimeout(onSaved, 0);
+            return true;
+          });
+        }
+      });
     }).catch(function (err) {
-      if (err && err.code === 'busy') return;
-      showBanner('error', '<strong>无法启动回归：</strong>' + esc(err.message), 0);
+      toast('无法打开任务：' + (err && err.message ? err.message : '未知错误'), 'error');
     });
   }
+
+  /* ================================================================== */
+  /* 移动端导航                                                          */
+  /* ================================================================== */
+  function openMobileNav() {
+    var sidebar = $('#sidebar');
+    var scrim = $('#sidebarScrim');
+    var btn = $('[data-act="toggle-sidebar"]');
+    if (sidebar) sidebar.classList.add('is-open');
+    if (scrim) scrim.hidden = false;
+    if (btn) btn.setAttribute('aria-expanded', 'true');
+  }
+
+  function closeMobileNav() {
+    var sidebar = $('#sidebar');
+    var scrim = $('#sidebarScrim');
+    var btn = $('[data-act="toggle-sidebar"]');
+    if (sidebar) sidebar.classList.remove('is-open');
+    if (scrim) scrim.hidden = true;
+    if (btn) btn.setAttribute('aria-expanded', 'false');
+  }
+
+  /* ================================================================== */
+  /* 全局动作                                                            */
+  /* ================================================================== */
+  function deleteProject(pid) {
+    getProject(pid).then(function (project) {
+      confirmDialog({
+        title: '删除项目',
+        bodyHtml: '确定删除项目「' + esc(project.name || pid) + '」？<br>' +
+          '只会删除项目配置与套件绑定，<b>不会删除任何历史运行</b>。',
+        okLabel: '删除项目',
+        danger: true
+      }).then(function (ok) {
+        if (!ok) return;
+        apiDelete(API + 'projects/' + enc(pid)).then(function () {
+          invalidateProject(pid);
+          APP.projects = null;
+          loadProjects(true).catch(function () {});
+          toast('项目已删除', 'ok');
+          go('#/projects');
+        }).catch(function (err) {
+          toast('删除失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+        });
+      });
+    }).catch(function (err) {
+      toast('无法读取项目：' + (err && err.message ? err.message : '未知错误'), 'error');
+    });
+  }
+
+  var ACTIONS = {
+    'logout': function (el) { doLogout(el); },
+    'toggle-sidebar': function () { openMobileNav(); },
+    'close-sidebar': function () { closeMobileNav(); },
+    'new-project': function () { openProjectModal(); },
+    'from-history': function () { openHistoryGuide(); },
+    'reload-projects': function () {
+      loadProjects(true).catch(function (err) {
+        toast('项目列表读取失败：' + (err && err.message ? err.message : '未知错误'), 'error');
+      });
+    },
+    'run-all': function (el) {
+      if (el && el.disabled) return;
+      startRunAll(el.getAttribute('data-pid') || '', el);
+    },
+    'new-suite': function (el) {
+      var pid = el.getAttribute('data-pid') || '';
+      if (!pid) return;
+      getProject(pid).then(function (project) { openSuiteModal(pid, project, null); })
+        .catch(function (err) { toast('无法读取项目：' + (err && err.message ? err.message : '未知错误'), 'error'); });
+    },
+    'delete-project': function (el) { deleteProject(el.getAttribute('data-pid') || ''); },
+    'job-close': function () { stopJobWatcher(); },
+    'new-task': function () { openTaskModal(null, function () { render(); }); },
+    'clear-project-search': function () {
+      var input = $('[data-search="projects"]');
+      if (input) {
+        input.value = '';
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.focus();
+      }
+    }
+  };
 
   function bindGlobalEvents() {
     document.addEventListener('click', function (e) {
@@ -3639,39 +3797,74 @@
       var actEl = target.closest('[data-act]');
       if (actEl) {
         var act = actEl.getAttribute('data-act');
-        if (act === 'run-demo') { e.preventDefault(); startDemo(); }
-        else if (act === 'run-regression') { e.preventDefault(); startRegression(); }
-        else if (act === 'job-dismiss') { APP.job.dismiss = true; renderJobPanels(); }
-        else if (act === 'job-detail') { location.hash = '#/runs/' + actEl.getAttribute('data-run'); }
-        else if (act === 'logout') { e.preventDefault(); doLogout(actEl); }
+        if (ACTIONS[act]) {
+          e.preventDefault();
+          ACTIONS[act](actEl);
+          return;
+        }
       }
-
-      if (target.closest('[data-drawer-close]')) { closeDrawer(); return; }
+      if (target.closest('[data-modal-close]')) { closeModal(null); return; }
       if (target.closest('[data-banner-close]')) { hideBanner(); return; }
 
       var row = target.closest('tr[data-href]');
       if (row && !target.closest('a') && !target.closest('button')) {
-        location.hash = row.getAttribute('data-href');
+        var href = row.getAttribute('data-href');
+        if (href && href.indexOf('#/') === 0) location.hash = href;
       }
     });
 
     document.addEventListener('keydown', function (e) {
-      if (e.key === 'Tab') {
-        var cRoot = $('#confirmRoot');
-        if (!cRoot || cRoot.hidden) return;
-        var focusables = $$('button:not([tabindex="-1"])', cRoot);
-        if (focusables.length < 2) return;
-        var first = focusables[0];
-        var last = focusables[focusables.length - 1];
-        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
-        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      if (MODAL.open) {
+        if (e.key === 'Escape') { e.preventDefault(); closeModal(null); return; }
+        if (e.key === 'Tab') {
+          var root = $('#modalRoot');
+          if (!root) return;
+          var f = $$('button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])', root)
+            .filter(function (el) { return el.offsetParent !== null && !el.disabled; });
+          if (!f.length) return;
+          var first = f[0];
+          var last = f[f.length - 1];
+          if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+          else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+        }
         return;
       }
-      if (e.key === 'Escape') {
-        var confirmRoot = $('#confirmRoot');
-        if (confirmRoot && !confirmRoot.hidden) { closeConfirm(false); return; }
-        if (!$('#drawerRoot').hidden) { closeDrawer(); return; }
-        if (!$('#globalBanner').hidden) hideBanner();
+
+      if (e.key === 'Escape') { closeMobileNav(); return; }
+
+      var t = e.target;
+      var typing = t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable);
+      if (typing) return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (e.key === '/') {
+        var searches = $$('[data-search]').filter(function (el) { return el.offsetParent !== null; });
+        if (searches.length) {
+          e.preventDefault();
+          searches[0].focus();
+          try { searches[0].select(); } catch (err) { /* noop */ }
+        }
+        return;
+      }
+
+      if (e.key === 'g') {
+        bindGlobalEvents._g = Date.now();
+        return;
+      }
+      if (e.key === 'p' && bindGlobalEvents._g && (Date.now() - bindGlobalEvents._g) < 900) {
+        bindGlobalEvents._g = 0;
+        e.preventDefault();
+        go('#/projects');
+        return;
+      }
+      bindGlobalEvents._g = 0;
+
+      if (e.key === 'Enter') {
+        var activeRow = t && t.closest ? t.closest('tr[data-href]') : null;
+        if (activeRow) {
+          var href = activeRow.getAttribute('data-href');
+          if (href && href.indexOf('#/') === 0) location.hash = href;
+        }
       }
     });
 
@@ -3684,10 +3877,13 @@
     });
   }
 
+  /* ================================================================== */
+  /* 启动                                                                */
+  /* ================================================================== */
   function boot() {
     bindGlobalEvents();
     if (!location.hash || location.hash === '#' || location.hash === '#/') {
-      try { history.replaceState(null, '', '#/overview'); } catch (e) { location.hash = '#/overview'; }
+      try { history.replaceState(null, '', DEFAULT_HASH); } catch (e) { location.hash = DEFAULT_HASH; }
     }
     initAuth();
   }
