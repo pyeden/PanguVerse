@@ -222,12 +222,16 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `source` 只有 `llm` / `rules` 两种。无 LLM 密钥（常见情况）→ `rules` +
   `degraded_reason="未配置 LLM 密钥，使用离线规则总结"`；LLM 异常、超时（单次上限 25s）或返回不是合法 JSON
   → 仍然 `200`，`source="rules"` 并在 `degraded_reason` 写明原因。**只有 `run_id` 非法（400）或 run 不存在（404）才报错。**
-- `stats` 永远取自 `report.summary`（`total/passed/failed/errored/skipped/healed_cases/duration_ms`，逐字相等），
+- `stats` 永远取自 `report.summary` 的**全字段**（含 `steps` / `http_requests` / `success`，逐字相等），
   LLM 不参与任何统计数字。
 - 规则内容只从 `report.json` 取数：失败按 `failure_kind` / `error.kind` / 状态码归为
   `config`（沙箱文件缺失）、`auth`（401/403）、`engine`（capture 路径不存在 / 目标不可达）、`assertion`（正文或期望不符）、
   `flaky`；`findings`/`suggestions` 里的 `case_ids` 一律来自报告。`plan.source == "memory"` 且存在失败时，
   追加 `mixed_target`（回归库混跑不同被测目标）并给出一条 P1「按场景分组回归」建议。
+- **LLM 输出确定性校正（v3.0.1 §3.5）**：模型只负责措辞，数字/归类/优先级不采信——
+  `stats` 全字段覆盖；`findings` 的 `kind`/`case_ids`/`detail` 由报告重建（错归类的 case_id 剔除、模型漏掉的类用规则补齐）；
+  有失败时强制至少一条覆盖配置/环境失败的 P0（模型没给就由规则注入）；`summary_md` 的计数句与用例清单按校正后数据重新渲染；
+  标题含数字或与结果矛盾时回退规则结论句。每次校正写入响应/缓存的 `corrections[]`（`{"field","reason"}`）便于审计。
 - LLM 输入只放打码后的摘要：`summary`、`plan.source`、失败用例/步骤的 `case/step/message/expected/actual/failure_kind`、
   env **键名**；复用 `mask_env_payload` + `core/redact.mask_obj`，体积 ≤ 40KB。输出落盘/返回前再按同一套规则打码，
   因此响应与缓存文件里不会出现 env 值、密码或 token。

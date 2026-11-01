@@ -17,6 +17,7 @@ import json
 import re
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
@@ -32,8 +33,6 @@ LLM_MAX_FAILURES = 40
 
 DEGRADED_NO_LLM = "未配置 LLM 密钥，使用离线规则总结"
 DEGRADED_TIMEOUT = f"LLM 生成超时（>{LLM_TIMEOUT:.0f}s），已降级为离线规则总结"
-
-STATS_KEYS = ("total", "passed", "failed", "errored", "skipped", "healed_cases", "duration_ms")
 
 KIND_LABELS = {
     "config": "沙箱文件缺失（检查 FS_ROOT / CREDS_FILE）",
@@ -105,9 +104,8 @@ def _list(value: Any) -> list[Any]:
 
 
 def stats_from_report(report: dict[str, Any]) -> dict[str, Any]:
-    """``stats`` 必须与 ``report.summary`` 逐字相等（只取契约字段）。"""
-    summary = _dict(report.get("summary"))
-    return {key: summary.get(key, 0) for key in STATS_KEYS}
+    """``stats`` 用 ``report.summary`` **全字段**覆盖（v3.0.1 §3.5.1，逐字相等）。"""
+    return dict(_dict(report.get("summary")))
 
 
 def _plan_source(report: dict[str, Any], plan: dict[str, Any] | None) -> str:
@@ -602,6 +600,7 @@ def rules_payload(
         "findings": _findings(failures, groups, plan_source),
         "suggestions": suggestions,
         "stats": stats,
+        "corrections": [],
     }
 
 
@@ -614,7 +613,7 @@ def _digest(
     """LLM 输入：只放打码后的摘要 + 键名，体积 <= 40KB。"""
     summary = _dict(report.get("summary"))
     digest: dict[str, Any] = {
-        "summary": {key: summary.get(key, 0) for key in (*STATS_KEYS, "steps", "http_requests", "success")},
+        "summary": dict(summary),
         "plan_source": _plan_source(report, plan),
         "env_keys": _env_keys(report, plan)[:200],
         "targets": sorted({key for item in failures for key in item.targets}),
@@ -663,34 +662,126 @@ def _with_deadline(fn: Any, timeout: float) -> Any:
     return box.get("value")
 
 
-def _clean_items(raw: Any, valid_ids: set[str], *, findings: bool) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for entry in _list(raw)[:12]:
+def _digit_free(text: str) -> bool:
+    """判断一段措辞里有没有数字（有数字的模型文本一律不采信）。"""
+    return not any(char.isdigit() for char in text)
+
+
+def _correct_findings(
+    model_findings: Any,
+    rules_findings: list[dict[str, Any]],
+    case_kinds: dict[str, str],
+) -> tuple[list[dict[str, Any]], int, int]:
+    """按报告重建 findings：kind/case_ids/detail 全部以规则为准（§3.5.2）。
+
+    模型只可能在「单一 kind + 无数字」时贡献标题措辞；错归类的 case_id 一律剔除，
+    报告有而模型漏掉的类由规则补齐。
+    """
+    model_by_kind: dict[str, dict[str, Any]] = {}
+    dropped = 0
+    for entry in _list(model_findings)[:12]:
+        entry = _dict(entry)
+        kind = str(entry.get("kind") or "").strip().lower()
+        raw_ids = [case_id for case_id in _list(entry.get("case_ids")) if isinstance(case_id, str)]
+        if kind == "mixed_target":
+            valid = [case_id for case_id in raw_ids if case_id in case_kinds]
+        elif kind in _ALLOWED_FINDING_KINDS:
+            valid = [case_id for case_id in raw_ids if case_kinds.get(case_id) == kind]
+        else:
+            dropped += len(raw_ids)
+            continue
+        dropped += len(raw_ids) - len(valid)
+        if not valid:
+            continue
+        bucket = model_by_kind.setdefault(kind, {"case_ids": [], "title": ""})
+        for case_id in valid:
+            if case_id not in bucket["case_ids"]:
+                bucket["case_ids"].append(case_id)
+        title = entry.get("title")
+        if not bucket["title"] and isinstance(title, str) and title.strip():
+            bucket["title"] = title.strip()
+
+    kind_counts = Counter(rule["kind"] for rule in rules_findings)
+    corrected: list[dict[str, Any]] = []
+    filled = 0
+    for rule in rules_findings:
+        kind = rule["kind"]
+        model = model_by_kind.get(kind)
+        title = rule["title"]
+        if model and kind_counts[kind] == 1 and _digit_free(model["title"]):
+            title = model["title"]
+        if model is None:
+            filled += 1
+        corrected.append(
+            {
+                "kind": kind,
+                "title": title,
+                "detail": rule["detail"],
+                "case_ids": list(rule["case_ids"]),
+            }
+        )
+    return corrected, dropped, filled
+
+
+def _correct_suggestions(
+    model_suggestions: Any,
+    rules_suggestions: list[dict[str, Any]],
+    failures: list[_Failure],
+    valid_ids: set[str],
+) -> tuple[list[dict[str, Any]], int, str]:
+    """建议可保留模型措辞，但 case_ids 必须在报告里；有失败时强制至少一条 P0。"""
+    corrected: list[dict[str, Any]] = []
+    dropped = 0
+    for entry in _list(model_suggestions)[:12]:
         entry = _dict(entry)
         title = entry.get("title")
         if not isinstance(title, str) or not title.strip():
             continue
-        case_ids = [
-            case_id
-            for case_id in _list(entry.get("case_ids"))
-            if isinstance(case_id, str) and case_id in valid_ids
-        ]
+        raw_ids = [case_id for case_id in _list(entry.get("case_ids")) if isinstance(case_id, str)]
+        case_ids = [case_id for case_id in raw_ids if case_id in valid_ids]
+        dropped += len(raw_ids) - len(case_ids)
+        priority = str(entry.get("priority") or "").strip().upper()
         detail = entry.get("detail")
-        item = {
-            "title": title.strip(),
-            "detail": detail.strip() if isinstance(detail, str) else "",
-            "case_ids": case_ids,
-        }
-        if findings:
-            kind = str(entry.get("kind") or "").strip().lower()
-            item["kind"] = kind if kind in _ALLOWED_FINDING_KINDS else "engine"
-        else:
-            priority = str(entry.get("priority") or "").strip().upper()
-            item["priority"] = priority if priority in _PRIORITIES else "P1"
-        items.append(item)
-    if not findings:
-        items.sort(key=lambda item: _PRIORITIES.index(item["priority"]))
-    return items
+        corrected.append(
+            {
+                "priority": priority if priority in _PRIORITIES else "P1",
+                "title": title.strip(),
+                "detail": detail.strip() if isinstance(detail, str) else "",
+                "case_ids": case_ids,
+            }
+        )
+    corrected.sort(key=lambda item: _PRIORITIES.index(item["priority"]))
+
+    injected = ""
+    rule_p0 = next(
+        (item for item in rules_suggestions if item["priority"] == "P0" and item["case_ids"]), None
+    )
+    model_p0_ids = {
+        case_id
+        for item in corrected
+        if item["priority"] == "P0"
+        for case_id in item["case_ids"]
+    }
+    if failures and rule_p0 is not None and not (set(rule_p0["case_ids"]) & model_p0_ids):
+        corrected.insert(0, dict(rule_p0))
+        injected = rule_p0["title"]
+    if failures and not any(item["priority"] == "P0" and item["case_ids"] for item in corrected):
+        if corrected:
+            corrected[0]["priority"] = "P0"
+            injected = corrected[0]["title"]
+    if not corrected and rules_suggestions:
+        corrected = [dict(item) for item in rules_suggestions]
+        injected = "全部建议（模型未给出可用建议）"
+    return corrected, dropped, injected
+
+
+def _correct_headline(model_headline: str, rules_headline: str, has_failures: bool) -> tuple[str, bool]:
+    """标题可保留模型措辞，但不得出现数字或与结果矛盾的「全部通过」。"""
+    text = model_headline.strip()
+    contradictory = has_failures and any(word in text for word in ("全部通过", "全部成功", "均通过"))
+    if not _digit_free(text) or contradictory:
+        return rules_headline, True
+    return text, False
 
 
 def _llm_payload(
@@ -710,24 +801,63 @@ def _llm_payload(
     if not isinstance(data, dict):
         raise LLMError("LLM 未返回 JSON 对象")
     headline = data.get("headline")
-    summary_md = data.get("summary_md")
     if not isinstance(headline, str) or not headline.strip():
         raise LLMError("LLM 输出缺少 headline")
-    if not isinstance(summary_md, str) or not summary_md.strip():
+    if not isinstance(data.get("summary_md"), str) or not data["summary_md"].strip():
         raise LLMError("LLM 输出缺少 summary_md")
     if not isinstance(data.get("findings"), list) or not isinstance(data.get("suggestions"), list):
         raise LLMError("LLM 输出缺少 findings/suggestions 列表")
+
     valid_ids = {str(_dict(case).get("case_id")) for case in _list(report.get("cases"))}
     valid_ids.discard("None")
+    case_kinds = {failure.case_id: failure.kind for failure in failures}
+    findings, dropped_findings, filled = _correct_findings(
+        data.get("findings"), rules["findings"], case_kinds
+    )
+    suggestions, dropped_suggestions, injected = _correct_suggestions(
+        data.get("suggestions"), rules["suggestions"], failures, valid_ids
+    )
+    stats = stats_from_report(report)
+    groups = _group(failures)
+    corrected_headline, headline_replaced = _correct_headline(
+        headline, rules["headline"], bool(failures)
+    )
+    summary_md = _summary_md(report, stats, groups, suggestions)
+
+    corrections: list[dict[str, Any]] = [
+        {"field": "stats", "reason": "以 report.summary 全字段覆盖，不采信模型计数"},
+        {
+            "field": "findings",
+            "reason": (
+                f"kind/case_ids 按报告重算：剔除 {dropped_findings} 个错归类或不存在的 case_id，"
+                f"补齐 {filled} 个模型缺失的类"
+            ),
+        },
+        {"field": "summary_md", "reason": "计数句与用例清单按校正后的 findings/suggestions 重新渲染"},
+    ]
+    if headline_replaced:
+        corrections.append(
+            {"field": "headline", "reason": "模型标题含数字或与结果矛盾，改用规则结论句"}
+        )
+    if injected:
+        corrections.append(
+            {"field": "suggestions", "reason": f"模型未给出覆盖配置/环境失败的有效 P0，已注入规则建议：{injected}"}
+        )
+    if dropped_suggestions:
+        corrections.append(
+            {"field": "suggestions.case_ids", "reason": f"剔除 {dropped_suggestions} 个报告中不存在的 case_id"}
+        )
     return {
         **rules,
         "source": "llm",
         "model": str(getattr(client, "model", "") or "") or None,
         "degraded_reason": "",
-        "headline": headline.strip(),
-        "summary_md": summary_md.strip(),
-        "findings": _clean_items(data.get("findings"), valid_ids, findings=True),
-        "suggestions": _clean_items(data.get("suggestions"), valid_ids, findings=False),
+        "headline": corrected_headline,
+        "summary_md": summary_md,
+        "findings": findings,
+        "suggestions": suggestions,
+        "stats": stats,
+        "corrections": corrections,
     }
 
 

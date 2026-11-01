@@ -134,7 +134,7 @@ class FakeLLM:
 
 def good_llm_output() -> dict[str, Any]:
     return {
-        "headline": "5 个用例 1 通过：配置与认证问题阻断回归",
+        "headline": "配置与认证问题阻断回归，先修沙箱文件",
         "summary_md": "## 结论\n未通过。\n## 失败分布\n- 配置/认证\n## 建议\n- 先修配置",
         "findings": [
             {
@@ -201,9 +201,7 @@ def test_a40_post_without_llm_returns_rules(tmp_path: Path, monkeypatch) -> None
     assert body["source"] == "rules"
     assert body["model"] is None
     assert body["degraded_reason"].strip()
-    for key, value in body["stats"].items():
-        assert value == ws.report["summary"][key], key
-    assert set(body["stats"]) == set(insight.STATS_KEYS)
+    assert body["stats"] == ws.report["summary"]  # v3.0.1：全字段逐字相等
 
 
 def test_a40_get_without_cache_never_generates(tmp_path: Path) -> None:
@@ -298,6 +296,16 @@ def test_a42_cache_reuse_and_refresh(tmp_path: Path) -> None:
     assert again["generated_at"] == refreshed["generated_at"]
 
 
+def test_a42_legacy_cache_without_corrections_is_stale(tmp_path: Path) -> None:
+    api, ws = make_api(tmp_path)
+    _s, first = call(api, "POST", f"/api/runs/{RUN_ID}/insight", {})
+    legacy = {key: value for key, value in first.items() if key != "corrections"}
+    ws.cache_path.write_text(json.dumps(legacy, ensure_ascii=False), encoding="utf-8")
+    os.utime(ws.cache_path, (time.time() + 30, time.time() + 30))
+    _status, body = call(api, "GET", f"/api/runs/{RUN_ID}/insight")
+    assert body == {"available": False}
+
+
 def test_a42_report_mtime_invalidates_cache(tmp_path: Path) -> None:
     api, ws = make_api(tmp_path)
     _s, _body = call(api, "POST", f"/api/runs/{RUN_ID}/insight", {})
@@ -346,10 +354,87 @@ def test_a44_llm_path_fields_complete(tmp_path: Path) -> None:
     assert body["source"] == "llm" and body["model"] == "fake-model-1"
     assert body["degraded_reason"] == ""
     assert body["headline"] == good_llm_output()["headline"]
-    assert body["stats"]["total"] == ws.report["summary"]["total"]
+    assert body["stats"] == ws.report["summary"]
     assert [item["priority"] for item in body["suggestions"]] == ["P0", "P2"]
     assert all(item["case_ids"] != ["not_a_real_case"] for item in body["findings"])
     assert body["findings"][0]["case_ids"] == ["cfg_creds"]
+    assert body["corrections"] and body["corrections"][0]["field"] == "stats"
+
+
+def _lying_llm_output() -> dict[str, Any]:
+    """故意瞎说：计数错、case_id 张冠李戴、缺 engine 类、0 条 P0。"""
+    return {
+        "headline": "6 个用例 5 通过，只剩文件路径问题",
+        "summary_md": (
+            "## 结论\n6 个用例 5 通过。\n## 失败分布\n- 文件路径 4 个\n- 健康检查 2 个\n"
+            "## 建议\n- 先补文件"
+        ),
+        "findings": [
+            {
+                "kind": "config",
+                "title": "文件路径问题 4 个",
+                "detail": "有 4 个文件路径问题",
+                "case_ids": ["cfg_creds", "health", "ghost_case"],
+            },
+            {
+                "kind": "assertion",
+                "title": "健康检查 2 个",
+                "detail": "2 个健康检查失败",
+                "case_ids": ["health"],  # health 实际是 auth，整条应被剔除
+            },
+        ],
+        "suggestions": [
+            {"priority": "P2", "title": "补字段断言", "detail": "加 schema", "case_ids": ["health"]},
+            {"priority": "P1", "title": "修文件路径", "detail": "补文件", "case_ids": ["cfg_creds", "ghost_case"]},
+        ],
+    }
+
+
+def test_a44_lying_llm_is_corrected_by_report(tmp_path: Path) -> None:
+    ws = InsightWorkspace(tmp_path / "ws")
+    api = WebAPI(ws.root, insight_llm=FakeLLM(_lying_llm_output()))
+    status, body = call(api, "POST", f"/api/runs/{RUN_ID}/insight", {})
+    assert status == 200 and body["source"] == "llm"
+
+    rules = insight.rules_payload(ws.report, {"source": "memory"}, run_id=RUN_ID)
+    # 1) stats 全字段与报告逐字相等
+    assert body["stats"] == ws.report["summary"]
+    # 2) findings 的 kind/case_ids/detail 完全按报告重建（含被模型漏掉的 engine 类）
+    assert [(f["kind"], f["case_ids"]) for f in body["findings"]] == [
+        (f["kind"], f["case_ids"]) for f in rules["findings"]
+    ]
+    engine_ids = [
+        case_id for finding in body["findings"] if finding["kind"] == "engine"
+        for case_id in finding["case_ids"]
+    ]
+    assert len(engine_ids) == 2  # capture + unreachable 两类都要有
+    # 3) 每条 case_id 都真的属于该 kind（含 mixed_target 之外的）
+    case_kinds = {f.case_id: f.kind for f in insight.collect_failures(ws.report)}
+    for finding in body["findings"]:
+        if finding["kind"] == "mixed_target":
+            continue
+        assert all(case_kinds[case_id] == finding["kind"] for case_id in finding["case_ids"])
+    # 4) 有失败时必须至少一条带 case_ids 的 P0，且覆盖配置类失败
+    p0 = [item for item in body["suggestions"] if item["priority"] == "P0" and item["case_ids"]]
+    assert p0 and "cfg_creds" in p0[0]["case_ids"]
+    # 5) summary_md 的数字/用例清单来自校正后数据
+    assert "6 个用例，通过 1、失败 2、错误 3" in body["summary_md"]
+    assert "文件路径 4 个" not in body["summary_md"]
+    assert "5 通过" not in body["summary_md"]
+    assert "cfg_creds" in body["summary_md"]
+    # 6) 可审计
+    fields = {item["field"] for item in body["corrections"]}
+    assert {"stats", "findings", "summary_md", "suggestions"} <= fields
+    assert not any("ghost_case" in json.dumps(item, ensure_ascii=False) for item in body["findings"])
+    # 模型标题含错误数字 → 回退规则结论句
+    assert body["headline"] == rules["headline"]
+
+
+def test_a44_headline_without_digits_is_kept(tmp_path: Path) -> None:
+    api, _ws = make_api(tmp_path, FakeLLM(good_llm_output()))
+    _status, body = call(api, "POST", f"/api/runs/{RUN_ID}/insight", {})
+    assert body["headline"] == "配置与认证问题阻断回归，先修沙箱文件"
+    assert not any(item["field"] == "headline" for item in body["corrections"])
 
 
 def test_a44_llm_error_degrades_to_rules(tmp_path: Path) -> None:

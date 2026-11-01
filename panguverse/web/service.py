@@ -910,7 +910,10 @@ def read_insight_cache(root: Path, run_id: str) -> dict[str, Any] | None:
         cached = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    return cached if isinstance(cached, dict) else None
+    # v3.0.1 起响应必须带 corrections[]；旧缓存视为过期，避免继续返回未校正的模型输出
+    if not isinstance(cached, dict) or "corrections" not in cached:
+        return None
+    return cached
 
 
 def write_insight_cache(root: Path, run_id: str, payload: dict[str, Any]) -> Path:
