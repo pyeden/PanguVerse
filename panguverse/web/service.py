@@ -36,7 +36,7 @@ from ..engine.result import RunResult
 from ..report import DEFAULT_FORMATS, write_all
 from ..report.json_report import conclusion as report_conclusion
 from ..spec.loader import TestSuite, load_suite
-from . import insight, tasks_store
+from . import insight, projects, tasks_store
 from .jobs import Job, JobManager, sanitize_message
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -472,32 +472,62 @@ def _demo_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any
 
 
 def _scenario_task(
-    root: Path, request: RunRequest, suite: TestSuite
+    root: Path,
+    request: RunRequest,
+    suite: TestSuite,
+    *,
+    attribution: dict[str, str] | None = None,
 ) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
-        baseline = load_last_env(root)
-        request_env = apply_fs_root(root, dict(request.env), request.env)
-        axe = build_axe(root, enable_llm=not request.no_llm)
-        plan = axe.plan(PlanRequest(suite=suite, env=request_env))
-        return _execute(
-            axe,
-            job,
-            plan=plan,
-            root=root,
-            request_env=request_env,
-            baseline=baseline,
-            evolve=True,
-            regression=bool(request.regression),
-            title="PanguVerse 场景运行报告",
-            run_config={
-                "mode": "scenario",
-                "scenario": request.scenario,
-                "intent": "",
-                "regression": bool(request.regression),
-                "no_llm": bool(request.no_llm),
-                "uses_mock": False,
-            },
-        )
+        return _scenario_execute(root, job, request, suite, attribution=attribution)
+
+    return task
+
+
+def _scenario_execute(
+    root: Path,
+    job: Job,
+    request: RunRequest,
+    suite: TestSuite,
+    *,
+    attribution: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    baseline = load_last_env(root)
+    request_env = apply_fs_root(root, dict(request.env), request.env)
+    axe = build_axe(root, enable_llm=not request.no_llm)
+    plan = axe.plan(PlanRequest(suite=suite, env=request_env))
+    return _execute(
+        axe,
+        job,
+        plan=plan,
+        root=root,
+        request_env=request_env,
+        baseline=baseline,
+        evolve=True,
+        regression=bool(request.regression),
+        title="PanguVerse 场景运行报告",
+        run_config={
+            "mode": "scenario",
+            "scenario": request.scenario,
+            "intent": "",
+            "regression": bool(request.regression),
+            "no_llm": bool(request.no_llm),
+            "uses_mock": False,
+        },
+        attribution=attribution,
+    )
+
+
+def _suite_run_task(
+    root: Path,
+    request: RunRequest,
+    attribution: dict[str, str],
+) -> Callable[[Job], dict[str, Any]]:
+    """项目套件运行：场景在 **job 内**才解析，单套件坏文件只失败自己。"""
+
+    def task(job: Job) -> dict[str, Any]:
+        suite = load_scenario_suite(resolve_scenario(root, request.scenario))
+        return _scenario_execute(root, job, request, suite, attribution=attribution)
 
     return task
 
@@ -621,6 +651,7 @@ def _execute(
     regression: bool,
     title: str,
     run_config: dict[str, Any] | None = None,
+    attribution: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     job.add_phase("plan", "ok", f"{plan.size} 个用例来自 {plan.source}")
     if not plan.cases:
@@ -644,19 +675,25 @@ def _execute(
 
     run_id = uuid.uuid4().hex[:12]
     job.set_run_id(run_id)
+    meta: dict[str, Any] = {
+        "intent": plan.intent,
+        "planner": plan.planner,
+        "plan_source": plan.source,
+        "llm_used": bool(plan.meta.get("llm_used")),
+        "heal_enabled": bool(axe.healer),
+        # 供 /api/runs/{id}/config 与 rerun 还原原始请求（新增字段，不改旧字段语义）
+        "run_config": dict(run_config or {}),
+    }
+    # 运行归属（v4.0 §1）：additive，只在从项目/套件发起时写入；旧报告没有这两个键
+    for key in ("project_id", "suite_id"):
+        value = (attribution or {}).get(key)
+        if isinstance(value, str) and value:
+            meta[key] = value
     run = axe.executor.run(
         plan,
         env=effective_env,
         run_id=run_id,
-        meta={
-            "intent": plan.intent,
-            "planner": plan.planner,
-            "plan_source": plan.source,
-            "llm_used": bool(plan.meta.get("llm_used")),
-            "heal_enabled": bool(axe.healer),
-            # 供 /api/runs/{id}/config 与 rerun 还原原始请求（新增字段，不改旧字段语义）
-            "run_config": dict(run_config or {}),
-        },
+        meta=meta,
     )
     summary = run.summary
     job.add_phase(
@@ -1368,6 +1405,496 @@ def save_run_as_task(root: Path, run_id: str, payload: Any = None) -> dict[str, 
     )
 
 
+# --------------------------------------------------------------------------- #
+# 项目 / 套件（契约 tasks/web-refactor-spec.md v4.0 §1–§2）
+# --------------------------------------------------------------------------- #
+PROJECT_NAME_MAX = TASK_NAME_MAX
+BASE_URL_MAX = 500
+TAGS_MAX = 20
+TAG_MAX = 40
+RUN_STATUSES = ("all", "passed", "failed", "errored", "done")
+#: 历史筛选里表示「没有项目/套件归属」的保留值（旧报告）
+UNCLASSIFIED = {"unclassified", "none", "_"}
+
+
+def _clean_base_url(value: Any) -> str:
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise ApiError("bad_request", "base_url 必须是字符串")
+    text = value.strip()
+    if len(text) > BASE_URL_MAX:
+        raise ApiError("bad_request", f"base_url 不能超过 {BASE_URL_MAX} 个字符")
+    if any(char in text for char in ("\x00", "\n", "\r")):
+        raise ApiError("bad_request", "base_url 含非法字符")
+    return text
+
+
+def _clean_tags(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ApiError("bad_request", "tags 必须是字符串数组")
+    if len(value) > TAGS_MAX:
+        raise ApiError("bad_request", f"tags 最多 {TAGS_MAX} 个")
+    tags: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise ApiError("bad_request", "tags 必须是字符串数组")
+        tag = item.strip()
+        if not tag:
+            raise ApiError("bad_request", "tags 不能包含空字符串")
+        if len(tag) > TAG_MAX:
+            raise ApiError("bad_request", f"单个 tag 不能超过 {TAG_MAX} 个字符")
+        if tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _clean_suite_scenario(root: Path, value: Any) -> str:
+    scenario = _clean_text(value, field="scenario")
+    if not scenario:
+        raise ApiError("bad_request", "scenario 不能为空")
+    resolve_scenario(root, scenario)  # realpath 前缀校验：越界/不存在一律 400
+    return scenario
+
+
+def _find_suite(project: dict[str, Any], suite_id: str) -> dict[str, Any]:
+    projects.validate_suite_id(suite_id)
+    for suite in project.get("suites") or []:
+        if isinstance(suite, dict) and suite.get("suite_id") == suite_id:
+            return suite
+    raise ApiError("not_found", "套件不存在")
+
+
+def create_project(root: Path, payload: Any) -> dict[str, Any]:
+    data = _as_body(payload)
+    now = time.time()
+    project = {
+        "project_id": projects.new_project_id(),
+        "name": _clean_name(data.get("name")),
+        "base_url": _clean_base_url(data.get("base_url")),
+        "env": _coerce_env(data.get("env")),
+        "suites": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    return projects.write_project(root, project)
+
+
+def update_project(root: Path, project_id: str, payload: Any) -> dict[str, Any]:
+    data = _as_body(payload)
+
+    def mutate(project: dict[str, Any]) -> None:
+        if "name" in data:
+            project["name"] = _clean_name(data.get("name"))
+        if "base_url" in data:
+            project["base_url"] = _clean_base_url(data.get("base_url"))
+        if "env" in data:
+            current = project.get("env") if isinstance(project.get("env"), dict) else {}
+            project["env"] = _merge_task_env(current, data.get("env"))
+        project["updated_at"] = time.time()
+
+    project, _ = projects.modify_project(root, project_id, mutate)
+    return project
+
+
+def delete_project(root: Path, project_id: str) -> None:
+    """只删项目文件；``runs/`` 下任何历史产物都不动（A50）。"""
+    projects.delete_project(root, project_id)
+
+
+def add_suite(root: Path, project_id: str, payload: Any) -> dict[str, Any]:
+    data = _as_body(payload)
+    suite = {
+        "suite_id": projects.new_suite_id(),
+        "name": _clean_name(data.get("name")),
+        "scenario": _clean_suite_scenario(root, data.get("scenario")),
+        "env": _coerce_env(data.get("env")),
+        "tags": _clean_tags(data.get("tags")),
+    }
+
+    def mutate(project: dict[str, Any]) -> None:
+        project.setdefault("suites", []).append(suite)
+        project["updated_at"] = time.time()
+
+    projects.modify_project(root, project_id, mutate)
+    return suite
+
+
+def update_suite(
+    root: Path, project_id: str, suite_id: str, payload: Any
+) -> dict[str, Any]:
+    data = _as_body(payload)
+
+    def mutate(project: dict[str, Any]) -> dict[str, Any]:
+        suite = _find_suite(project, suite_id)
+        if "name" in data:
+            suite["name"] = _clean_name(data.get("name"))
+        if "scenario" in data:
+            suite["scenario"] = _clean_suite_scenario(root, data.get("scenario"))
+        if "env" in data:
+            current = suite.get("env") if isinstance(suite.get("env"), dict) else {}
+            suite["env"] = _merge_task_env(current, data.get("env"))
+        if "tags" in data:
+            suite["tags"] = _clean_tags(data.get("tags"))
+        project["updated_at"] = time.time()
+        return dict(suite)
+
+    _, updated = projects.modify_project(root, project_id, mutate)
+    return updated
+
+
+def delete_suite(root: Path, project_id: str, suite_id: str) -> None:
+    def mutate(project: dict[str, Any]) -> None:
+        _find_suite(project, suite_id)
+        project["suites"] = [
+            suite
+            for suite in project.get("suites") or []
+            if not (isinstance(suite, dict) and suite.get("suite_id") == suite_id)
+        ]
+        project["updated_at"] = time.time()
+
+    projects.modify_project(root, project_id, mutate)
+
+
+# --------------------------------------------------------------------------- #
+# 运行索引（按报告 meta 归类，旧报告 = 未归类）
+# --------------------------------------------------------------------------- #
+def _run_status(report: dict[str, Any]) -> str:
+    """报告 → 运行状态：``errored | passed | failed``（缺 summary 的老报告 → done）。"""
+    summary = report.get("summary")
+    if not isinstance(summary, dict) or "total" not in summary:
+        return "done"
+    if _as_int(summary.get("errored")):
+        return "errored"
+    if summary.get("success"):
+        return "passed"
+    return "failed"
+
+
+def scan_runs(root: Path) -> list[dict[str, Any]]:
+    """扫描 ``runs/``，返回带归属与状态的最新在前列表（含原始 report，供聚合）。"""
+    base = runs_root(root)
+    if not base.is_dir():
+        return []
+    entries: list[dict[str, Any]] = []
+    try:
+        children = sorted(base.iterdir())
+    except OSError:
+        return []
+    for child in children:
+        if not child.is_dir():
+            continue
+        report_path = child / "report.json"
+        if not report_path.is_file():
+            continue
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        meta = report.get("meta") if isinstance(report.get("meta"), dict) else None
+        project_id = meta.get("project_id") if isinstance(meta, dict) else None
+        suite_id = meta.get("suite_id") if isinstance(meta, dict) else None
+        entries.append(
+            {
+                "run_id": report.get("run_id") or child.name,
+                "dir": str(child),
+                "started_at": report.get("started_at"),
+                "finished_at": report.get("finished_at"),
+                "duration_ms": report.get("duration_ms"),
+                "summary": report.get("summary"),
+                "conclusion": report.get("conclusion"),
+                "meta": report.get("meta"),
+                "status": _run_status(report),
+                "project_id": project_id if isinstance(project_id, str) and project_id else None,
+                "suite_id": suite_id if isinstance(suite_id, str) and suite_id else None,
+                "report": report,
+            }
+        )
+    entries.sort(key=lambda item: item.get("started_at") or 0, reverse=True)
+    return entries
+
+
+def _public_run(entry: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in entry.items() if key != "report"}
+
+
+def _group_project_runs(root: Path) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for entry in scan_runs(root):
+        project_id = entry.get("project_id")
+        if project_id:
+            grouped.setdefault(project_id, []).append(entry)
+    return grouped
+
+
+def _pass_rate(entries: list[dict[str, Any]]) -> dict[str, int] | None:
+    if not entries:
+        return None
+    seen = False
+    passed = 0
+    total = 0
+    for entry in entries:
+        summary = entry.get("summary")
+        if not isinstance(summary, dict):
+            continue
+        seen = True
+        passed += _as_int(summary.get("passed"))
+        total += _as_int(summary.get("total"))
+    return {"passed": passed, "total": total} if seen else None
+
+
+def _last_run(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if not entries:
+        return None
+    entry = entries[0]
+    summary = entry.get("summary") if isinstance(entry.get("summary"), dict) else {}
+    conclusion = entry.get("conclusion") if isinstance(entry.get("conclusion"), dict) else {}
+    return {
+        "run_id": entry.get("run_id", ""),
+        "status": entry.get("status", "done"),
+        "verdict": conclusion.get("verdict", ""),
+        "at": entry.get("started_at"),
+        "passed": _as_int(summary.get("passed")),
+        "total": _as_int(summary.get("total")),
+    }
+
+
+def list_project_summaries(root: Path) -> list[dict[str, Any]]:
+    grouped = _group_project_runs(root)
+    items: list[dict[str, Any]] = []
+    for project in projects.list_projects(root):
+        entries = grouped.get(project["project_id"], [])
+        items.append(
+            {
+                "project_id": project["project_id"],
+                "name": project.get("name", ""),
+                "base_url": project.get("base_url", ""),
+                "suite_count": len(project.get("suites") or []),
+                "last_run": _last_run(entries),
+                "pass_rate": _pass_rate(entries),
+            }
+        )
+    return items
+
+
+def get_project_detail(root: Path, project_id: str) -> dict[str, Any]:
+    project = projects.read_project(root, project_id)
+    entries = _group_project_runs(root).get(project_id, [])
+    detail = dict(project)
+    detail["suite_count"] = len(project.get("suites") or [])
+    detail["last_run"] = _last_run(entries)
+    detail["pass_rate"] = _pass_rate(entries)
+    return detail
+
+
+def _failure_top(entries: list[dict[str, Any]], *, limit: int = 3) -> list[dict[str, Any]]:
+    """按报告里每个失败步骤的 ``failure_kind`` 聚合（最多 3 条，带 case_ids）。"""
+    buckets: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        report = entry.get("report") if isinstance(entry.get("report"), dict) else {}
+        cases = report.get("cases")
+        if not isinstance(cases, list):
+            continue
+        for case in cases:
+            if not isinstance(case, dict) or case.get("status") not in ("failed", "error"):
+                continue
+            kinds: set[str] = set()
+            steps = case.get("steps")
+            if isinstance(steps, list):
+                for step in steps:
+                    if not isinstance(step, dict) or step.get("status") not in ("failed", "error"):
+                        continue
+                    error = step.get("error")
+                    if isinstance(error, dict):
+                        kind = error.get("failure_kind") or error.get("kind")
+                        if isinstance(kind, str) and kind:
+                            kinds.add(kind)
+            error = case.get("error")
+            if isinstance(error, dict):
+                kind = error.get("failure_kind") or error.get("kind")
+                if isinstance(kind, str) and kind:
+                    kinds.add(kind)
+            if not kinds:
+                kinds.add("unknown")
+            case_id = str(case.get("case_id") or case.get("name") or "")
+            for kind in kinds:
+                bucket = buckets.setdefault(kind, {"kind": kind, "count": 0, "cases": []})
+                bucket["count"] += 1
+                if case_id and case_id not in bucket["cases"]:
+                    bucket["cases"].append(case_id)
+    ordered = sorted(buckets.values(), key=lambda item: (-item["count"], item["kind"]))
+    return ordered[: max(1, limit)]
+
+
+def project_summary(root: Path, project_id: str, *, limit: int = 5) -> dict[str, Any]:
+    """概览：最近 ``limit`` 条运行 + 全量通过率 + 全量失败归类（口径见 docs/web-api.md）。"""
+    projects.read_project(root, project_id)  # 不存在 → 404
+    entries = _group_project_runs(root).get(project_id, [])
+    return {
+        "recent_runs": [_public_run(entry) for entry in entries[: max(1, limit)]],
+        "pass_rate": _pass_rate(entries),
+        "failure_top": _failure_top(entries),
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 历史筛选分页（GET /api/runs/query）
+# --------------------------------------------------------------------------- #
+def _match_owner(value: str | None, wanted: str | None, field: str) -> bool:
+    if not wanted or wanted == "all":
+        return True
+    if wanted in UNCLASSIFIED:
+        return not value
+    if field == "project":
+        projects.validate_project_id(wanted)
+    else:
+        projects.validate_suite_id(wanted)
+    return value == wanted
+
+
+def query_runs(
+    root: Path,
+    *,
+    project: str | None = None,
+    suite: str | None = None,
+    status: str = "all",
+    offset: int = 0,
+    limit: int = 20,
+) -> dict[str, Any]:
+    if status not in RUN_STATUSES:
+        raise ApiError(
+            "bad_request", f"status 非法: {status!r}（可选 {'/'.join(RUN_STATUSES)}）"
+        )
+    entries = [
+        entry
+        for entry in scan_runs(root)
+        if _match_owner(entry.get("project_id"), project, "project")
+        and _match_owner(entry.get("suite_id"), suite, "suite")
+        # done = 已跑完的任意结论；其余按报告 summary 精确匹配
+        and (status in ("all", "done") or entry.get("status") == status)
+    ]
+    return {
+        "total": len(entries),
+        "items": [_public_run(entry) for entry in entries[offset : offset + limit]],
+    }
+
+
+def run_summary(root: Path, run_id: str) -> dict[str, Any] | None:
+    """批量聚合用：读磁盘报告的 ``summary``（读不到返回 None，绝不抛错）。"""
+    if not isinstance(run_id, str) or not _RUN_ID_RE.match(run_id):
+        return None
+    try:
+        report = json.loads(
+            (runs_root(root) / run_id / "report.json").read_text(encoding="utf-8")
+        )
+    except (OSError, ValueError):
+        return None
+    summary = report.get("summary") if isinstance(report, dict) else None
+    return summary if isinstance(summary, dict) else None
+
+
+# --------------------------------------------------------------------------- #
+# 从项目发起批量运行（§2–§3）
+# --------------------------------------------------------------------------- #
+def _merged_suite_env(
+    root: Path, project: dict[str, Any], suite: dict[str, Any], overrides: dict[str, Any]
+) -> dict[str, Any]:
+    """优先级：``suite.env`` > ``project.env`` > 本次请求覆盖（契约 §1 硬要求）。"""
+    project_env = project.get("env") if isinstance(project.get("env"), dict) else {}
+    suite_env = suite.get("env") if isinstance(suite.get("env"), dict) else {}
+    merged = dict(overrides)
+    merged.update(project_env)
+    merged.update(suite_env)
+    return apply_fs_root(root, merged, merged)
+
+
+def start_project_batch(
+    jobs: JobManager,
+    batches: Any,
+    root: Path,
+    project_id: str,
+    payload: Any = None,
+) -> dict[str, Any]:
+    """``POST /api/projects/{pid}/run``：登记全部 job 后交给 BatchManager 串行执行。"""
+    project = projects.read_project(root, project_id)
+    data = _as_body(payload)
+    suites = list(project.get("suites") or [])
+    requested = data.get("suite_ids")
+    if requested is not None:
+        if not isinstance(requested, list) or any(
+            not isinstance(item, str) for item in requested
+        ):
+            raise ApiError("bad_request", "suite_ids 必须是字符串数组")
+        if requested:  # 空数组 = 不限定 → 全部套件（与前端「一键全跑」一致）
+            known = {
+                suite.get("suite_id"): suite
+                for suite in suites
+                if isinstance(suite, dict)
+            }
+            for suite_id in requested:
+                projects.validate_suite_id(suite_id)
+                if suite_id not in known:
+                    raise ApiError("bad_request", f"套件不存在: {suite_id}")
+            wanted = set(requested)
+            suites = [suite for suite in suites if suite.get("suite_id") in wanted]
+    if not suites:
+        raise ApiError("bad_request", "项目没有可运行的套件")
+    overrides = _env_override(data.get("env")) if "env" in data else {}
+
+    items = []
+    for suite in suites:
+        suite_id = projects.validate_suite_id(suite.get("suite_id"))
+        suite_name = str(suite.get("name") or "")
+        scenario = str(suite.get("scenario") or "")
+        attribution = {"project_id": project_id, "suite_id": suite_id}
+        request = RunRequest(
+            mode="scenario",
+            scenario=scenario,
+            env=_merged_suite_env(root, project, suite, overrides),
+        )
+        job = jobs.create("scenario")
+        items.append(
+            {
+                "suite_id": suite_id,
+                "name": suite_name,
+                "job": job,
+                "task": _suite_run_task(root, request, attribution),
+            }
+        )
+
+    from .batches import BatchItem  # 局部导入：保持 service → batches 无模块级依赖
+
+    batch = batches.submit(
+        project_id,
+        [
+            BatchItem(
+                suite_id=item["suite_id"],
+                name=item["name"],
+                job=item["job"],
+                task=item["task"],
+            )
+            for item in items
+        ],
+    )
+    return {
+        "batch_id": batch.batch_id,
+        "jobs": [
+            {"job_id": item["job"].job_id, "suite_id": item["suite_id"]} for item in items
+        ],
+    }
+
+
+def _as_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 __all__ = [
     "BUILTIN_SCENARIOS",
     "MOCK_TARGET_KIND",
@@ -1375,17 +1902,23 @@ __all__ = [
     "STATUS_BY_CODE",
     "ApiError",
     "RunRequest",
+    "add_suite",
     "apply_fs_root",
     "build_axe",
+    "create_project",
     "create_task",
     "default_fs_root",
+    "delete_project",
+    "delete_suite",
     "delete_task",
     "demo_target",
     "get_pack",
+    "get_project_detail",
     "get_run",
     "get_task",
     "list_atoms",
     "list_packs",
+    "list_project_summaries",
     "list_runs",
     "list_scenarios",
     "list_tasks",
@@ -1396,6 +1929,8 @@ __all__ = [
     "missing_env_vars",
     "pack_registry",
     "parse_run_request",
+    "project_summary",
+    "query_runs",
     "record_task_run",
     "registry",
     "rerun",
@@ -1403,14 +1938,19 @@ __all__ = [
     "resolve_workspace",
     "run_artifact",
     "run_config",
+    "run_summary",
     "run_task",
     "runs_root",
     "safe_message",
     "save_last_env",
     "save_run_as_task",
+    "scan_runs",
+    "start_project_batch",
     "status_payload",
     "submit_run",
     "task_summary",
+    "update_project",
+    "update_suite",
     "update_task",
     "validate_run_id",
 ]

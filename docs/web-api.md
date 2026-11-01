@@ -342,6 +342,79 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - `save_as_task=true` 时先创建任务定义（写入本次合并后的 env 真值）再运行，`name` 缺省为 `重跑 <run_id>`；
 - 未知 run → 404；无法还原场景（缺 `scenario`）→ 400。
 
+### 项目 / 套件 / 批量运行（v4.0，契约 `tasks/web-refactor-spec.md`）
+
+三级结构：**Project → Suite → Run**。项目与套件落盘，运行仍落 `runs/`。
+
+**落盘**：`<workspace>/.panguverse/projects/<project_id>.json`（目录 `0700`、文件 `0600`、原子写）。
+`project_id` / `suite_id` 一律**服务端生成**（`^p-[0-9a-f]{6,12}$` / `^s-[0-9a-f]{6,12}$`），
+客户端传了也忽略；路径拼接前先做正则校验。项目文件含 env 明文（与 `tasks/`、`last_env.json` 同策略），
+**只有 HTTP 出口打码**。
+
+```json
+{
+  "project_id": "p-3f2a1c", "name": "coding-log-web",
+  "base_url": "https://seres-ai.com",
+  "env": {"BASE_URL": "https://seres-ai.com"},
+  "suites": [
+    {"suite_id": "s-1a2b3c", "name": "站点只读巡检",
+     "scenario": "scenarios/suites/codinglog_web.yaml",
+     "env": {"WEATHER_DATE": "2026-11-02"}, "tags": ["smoke"]}
+  ],
+  "created_at": 0.0, "updated_at": 0.0
+}
+```
+
+**env 优先级**（高 → 低）：`suite.env` > `project.env` > 本次请求 `env`。
+PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/空串 = 沿用旧值、`null` = 删键、其余 = 覆盖。
+`scenario` 与 `POST /api/runs` 同源校验（`realpath` 前缀：仅 workspace 或仓库内置 `scenarios/`），越界 400。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/projects` | `{"projects":[{project_id,name,base_url,suite_count,last_run,pass_rate}]}`，按 `updated_at` 倒序 |
+| `POST` | `/api/projects` | `{name, base_url?, env?}` → `201` 项目（env 打码） |
+| `GET` | `/api/projects/{pid}` | 项目详情（env 打码、`suites` 原样），额外带 `suite_count/last_run/pass_rate` |
+| `PATCH` | `/api/projects/{pid}` | 部分更新 `name/base_url/env` → `200` |
+| `DELETE` | `/api/projects/{pid}` | `204`，**不删任何 run**（运行归属存在报告 `meta` 里） |
+| `POST` | `/api/projects/{pid}/suites` | `{name, scenario, env?, tags?}` → `201` suite |
+| `PATCH` | `/api/projects/{pid}/suites/{sid}` | 部分更新 `name/scenario/env/tags` → `200` |
+| `DELETE` | `/api/projects/{pid}/suites/{sid}` | `204` |
+| `GET` | `/api/projects/{pid}/summary?limit=5` | `{recent_runs, pass_rate, failure_top}` |
+| `POST` | `/api/projects/{pid}/run` | `{suite_ids?, env?}` → `202 {batch_id, jobs:[{job_id,suite_id}]}` |
+| `GET` | `/api/batches/{batch_id}` | `{batch_id, project_id, status, suites[], aggregate}` |
+| `GET` | `/api/runs/query?...` | `{total, items[]}` |
+
+**运行归属**：从项目/套件发起的运行，报告 `meta` 里新增 `project_id` / `suite_id`（additive，旧字段不变）。
+旧报告没有这两个键 → 历史里归为「未归类」，列表与筛选都**不报错**。
+
+- `last_run`：该项目最新一条运行 `{run_id,status,verdict,at,passed,total}`，无运行 → `null`；
+  `status` 由报告 `summary` 推导（`errored` > `passed` > `failed`，缺 `summary` 的老报告 → `done`）。
+- `pass_rate`：`{passed,total}` = 该项目**全部**运行按用例数累加，无运行 → `null`。
+- `summary.recent_runs`：最新 `limit` 条（`limit` 1–50，默认 5）；`pass_rate` / `failure_top` 仍按**全量**统计。
+- `failure_top`：遍历项目全部运行里 `failed/error` 的用例，按报告 `error.failure_kind`（缺失则退回 `kind`，再缺 `unknown`）
+  聚合，`count` = 命中用例数，`cases` = 去重后的 `case_id`；按 `count` 降序、同数按 kind 升序，**最多 3 条**。
+
+**批量运行语义**：
+
+- 缺省跑该项目全部套件；`suite_ids: []` 也视为全部（前端「一键全跑」）；显式给出未知 id → `400`。
+- **串行**：batch 内前一个 job 进入终态后才启动下一个；每个套件一个 job + 一个 run，响应里 `jobs` 先返回全部 job_id。
+- 单套件失败（场景文件损坏、目标不可达、计划为空等）**不中断**其余套件。
+- `GET /api/batches/{id}` 的 `status`：`queued|running|done|failed`；只有「有套件拿不到报告」（job 失败）才 `failed`，
+  全部跑完但有用例失败仍是 `done`。
+- `aggregate` 逐项来自各 run 的磁盘报告 `summary`：`passed`/`total` 为求和，`suites_passed` = 全部用例通过的套件数，
+  `suites_failed` = 其余套件数（两者之和 = 套件总数），`duration_ms` = 各 run 真实 `duration_ms` 之和（串行，可逐条对账）。
+- batch 与 job 都在内存，重启即丢；`runs/` 落盘不受影响。
+
+**历史筛选分页**：`GET /api/runs/query?project=&suite=&status=&offset=0&limit=20`
+
+- `project` / `suite`：省略或 `all` = 不限；`unclassified`（也接受 `none`/`_`）= 没有归属的旧报告；
+  其余值按 id 正则校验，非法 → `400`（已删除项目的运行仍可按原 id 查到）。
+- `status`：`all`（默认）/`passed`/`failed`/`errored`/`done`；`done` = 已跑完的任意结论（磁盘上的运行都算）；
+  其余按报告 `summary` 精确匹配。非法值 → `400`。
+- `offset` ≥ 0（负数 `400`）；`limit` 1–200（默认 20）。`total` 是筛选后的总数，与分页无关；
+  `items` 字段与 `/api/runs` 数组元素一致，另加 `status` / `project_id` / `suite_id`。
+- **兼容**：`/api/runs` 仍返回数组（形状未变），筛选分页只走 `/api/runs/query`。
+
 ### 静态资源
 
 - `GET /` → `panguverse/web/static/index.html`；资源未就绪 → 503（文案「前端资源未就绪」）。
@@ -362,12 +435,13 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 ## 5. 任务模型与并发
 
 - `panguverse/web/jobs.py`：`dict[job_id] → Job` + `threading.Lock`；每个 job 一条 daemon 线程，不排队（MVP 单用户，前端限制一次只发一个）。
+- `panguverse/web/batches.py`：批次表（内存）+ 串行调度线程；套件逐个 `JobManager.start`，前一个终态后才启动下一个。
 - 执行顺序与 `PanguAxe.loop` 一致：`plan → validate → executor.run（含重试/自愈）→ report（json/html/junit + plan.json）→ evolve → regression`。
 - 报告一律经 `panguverse.report.write_all` 生成（内部按密钥打码）；`/api/runs/{id}` 直接回磁盘 `report.json`，不重新序列化。
 
 ## 6. 已知限制
 
-- job 表在内存：重启后历史只剩磁盘上的 `runs/`（前端应回退到「运行历史」）。
+- job 表与 batch 表都在内存：重启后历史只剩磁盘上的 `runs/`（前端应回退到「运行历史」）。
 - 无认证、无多用户、无 SSE：仅本机单人使用；实时进度靠轮询。
 - 长任务只做「超时标记」，不强行中断执行线程（线程为 daemon，进程退出即回收）。
 - 回归库/经验库/`last_env.json` 是工作区文件，多个 job 并发写入时以「最后写入」为准（单用户场景可接受）。

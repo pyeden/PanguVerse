@@ -18,7 +18,9 @@ from urllib.parse import parse_qs, unquote
 from ..report import html_report, junit
 from . import service
 from .auth import AuthManager, build_cookie
+from .batches import BatchManager
 from .jobs import JobManager
+from .projects import ProjectStoreError
 from .service import ApiError
 from .tasks_store import TaskStoreError
 
@@ -103,9 +105,15 @@ class WebAPI:
         jobs: JobManager | None = None,
         auth: AuthManager | None = None,
         insight_llm: Any = None,
+        batches: BatchManager | None = None,
     ) -> None:
         self.root = service.resolve_workspace(workspace)
         self.jobs = jobs or JobManager()
+        #: 批量运行表（内存态）；聚合数字优先读磁盘报告，读不到再退回 job.summary
+        self.batches = batches or BatchManager(
+            self.jobs,
+            load_summary=lambda run_id: service.run_summary(self.root, run_id),
+        )
         #: ``None`` = 关闭认证（--no-auth / 单元测试直接嵌入）；``serve`` 默认构造 AuthManager
         self.auth = auth
         #: 注入用的 LLM client（A44 假 client）；``None`` = 按环境变量自动判定
@@ -131,7 +139,7 @@ class WebAPI:
             return self._route(
                 method.upper(), path, params, body, headers=request_headers, client_ip=client_ip
             )
-        except (ApiError, TaskStoreError) as exc:
+        except (ApiError, ProjectStoreError, TaskStoreError) as exc:
             return error_response(exc.code, exc.message, exc.status)
         except Exception as exc:  # noqa: BLE001 - 兜底：异常不得穿透到 handler 线程
             return error_response("internal_error", f"{type(exc).__name__}: {exc}")
@@ -212,6 +220,18 @@ class WebAPI:
                         raise ApiError("not_found", "job 不存在")
                     return json_response(job.to_dict())
             if head == "runs":
+                if rest == ["query"]:
+                    # 必须在 run_id 分支之前：'query' 不是合法 run_id，但语义上是子资源
+                    return json_response(
+                        service.query_runs(
+                            self.root,
+                            project=_first(query, "project"),
+                            suite=_first(query, "suite"),
+                            status=_first(query, "status") or "all",
+                            offset=_offset_query(query, "offset", 0),
+                            limit=_int_query(query, "limit", 20, maximum=200),
+                        )
+                    )
                 if not rest:
                     limit = _int_query(query, "limit", 50, maximum=500)
                     return json_response(service.list_runs(self.root, limit=limit))
@@ -249,7 +269,39 @@ class WebAPI:
                                 "Content-Disposition": f'attachment; filename="panguverse-{run_id}.xml"',
                             },
                         )
+            if head == "projects":
+                if not rest:
+                    return json_response(
+                        {"projects": service.list_project_summaries(self.root)}
+                    )
+                if len(rest) == 1:
+                    return json_response(service.get_project_detail(self.root, rest[0]))
+                if len(rest) == 2 and rest[1] == "summary":
+                    return json_response(
+                        service.project_summary(
+                            self.root,
+                            rest[0],
+                            limit=_int_query(query, "limit", 5, maximum=50),
+                        )
+                    )
+            if head == "batches" and len(rest) == 1:
+                batch = self.batches.get(rest[0])
+                if batch is None:
+                    raise ApiError("not_found", "batch 不存在")
+                return json_response(batch.snapshot())
         elif method == "POST":
+            if head == "projects":
+                if not rest:
+                    return json_response(service.create_project(self.root, body), status=201)
+                if len(rest) == 2 and rest[1] == "suites":
+                    return json_response(
+                        service.add_suite(self.root, rest[0], body), status=201
+                    )
+                if len(rest) == 2 and rest[1] == "run":
+                    payload = service.start_project_batch(
+                        self.jobs, self.batches, self.root, rest[0], body
+                    )
+                    return json_response(payload, status=202)
             if head == "runs" and not rest:
                 job = service.submit_run(self.jobs, self.root, body)
                 return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
@@ -272,9 +324,23 @@ class WebAPI:
                     job = service.run_task(self.jobs, self.root, rest[0], body)
                     return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
         elif method == "PATCH":
+            if head == "projects":
+                if len(rest) == 1:
+                    return json_response(service.update_project(self.root, rest[0], body))
+                if len(rest) == 3 and rest[1] == "suites":
+                    return json_response(
+                        service.update_suite(self.root, rest[0], rest[2], body)
+                    )
             if head == "tasks" and len(rest) == 1:
                 return json_response(service.update_task(self.root, rest[0], body))
         elif method == "DELETE":
+            if head == "projects":
+                if len(rest) == 1:
+                    service.delete_project(self.root, rest[0])
+                    return _no_content()
+                if len(rest) == 3 and rest[1] == "suites":
+                    service.delete_suite(self.root, rest[0], rest[2])
+                    return _no_content()
             if head == "tasks" and len(rest) == 1:
                 service.delete_task(self.root, rest[0])
                 # 204 无实体：content_type 留空，server 层也不会写 Content-Type/Content-Length
@@ -369,6 +435,24 @@ def _int_query(
     except ValueError as exc:
         raise ApiError("bad_request", f"{key} 必须是整数") from exc
     return max(1, min(maximum, value))
+
+
+def _offset_query(query: dict[str, list[str]], key: str, default: int) -> int:
+    raw = _first(query, key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ApiError("bad_request", f"{key} 必须是整数") from exc
+    if value < 0:
+        raise ApiError("bad_request", f"{key} 不能为负数")
+    return value
+
+
+def _no_content() -> Response:
+    """204 无实体：content_type 留空，server 层不会写 Content-Type/Content-Length。"""
+    return Response(status=204, body=b"", content_type="", headers={"Cache-Control": "no-store"})
 
 
 def _read_bytes(path: Path) -> bytes:

@@ -167,11 +167,25 @@ class JobManager:
         *,
         on_finish: Callable[[Job], None] | None = None,
     ) -> Job:
+        return self.start(self.create(mode, on_finish=on_finish), task)
+
+    def create(
+        self, mode: str, *, on_finish: Callable[[Job], None] | None = None
+    ) -> Job:
+        """只登记一个 queued job、不启动线程。
+
+        批量运行需要**先返回全部 job_id**（202 响应里带 jobs 数组），再按套件串行
+        启动，因此把「登记」和「启动」拆开；``submit`` 的行为保持不变。
+        """
         job = Job(uuid.uuid4().hex[:12], mode)
         job.on_finish = on_finish
         with self._lock:
             self._jobs[job.job_id] = job
             self._prune_locked()
+        return job
+
+    def start(self, job: Job, task: Callable[[Job], dict[str, Any] | None]) -> Job:
+        """在独立 daemon 线程里启动一个已登记的 queued job。"""
         thread = threading.Thread(
             target=self._worker,
             args=(job, task),
