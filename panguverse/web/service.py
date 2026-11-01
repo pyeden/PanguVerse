@@ -493,7 +493,9 @@ def _scenario_execute(
     attribution: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     baseline = load_last_env(root)
-    request_env = apply_fs_root(root, dict(request.env), request.env)
+    # 这里只放「显式给出的 env」：场景文件里的 FS_ROOT 等声明必须能生效，
+    # web 默认值统一在 _execute 里按最低优先级兜底（契约 v4.0：suite.env > project.env > 请求）。
+    request_env = dict(request.env)
     axe = build_axe(root, enable_llm=not request.no_llm)
     plan = axe.plan(PlanRequest(suite=suite, env=request_env))
     return _execute(
@@ -658,10 +660,13 @@ def _execute(
         job.add_phase("plan", "failed", "计划中没有任何用例")
         raise RuntimeError("计划中没有任何用例（回归库为空？先跑一次成功的闭环）")
 
-    # 执行 env = 最近一次成功基线 < 计划 env < 请求 env；FS_ROOT 永远钉在 workspace 内
-    effective_env = apply_fs_root(
-        root, {**(baseline or {}), **plan.env, **request_env}, request_env
-    )
+    # 执行 env = 最近一次成功基线 < 计划 env < 请求 env。
+    # FS_ROOT 默认值（workspace 内）只在**本次三层都没声明**时兜底：
+    # 显式声明（suite.env / project.env / 场景文件 / 请求）永远优先，陈旧的
+    # 基线 FS_ROOT 也不能顶掉默认值（契约 v4.0 §1）。
+    declared_env = {**plan.env, **request_env}
+    candidate_env = {**(baseline or {}), **declared_env}
+    effective_env = apply_fs_root(root, candidate_env, declared_env)
     missing = missing_env_vars(plan, effective_env)
     if missing:
         message = "缺少环境变量: " + ", ".join(missing)
@@ -1809,7 +1814,7 @@ def _merged_suite_env(
     merged = dict(overrides)
     merged.update(project_env)
     merged.update(suite_env)
-    return apply_fs_root(root, merged, merged)
+    return merged
 
 
 def start_project_batch(

@@ -365,7 +365,9 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 }
 ```
 
-**env 优先级**（高 → 低）：`suite.env` > `project.env` > 本次请求 `env`。
+**env 优先级**（高 → 低）：`suite.env` > `project.env` > 本次请求 `env`；Web 层注入的默认值
+（如 `FS_ROOT` 指向 workspace 内 `fs-demo`）**只在三层都没声明该键时兜底**，绝不覆盖任何显式值，
+也不被上一次成功运行留下的 `last_env` 基线顶掉。
 PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/空串 = 沿用旧值、`null` = 删键、其余 = 覆盖。
 `scenario` 与 `POST /api/runs` 同源校验（`realpath` 前缀：仅 workspace 或仓库内置 `scenarios/`），越界 400。
 

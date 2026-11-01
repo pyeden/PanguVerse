@@ -693,3 +693,48 @@ def test_a56_query_filters_and_pagination(web: Client) -> None:
     status, body = web.json("GET", "/api/batches/deadbeefcafe")
     assert status == 404
     assert_error(body, "not_found")
+
+
+# --------------------------------------------------------------------------- #
+# A52 补充：web 层默认值（FS_ROOT）必须是最低优先级
+# --------------------------------------------------------------------------- #
+def test_a52_fs_root_default_is_lowest_priority(web: Client) -> None:
+    write_scenario(web, "pass.yaml", PASS_SCENARIO)
+    default_root = str((web.workspace / ".panguverse" / "fs-demo").resolve())
+    with MockAPI(flaky_failures=0) as mock:
+        # (a) suite.env 声明 FS_ROOT：请求里的覆盖不得盖掉它
+        suite_project = create_project(web, env={"BASE_URL": mock.base_url})
+        add_suite(
+            web,
+            suite_project["project_id"],
+            "scenarios/pass.yaml",
+            env={"FS_ROOT": "/tmp/pv-suite-root"},
+        )
+        started = run_project(
+            web, suite_project["project_id"], {"env": {"FS_ROOT": "/tmp/pv-request-root"}}
+        )
+        batch = web.wait_batch(started["batch_id"])
+        assert batch["aggregate"]["passed"] == 1, batch
+        suite_env = disk_report(web, batch["suites"][0]["run_id"])["env"]
+        assert suite_env["FS_ROOT"] == "/tmp/pv-suite-root", suite_env
+
+        # (b) suite 未声明、project.env 声明 → 取 project 的值
+        project_root = create_project(
+            web, env={"BASE_URL": mock.base_url, "FS_ROOT": "/tmp/pv-project-root"}
+        )
+        add_suite(web, project_root["project_id"], "scenarios/pass.yaml")
+        started = run_project(web, project_root["project_id"])
+        batch = web.wait_batch(started["batch_id"])
+        assert batch["aggregate"]["passed"] == 1, batch
+        project_env = disk_report(web, batch["suites"][0]["run_id"])["env"]
+        assert project_env["FS_ROOT"] == "/tmp/pv-project-root", project_env
+
+        # (c) 三者都没给 → 才用 web 默认（workspace 内 fs-demo）
+        bare_project = create_project(web, env={"BASE_URL": mock.base_url})
+        add_suite(web, bare_project["project_id"], "scenarios/pass.yaml")
+        started = run_project(web, bare_project["project_id"], {"env": {"BASE_URL": mock.base_url}})
+        batch = web.wait_batch(started["batch_id"])
+        assert batch["aggregate"]["passed"] == 1, batch
+        bare_env = disk_report(web, batch["suites"][0]["run_id"])["env"]
+        assert bare_env["FS_ROOT"] == default_root, bare_env
+        assert bare_env["FS_ROOT"] != "/tmp/pv-suite-root"
