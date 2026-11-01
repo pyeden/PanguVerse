@@ -14,6 +14,11 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from ..http.client import is_loopback_url
+
+#: 回环目标必须直连（macOS 系统代理会把 127.0.0.1 也劫持走，本机 ollama 会 502）
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
 
 class LLMError(RuntimeError):
     """LLM 调用失败（网络、鉴权、返回格式）。"""
@@ -139,8 +144,14 @@ class LLMClient:
             raise LLMError(f"无法解析 Anthropic 响应: {str(data)[:200]}") from exc
 
     def _send(self, request: urllib.request.Request) -> dict[str, Any]:
+        # 与 panguverse/http/client.py 同一套规则：回环直连，其余仍尊重系统/环境代理
+        opener = _DIRECT_OPENER if is_loopback_url(request.full_url) else None
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+            with (
+                opener.open(request, timeout=self.timeout)
+                if opener
+                else urllib.request.urlopen(request, timeout=self.timeout)
+            ) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""

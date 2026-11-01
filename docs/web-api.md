@@ -210,6 +210,28 @@ python -m panguverse serve --port 7788 --workspace . --no-open
   同样从打码后的报告数据重新渲染，避免 XML 旁路。
 - 文件缺失 → 404。
 
+### 测试报告 AI 总结（v3.0，契约 `tasks/web-ai-insight-spec.md`）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| `GET` | `/api/runs/{run_id}/insight` | 有缓存 → `200 {available: true, ...}`；无缓存 → `200 {"available": false}`，**不自动生成** |
+| `POST` | `/api/runs/{run_id}/insight` | body `{"refresh": false}`；`refresh=true` 强制重算，否则缓存有效时直接复用 |
+
+- 缓存 `<workspace>/.panguverse/web/insights/<run_id>.json`（目录 `0700`、文件 `0600`、临时文件 + `os.replace` 原子写），
+  内容就是响应体；`report.json` 的 `mtime` 晚于缓存即视为过期。
+- `source` 只有 `llm` / `rules` 两种。无 LLM 密钥（常见情况）→ `rules` +
+  `degraded_reason="未配置 LLM 密钥，使用离线规则总结"`；LLM 异常、超时（单次上限 25s）或返回不是合法 JSON
+  → 仍然 `200`，`source="rules"` 并在 `degraded_reason` 写明原因。**只有 `run_id` 非法（400）或 run 不存在（404）才报错。**
+- `stats` 永远取自 `report.summary`（`total/passed/failed/errored/skipped/healed_cases/duration_ms`，逐字相等），
+  LLM 不参与任何统计数字。
+- 规则内容只从 `report.json` 取数：失败按 `failure_kind` / `error.kind` / 状态码归为
+  `config`（沙箱文件缺失）、`auth`（401/403）、`engine`（capture 路径不存在 / 目标不可达）、`assertion`（正文或期望不符）、
+  `flaky`；`findings`/`suggestions` 里的 `case_ids` 一律来自报告。`plan.source == "memory"` 且存在失败时，
+  追加 `mixed_target`（回归库混跑不同被测目标）并给出一条 P1「按场景分组回归」建议。
+- LLM 输入只放打码后的摘要：`summary`、`plan.source`、失败用例/步骤的 `case/step/message/expected/actual/failure_kind`、
+  env **键名**；复用 `mask_env_payload` + `core/redact.mask_obj`，体积 ≤ 40KB。输出落盘/返回前再按同一套规则打码，
+  因此响应与缓存文件里不会出现 env 值、密码或 token。
+
 ### 任务定义 CRUD（v2.0，契约 `tasks/web-tasks-crud-spec.md` §2–§3.3）
 
 任务定义落盘 `<workspace>/.panguverse/tasks/<task_id>.json`（目录 `0700`、文件 `0600`，含 env 明文，
@@ -346,4 +368,4 @@ python -m panguverse serve --port 7788 --workspace . --no-open
 - 长任务只做「超时标记」，不强行中断执行线程（线程为 daemon，进程退出即回收）。
 - 回归库/经验库/`last_env.json` 是工作区文件，多个 job 并发写入时以「最后写入」为准（单用户场景可接受）。
 - env 基线只在「成功运行」后更新；一次失败的运行不会污染下一次的默认目标。
-- `panguverse/http/client.py` 之外的出站调用（如 `axe/llm.py` 的 LLM 请求）不在此次修复范围内。
+- `axe/llm.py` 的 LLM 请求回环地址（本机 ollama）已走 `ProxyHandler({})` 直连，与 `http/client.py` 规则一致；非回环地址仍尊重系统/环境代理。

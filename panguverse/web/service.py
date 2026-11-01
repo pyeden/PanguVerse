@@ -16,6 +16,7 @@ import contextlib
 import json
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -35,7 +36,7 @@ from ..engine.result import RunResult
 from ..report import DEFAULT_FORMATS, write_all
 from ..report.json_report import conclusion as report_conclusion
 from ..spec.loader import TestSuite, load_suite
-from . import tasks_store
+from . import insight, tasks_store
 from .jobs import Job, JobManager, sanitize_message
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -880,6 +881,95 @@ def run_artifact(root: Path, run_id: str, filename: str) -> Path:
     if not path.is_file():
         raise ApiError("not_found", f"{filename} 不存在")
     return path
+
+
+# --------------------------------------------------------------------------- #
+# AI 总结（契约 tasks/web-ai-insight-spec.md §1–§4）
+# --------------------------------------------------------------------------- #
+INSIGHT_STATE_REL = Path(".panguverse") / "web" / "insights"
+
+
+def insight_dir(root: Path) -> Path:
+    return root / INSIGHT_STATE_REL
+
+
+def insight_cache_path(root: Path, run_id: str) -> Path:
+    validate_run_id(run_id)
+    return insight_dir(root) / f"{run_id}.json"
+
+
+def read_insight_cache(root: Path, run_id: str) -> dict[str, Any] | None:
+    """读缓存；报告 ``mtime`` 晚于缓存即视为过期（契约 §1）。"""
+    path = insight_cache_path(root, run_id)
+    report_path = runs_root(root) / run_id / "report.json"
+    try:
+        if not path.is_file() or not report_path.is_file():
+            return None
+        if report_path.stat().st_mtime > path.stat().st_mtime:
+            return None
+        cached = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return cached if isinstance(cached, dict) else None
+
+
+def write_insight_cache(root: Path, run_id: str, payload: dict[str, Any]) -> Path:
+    """原子写：目录 0700、文件 0600（契约 §1）。"""
+    directory = insight_dir(root)
+    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        os.chmod(directory, 0o700)
+    target = insight_cache_path(root, run_id)
+    fd, tmp = tempfile.mkstemp(prefix=".insight-", suffix=".tmp", dir=directory)
+    written = False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, default=str)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, target)
+        written = True
+    finally:
+        if not written:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+    return target
+
+
+def get_insight(root: Path, run_id: str) -> dict[str, Any]:
+    """``GET``：有缓存原样返回，**不自动生成**（避免打开页面就烧 token）。"""
+    get_run(root, run_id)  # run_id 非法 400 / run 不存在 404
+    cached = read_insight_cache(root, run_id)
+    return cached if cached is not None else {"available": False}
+
+
+def _default_insight_llm() -> Any:
+    """没有密钥是常态：直接返回 None，让 insight 走规则兜底。"""
+    if not llm_enabled():
+        return None
+    from ..axe.llm import LLMClient
+
+    return LLMClient(timeout=insight.LLM_TIMEOUT)
+
+
+def generate_insight(
+    root: Path, run_id: str, payload: Any = None, *, llm_client: Any = None
+) -> dict[str, Any]:
+    """``POST``：``refresh=false`` 且缓存有效时直接复用；LLM 失败由 insight 内部降级。"""
+    data = _as_body(payload)
+    refresh = bool(data.get("refresh", False))
+    run = get_run(root, run_id)
+    if not refresh:
+        cached = read_insight_cache(root, run_id)
+        if cached is not None:
+            return cached
+    report = run.get("report")
+    if not isinstance(report, dict):
+        raise ApiError("internal_error", "report.json 结构非法")
+    plan = run.get("plan") if isinstance(run.get("plan"), dict) else None
+    client = llm_client if llm_client is not None else _default_insight_llm()
+    result = insight.build_payload(report, plan, run_id=run_id, llm_client=client)
+    write_insight_cache(root, run_id, result)
+    return result
 
 
 

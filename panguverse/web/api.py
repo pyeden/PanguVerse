@@ -30,6 +30,11 @@ _SENSITIVE_ENV_KEY_RE = re.compile(r"(?i)(password|passwd|secret|token|api[_-]?k
 MASK = "***"
 
 
+def is_sensitive_env_key(key: Any) -> bool:
+    """env 键名是否敏感（供 AI 总结打码复用同一套规则）。"""
+    return isinstance(key, str) and bool(_SENSITIVE_ENV_KEY_RE.search(key))
+
+
 def _mask_env_value(value: Any) -> Any:
     """把 env 子树里的敏感键值替换成 ``***``（递归处理嵌套 dict/list）。"""
     if isinstance(value, dict):
@@ -97,11 +102,14 @@ class WebAPI:
         *,
         jobs: JobManager | None = None,
         auth: AuthManager | None = None,
+        insight_llm: Any = None,
     ) -> None:
         self.root = service.resolve_workspace(workspace)
         self.jobs = jobs or JobManager()
         #: ``None`` = 关闭认证（--no-auth / 单元测试直接嵌入）；``serve`` 默认构造 AuthManager
         self.auth = auth
+        #: 注入用的 LLM client（A44 假 client）；``None`` = 按环境变量自动判定
+        self.insight_llm = insight_llm
 
     # ------------------------------------------------------------------ #
     def handle(
@@ -211,6 +219,8 @@ class WebAPI:
                     return json_response(service.get_run(self.root, rest[0]))
                 if len(rest) == 2:
                     run_id, filename = rest
+                    if filename == "insight":
+                        return json_response(service.get_insight(self.root, run_id))
                     if filename == "config":
                         return json_response(service.run_config(self.root, run_id))
                     if filename in ("report.html", "junit.xml"):
@@ -249,6 +259,11 @@ class WebAPI:
             if head == "runs" and len(rest) == 2 and rest[1] == "save_as_task":
                 task = service.save_run_as_task(self.root, rest[0], body)
                 return json_response(task, status=201)
+            if head == "runs" and len(rest) == 2 and rest[1] == "insight":
+                payload = service.generate_insight(
+                    self.root, rest[0], body, llm_client=self.insight_llm
+                )
+                return json_response(payload)
             if head == "tasks":
                 if not rest:
                     task = service.create_task(self.root, body)
@@ -391,5 +406,6 @@ __all__ = [
     "Response",
     "WebAPI",
     "error_response",
+    "is_sensitive_env_key",
     "json_response",
 ]
