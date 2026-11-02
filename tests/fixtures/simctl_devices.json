@@ -1,0 +1,26 @@
+{
+  "devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-17-5": [
+      {
+        "name": "iPhone 15",
+        "udid": "AAAA-1111-2222",
+        "state": "Shutdown",
+        "isAvailable": true
+      },
+      {
+        "name": "iPhone 15 Pro",
+        "udid": "BBBB-3333-4444",
+        "state": "Booted",
+        "isAvailable": true
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-16-4": [
+      {
+        "name": "Old Phone",
+        "udid": "CCCC-5555-6666",
+        "state": "Shutdown",
+        "isAvailable": false
+      }
+    ]
+  }
+}

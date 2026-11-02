@@ -1,0 +1,50 @@
+#!/bin/sh
+# 假 simctl：按 FAKE_SIM_MODE 返回 JSON/命令结果，供无模拟器环境验证解析。
+# 支持: normal | empty | fail
+mode="${FAKE_SIM_MODE:-normal}"
+if [ -n "$FAKE_SIM_LOG" ]; then
+  printf '%s\n' "$*" >> "$FAKE_SIM_LOG"
+fi
+
+case "$1" in
+  list)
+    case "$mode" in
+      empty) cat "${FAKE_SIM_JSON_EMPTY:?not set}" ;;
+      fail) echo "simctl: unable to list devices" >&2; exit 1 ;;
+      *) cat "${FAKE_SIM_JSON:?not set}" ;;
+    esac
+    exit 0
+    ;;
+  launch)
+    echo "${3}: 4242"
+    exit 0
+    ;;
+  terminate)
+    if [ "$mode" = "notrunning" ]; then
+      echo "found nothing to terminate" >&2
+      exit 1
+    fi
+    echo ok
+    exit 0
+    ;;
+  io)
+    # io <udid> screenshot <path>
+    if [ "$3" = "screenshot" ]; then
+      cp "${FAKE_SIM_PNG:?not set}" "$4"
+      exit 0
+    fi
+    echo ok
+    exit 0
+    ;;
+  boot|shutdown|install|openurl)
+    if [ "$mode" = "fail" ]; then
+      echo "simctl: operation failed" >&2
+      exit 1
+    fi
+    echo ok
+    exit 0
+    ;;
+esac
+
+echo "unsupported fake simctl command: $*" >&2
+exit 2

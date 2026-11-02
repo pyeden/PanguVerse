@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hierarchy rotation="0">
+  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="com.example" content-desc="" clickable="false" enabled="true" bounds="[0,0][1080,1920]">
+    <node index="0" text="登录" resource-id="com.example:id/login" class="android.widget.Button" package="com.example" content-desc="登录按钮" clickable="true" enabled="true" bounds="[100,200][500,300]" />
+    <node index="1" text="用户名" resource-id="com.example:id/username" class="android.widget.EditText" package="com.example" content-desc="" clickable="true" enabled="true" bounds="[100,400][900,500]" />
+    <node index="2" text="" resource-id="com.example:id/avatar" class="android.widget.ImageView" package="com.example" content-desc="头像" clickable="false" enabled="true" bounds="[800,20][1060,280]" />
+  </node>
+</hierarchy>

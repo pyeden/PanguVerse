@@ -1,0 +1,97 @@
+#!/bin/sh
+# 假 adb：按 FAKE_ADB_MODE 模拟设备/命令，供无真机环境验证解析与失败分支。
+# 支持: one | two | none | unauthorized | dump_fail_once | fail | long
+mode="${FAKE_ADB_MODE:-one}"
+if [ -n "$FAKE_ADB_LOG" ]; then
+  printf '%s\n' "$*" >> "$FAKE_ADB_LOG"
+fi
+
+if [ "$1" = "devices" ]; then
+  echo "List of devices attached"
+  case "$mode" in
+    none) ;;
+    two)
+      echo "SERIAL-A	device product:p1 model:Pixel_7 device:panther transport_id:1"
+      echo "SERIAL-B	device product:p2 model:Pixel_8 device:husky transport_id:2"
+      ;;
+    unauthorized)
+      echo "SERIAL-U	unauthorized usb:1-1 transport_id:3"
+      ;;
+    *)
+      echo "SERIAL-A	device product:p1 model:Pixel_7 device:panther transport_id:1"
+      ;;
+  esac
+  exit 0
+fi
+
+if [ "$1" = "-s" ]; then
+  shift 2
+fi
+
+case "$1" in
+  shell)
+    shift
+    case "$1" in
+      uiautomator)
+        if [ "$mode" = "dump_fail_once" ]; then
+          state_dir="${FAKE_ADB_STATE_DIR:-/tmp}"
+          count_file="$state_dir/fake_adb_dump_count"
+          count=$(cat "$count_file" 2>/dev/null || echo 0)
+          count=$((count + 1))
+          echo "$count" > "$count_file"
+          if [ "$count" -eq 1 ]; then
+            echo "ERROR: could not get idle state." >&2
+            exit 1
+          fi
+        fi
+        if [ "$mode" = "fail" ]; then
+          echo "ERROR: could not get idle state." >&2
+          exit 1
+        fi
+        echo "UI hierchary dumped to: /sdcard/window_dump.xml"
+        exit 0
+        ;;
+      input)
+        if [ "$mode" = "fail" ]; then
+          echo "Error: Invalid arguments for command: tap" >&2
+          exit 1
+        fi
+        echo "ok"
+        exit 0
+        ;;
+      am|monkey)
+        if [ "$mode" = "fail" ]; then
+          echo "Error: Activity class does not exist." >&2
+          exit 1
+        fi
+        if [ "$mode" = "long" ]; then
+          awk 'BEGIN { for (i = 0; i < 6000; i++) printf "x"; printf "\n" }'
+          exit 0
+        fi
+        echo "Starting: Intent { cmp=com.example/.MainActivity }"
+        echo "Events injected: 1"
+        exit 0
+        ;;
+      *)
+        echo "ok"
+        exit 0
+        ;;
+    esac
+    ;;
+  exec-out)
+    shift
+    case "$1" in
+      cat)
+        cat "${FAKE_ADB_XML:?FAKE_ADB_XML not set}"
+        exit 0
+        ;;
+      screencap)
+        cat "${FAKE_ADB_PNG:?FAKE_ADB_PNG not set}"
+        exit 0
+        ;;
+    esac
+    ;;
+esac
+
+echo "unsupported fake adb command: $*" >&2
+exit 2

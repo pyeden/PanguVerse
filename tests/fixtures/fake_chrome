@@ -1,0 +1,15 @@
+#!/bin/sh
+# 假 Chrome：--dump-dom 输出固定 DOM，--screenshot=path 写固定 PNG。
+if [ -n "$FAKE_CHROME_LOG" ]; then
+  printf '%s\n' "$*" >> "$FAKE_CHROME_LOG"
+fi
+for arg in "$@"; do
+  case "$arg" in
+    --screenshot=*)
+      target="${arg#--screenshot=}"
+      cp "${FAKE_CHROME_PNG:?not set}" "$target"
+      exit 0
+      ;;
+  esac
+done
+cat "${FAKE_CHROME_DOM:?not set}"

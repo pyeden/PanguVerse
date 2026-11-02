@@ -6,6 +6,9 @@
 - :mod:`~panguverse.packs.api_testing` —— HTTP / API 测试领域
 - :mod:`~panguverse.packs.local_fs` —— 本地文件系统领域
 - :mod:`~panguverse.packs.web_research` —— 网页抓取 / 正文 / 结构 / LLM 总结领域
+- :mod:`~panguverse.packs.web_browser` —— Chrome 无头浏览器 / 渲染后 DOM / 截图领域
+- :mod:`~panguverse.packs.android_adb` —— 安卓 adb 设备控制领域
+- :mod:`~panguverse.packs.ios_sim` —— iOS 模拟器（simctl）领域
 
 第三方包：把 ``*.pack.yaml``（声明式、无需 Python）放进项目或 ``PANGUVERSE_PACKS``
 指向的目录即可被加载，见 :func:`panguverse.core.pack.load_pack_dir`。
@@ -14,13 +17,16 @@
 from __future__ import annotations
 
 from ..core.pack import AtomPack
-from . import api_testing, core, local_fs, web_research
+from . import android_adb, api_testing, core, ios_sim, local_fs, web_browser, web_research
 
 _BUILDERS = (
     core.build_pack,
     api_testing.build_pack,
     local_fs.build_pack,
     web_research.build_pack,
+    web_browser.build_pack,
+    android_adb.build_pack,
+    ios_sim.build_pack,
 )
 
 
