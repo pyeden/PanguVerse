@@ -26,8 +26,6 @@ URL_RE = re.compile(r"https?://[^\s，。；、）)\]}>\"']+", re.IGNORECASE)
 
 #: 明确「当前原子库表达不了」的网页动作 → 需要的新原子
 WEB_MISSING_ACTIONS: dict[str, tuple[str, str]] = {
-    "截图": ("web_screenshot", "浏览器截图原子（web_screenshot）"),
-    "screenshot": ("web_screenshot", "浏览器截图原子（web_screenshot）"),
     "ocr": ("ocr_image", "图片 OCR 原子（ocr_image）"),
     "识别图片": ("ocr_image", "图片 OCR 原子（ocr_image）"),
     "图片文字": ("ocr_image", "图片 OCR 原子（ocr_image）"),
@@ -41,6 +39,31 @@ WEB_MISSING_ACTIONS: dict[str, tuple[str, str]] = {
     "翻译": ("llm_translate", "翻译原子（llm_translate）"),
     "视频": ("video_extract", "视频解析原子（video_extract）"),
     "音频": ("audio_transcribe", "音频转写原子（audio_transcribe）"),
+}
+
+#: iOS 专属能力缺口：原子库没有元素级交互（需要 XCUITest/WebDriverAgent）
+IOS_MISSING_ACTIONS: dict[str, tuple[str, str]] = {
+    "点击": ("ios_tap", "iOS 元素点击原子（ios_tap，需要 XCUITest/WebDriverAgent）"),
+    "tap": ("ios_tap", "iOS 元素点击原子（ios_tap，需要 XCUITest/WebDriverAgent）"),
+    "输入": ("ios_input_text", "iOS 文本输入原子（ios_input_text，需要 XCUITest/WebDriverAgent）"),
+    "input": ("ios_input_text", "iOS 文本输入原子（ios_input_text，需要 XCUITest/WebDriverAgent）"),
+    "滑动": ("ios_swipe", "iOS 滑动原子（ios_swipe，需要 XCUITest/WebDriverAgent）"),
+    "swipe": ("ios_swipe", "iOS 滑动原子（ios_swipe，需要 XCUITest/WebDriverAgent）"),
+}
+
+#: 安卓专属能力缺口：点击/输入/截图/UI dump 都已实现；只缺 APK 安装
+ANDROID_MISSING_ACTIONS: dict[str, tuple[str, str]] = {
+    "安装 apk": ("android_install_app", "安卓 APK 安装原子（android_install_app）"),
+    "安装apk": ("android_install_app", "安卓 APK 安装原子（android_install_app）"),
+}
+
+#: 领域 → 缺失动作表。**能力缺口 ≠ 环境缺失**：
+#: 安卓点击原子存在，只会在运行期因无设备报 missing_device，不能在这里判 gap。
+_MISSING_BY_DOMAIN: dict[str, dict[str, tuple[str, str]]] = {
+    "web_browser": WEB_MISSING_ACTIONS,
+    "web_research": WEB_MISSING_ACTIONS,
+    "android_adb": ANDROID_MISSING_ACTIONS,
+    "ios_sim": IOS_MISSING_ACTIONS,
 }
 
 #: 领域词 → 领域包
@@ -59,6 +82,48 @@ _DOMAIN_HINTS: dict[str, tuple[str, ...]] = {
         "爬取",
         "爬虫",
         "web",
+    ),
+    "web_browser": (
+        "无头浏览器",
+        "浏览器",
+        "chrome",
+        "chromium",
+        "browser",
+        "打开网页",
+        "打开页面",
+        "访问网页",
+        "页面截图",
+        "网页截图",
+        "取链接",
+        "提取链接",
+        "等待文本",
+        "渲染后",
+        "前端渲染",
+    ),
+    "android_adb": (
+        "安卓",
+        "android",
+        "adb",
+        "安卓设备",
+        "安卓手机",
+        "安卓模拟器",
+        "坐标",
+        "uiautomator",
+        "ui 控件",
+        "界面控件",
+    ),
+    "ios_sim": (
+        "ios",
+        "iphone",
+        "ipad",
+        "ios 模拟器",
+        "ios模拟器",
+        "模拟器",
+        "simulator",
+        "simctl",
+        "xcrun",
+        "xcode",
+        "安装 ipa",
     ),
     "local_fs": (
         "文件",
@@ -115,6 +180,39 @@ _ACTION_ATOMS: dict[str, dict[str, tuple[str, ...]]] = {
         "user": ("http_request", "assert_json"),
         "assert": ("assert_json", "assert_schema"),
     },
+    "web_browser": {
+        "open": ("web_open",),
+        "text": ("web_get_text",),
+        "links": ("web_extract_links",),
+        "screenshot": ("web_screenshot",),
+        "wait": ("web_wait_for_text",),
+    },
+    "android_adb": {
+        "device": ("android_devices",),
+        "launch": ("android_launch_app",),
+        "stop": ("android_stop_app",),
+        "tap": ("android_tap",),
+        "swipe": ("android_swipe",),
+        "input": ("android_input_text",),
+        "key": ("android_keyevent",),
+        "screenshot": ("android_screencap",),
+        "ui": ("android_ui_dump",),
+        "find": ("android_find_text",),
+        "wait": ("android_wait_text",),
+    },
+    "ios_sim": {
+        "list": ("ios_sim_list",),
+        "boot": ("ios_sim_boot",),
+        "shutdown": ("ios_sim_shutdown",),
+        "install": ("ios_sim_install",),
+        "launch": ("ios_sim_launch",),
+        "terminate": ("ios_sim_terminate",),
+        "openurl": ("ios_sim_openurl",),
+        "screenshot": ("ios_sim_screenshot",),
+        "tap": ("ios_tap",),
+        "input": ("ios_input_text",),
+        "swipe": ("ios_swipe",),
+    },
 }
 
 _WEB_ACTION_WORDS: dict[str, tuple[str, ...]] = {
@@ -142,6 +240,42 @@ _API_ACTION_WORDS: dict[str, tuple[str, ...]] = {
     "request": ("请求", "接口", "api", "http"),
 }
 
+_WEB_BROWSER_ACTION_WORDS: dict[str, tuple[str, ...]] = {
+    "open": ("打开网页", "打开页面", "访问网页", "打开", "访问", "抓取页面"),
+    "text": ("取文本", "提取正文", "页面文本", "文本内容", "正文"),
+    "links": ("链接", "取链接", "提取链接", "href"),
+    "screenshot": ("截图", "截屏", "screenshot"),
+    "wait": ("等待文本", "等待出现", "动态加载", "wait for"),
+}
+
+_ANDROID_ACTION_WORDS: dict[str, tuple[str, ...]] = {
+    "device": ("设备列表", "列出设备", "探测设备", "adb devices", "连接设备"),
+    "launch": ("启动应用", "启动 app", "打开 app", "launch"),
+    "stop": ("停止应用", "关闭应用", "force-stop", "停止"),
+    "tap": ("点击", "点击坐标", "tap"),
+    "swipe": ("滑动", "swipe"),
+    "input": ("输入", "输入文字", "输入文本", "填写", "input text"),
+    "key": ("按键", "keyevent", "返回键"),
+    "screenshot": ("截图", "截屏", "screencap"),
+    "ui": ("ui 控件", "界面控件", "控件树", "uiautomator", "ui dump"),
+    "find": ("查找文本", "查找控件", "find text"),
+    "wait": ("等待文本", "等待控件"),
+}
+
+_IOS_ACTION_WORDS: dict[str, tuple[str, ...]] = {
+    "list": ("模拟器列表", "列出模拟器", "设备列表", "list"),
+    "boot": ("启动模拟器", "boot"),
+    "shutdown": ("关闭模拟器", "shutdown"),
+    "install": ("安装 ipa", "安装 app", "install"),
+    "launch": ("启动 app", "启动应用", "launch"),
+    "terminate": ("结束 app", "终止 app", "terminate"),
+    "openurl": ("打开 url", "深链", "openurl"),
+    "screenshot": ("截图", "截屏", "screenshot"),
+    "tap": ("点击", "tap"),
+    "input": ("输入", "输入文字", "输入文本", "input text"),
+    "swipe": ("滑动", "swipe"),
+}
+
 #: 动作 → 模板名（只用于自动领域路由；显式 domain_pack 仍走旧模板打分）
 _TEMPLATE_BY_ACTION: dict[str, dict[str, str]] = {
     "web_research": {"fetch": "web_page_report", "text": "web_page_report", "structure": "web_page_report", "summary": "web_page_report"},
@@ -150,6 +284,22 @@ _TEMPLATE_BY_ACTION: dict[str, dict[str, str]] = {
         "write": "fs_data_roundtrip",
         "read": "fs_data_roundtrip",
         "cleanup": "fs_cleanup",
+    },
+    "web_browser": {
+        "open": "web_browser_content",
+        "text": "web_browser_content",
+        "links": "web_browser_links",
+        "screenshot": "web_browser_screenshot",
+        "wait": "web_browser_wait_text",
+    },
+    "android_adb": {
+        "device": "android_devices_probe",
+        "launch": "android_launch_screenshot",
+        "screenshot": "android_launch_screenshot",
+        "tap": "android_tap_coordinates",
+    },
+    "ios_sim": {
+        "list": "ios_simulator_list",
     },
     "api_testing": {
         "login": "login_flow",
@@ -233,32 +383,39 @@ def _domain_hits(text: str, domain: str) -> list[str]:
 
 
 def _action_words(domain: str) -> dict[str, tuple[str, ...]]:
+    if domain == "web_browser":
+        return _WEB_BROWSER_ACTION_WORDS
     if domain == "web_research":
         return _WEB_ACTION_WORDS
+    if domain == "android_adb":
+        return _ANDROID_ACTION_WORDS
+    if domain == "ios_sim":
+        return _IOS_ACTION_WORDS
     if domain == "local_fs":
         return _FS_ACTION_WORDS
     return _API_ACTION_WORDS
 
 
 def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
-    """把意图拆成「领域 + 动作 + 缺失能力」，**不做任何兜底补全**。"""
+    """把意图拆成「领域 + 动作 + 缺失能力」，**不做任何兜底补全**。
+
+    关键区分：**能力缺口 ≠ 环境缺失**。
+
+    - 原子不存在（例如 iOS 点击需要 ``ios_tap``）→ ``missing_atoms`` / ``capability_gap``；
+    - 原子存在但运行期没有设备（例如 ``android_tap`` 无设备）→ 不在这里判 gap，
+      由原子在执行时返回 ``missing_device``。
+    """
     text = str(intent or "").strip()
     analysis = IntentAnalysis(intent=text)
     urls = [match.group(0).rstrip(".,;:!?") for match in URL_RE.finditer(text)]
     analysis.url = urls[0] if urls else ""
 
-    # 缺失动作：即使领域命中，原子库也没有对应原语
-    lowered = text.lower()
-    missing: list[str] = []
-    suggestions: list[str] = []
-    for word, (atom_name, hint) in WEB_MISSING_ACTIONS.items():
-        if word.lower() in lowered and atom_name not in missing:
-            missing.append(atom_name)
-            suggestions.append(f"需要新增原子：{hint}")
-    analysis.missing_atoms = missing
-    analysis.suggestions = suggestions
-
-    candidates = [domain_pack] if domain_pack else ["web_research", "local_fs", "api_testing"]
+    # 先做领域 + 动作路由（新领域靠词表和动作词参与同一套打分）
+    candidates = (
+        [domain_pack]
+        if domain_pack
+        else ["web_browser", "web_research", "android_adb", "ios_sim", "local_fs", "api_testing"]
+    )
     best: tuple[int, str, list[str]] | None = None
     for domain in candidates:
         domain_hits = _domain_hits(text, domain)
@@ -285,6 +442,18 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     elif domain_pack:
         analysis.domain = domain_pack
 
+    # 缺失动作：按**已路由到的领域**查表，避免把 iOS/安卓点击误判成浏览器点击
+    lowered = text.lower()
+    missing: list[str] = []
+    suggestions: list[str] = []
+    table = _MISSING_BY_DOMAIN.get(analysis.domain, WEB_MISSING_ACTIONS)
+    for word, (atom_name, hint) in table.items():
+        if word.lower() in lowered and atom_name not in missing:
+            missing.append(atom_name)
+            suggestions.append(f"需要新增原子：{hint}")
+    analysis.missing_atoms = missing
+    analysis.suggestions = suggestions
+
     terms: list[str] = []
     domain_terms = _domain_hits(text, analysis.domain) if analysis.domain else []
     for word in [*domain_terms, *analysis.actions]:
@@ -302,8 +471,11 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
             analysis.missing_atoms.insert(0, "http_get_page")
         analysis.suggestions.append("请提供目标网页 URL（如 https://example.com）")
         analysis.assumptions.append("需要提供目标网页 URL")
+    if analysis.domain == "web_browser" and not analysis.url and (
+        "open" in analysis.actions or "screenshot" in analysis.actions
+    ):
+        analysis.assumptions.append("需要提供目标网页 URL（env.PAGE_URL）")
     return analysis
-
 
 # --------------------------------------------------------------------------- #
 # 覆盖率（语义校验用）
@@ -471,7 +643,14 @@ def _build_rule_plan(
                 "suggestions": [f"为 {domain} 增加动作模板，或改用场景 YAML 精确描述"],
             },
         )
-    specs = [expand_case_spec(template.build(), registry=registry) for template in chosen]
+    specs = []
+    for template in chosen:
+        spec = template.build()
+        if domain == "web_browser" and analysis.url:
+            for step in spec.get("steps") or []:
+                if step.get("use") in {"web_open", "web_screenshot"}:
+                    step.setdefault("with", {})["url"] = analysis.url
+        specs.append(expand_case_spec(spec, registry=registry))
     from ..core.molecule import Molecule
 
     return TestPlan(

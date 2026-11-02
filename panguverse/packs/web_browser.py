@@ -750,6 +750,70 @@ def build_web_content() -> dict[str, Any]:
     }
 
 
+def build_web_links() -> dict[str, Any]:
+    """「打开网页 → 提取链接」的参数化计划。"""
+    return {
+        "id": "web_browser_links",
+        "name": "浏览器打开网页并提取链接",
+        "tags": ["web", "browser", "links"],
+        "description": "用 Chrome 无头打开页面，提取页面链接",
+        "steps": [
+            {
+                "id": "open",
+                "use": "web_open",
+                "name": "无头浏览器打开页面",
+                "with": {"url": "${env.PAGE_URL}", "timeout": 30},
+            },
+            {
+                "id": "links",
+                "use": "web_extract_links",
+                "name": "提取链接",
+                "with": {"html": "${open.html}"},
+            },
+        ],
+    }
+
+
+def build_web_screenshot_plan() -> dict[str, Any]:
+    """「网页截图」的参数化计划。"""
+    return {
+        "id": "web_browser_screenshot",
+        "name": "网页截图",
+        "tags": ["web", "browser", "screenshot"],
+        "description": "用 Chrome 无头模式给网页截图",
+        "steps": [
+            {
+                "id": "shot",
+                "use": "web_screenshot",
+                "name": "网页截图",
+                "with": {"url": "${env.PAGE_URL}", "name": "page.png"},
+            }
+        ],
+    }
+
+
+def build_web_wait_text() -> dict[str, Any]:
+    """「等待页面文本出现」的参数化计划。"""
+    return {
+        "id": "web_browser_wait_text",
+        "name": "等待网页文本出现",
+        "tags": ["web", "browser", "wait"],
+        "description": "轮询渲染后的页面，直到指定文本出现",
+        "steps": [
+            {
+                "id": "wait",
+                "use": "web_wait_for_text",
+                "name": "等待文本出现",
+                "with": {
+                    "url": "${env.PAGE_URL}",
+                    "text": "${env.WAIT_TEXT}",
+                    "timeout": 15,
+                },
+            }
+        ],
+    }
+
+
 def web_browser_intent_templates() -> list[Any]:
     """``web_browser`` 包声明的意图模板。"""
     from ..core.contract import RuleTemplate
@@ -758,13 +822,43 @@ def web_browser_intent_templates() -> list[Any]:
         RuleTemplate(
             name="web_browser_content",
             description="用无头浏览器打开网页并提取渲染后的正文",
-            keywords=("无头浏览器", "浏览器打开", "渲染后", "前端渲染", "js 渲染", "浏览器截图"),
+            keywords=("无头浏览器", "浏览器打开", "渲染后", "前端渲染", "js 渲染", "取文本", "正文"),
             builder=build_web_content,
             tags=("web", "browser"),
             weight=1,
             domain="web_browser",
             pack="web_browser",
-        )
+        ),
+        RuleTemplate(
+            name="web_browser_links",
+            description="无头浏览器打开网页并提取链接",
+            keywords=("取链接", "提取链接", "页面链接"),
+            builder=build_web_links,
+            tags=("web", "browser", "links"),
+            weight=2,
+            domain="web_browser",
+            pack="web_browser",
+        ),
+        RuleTemplate(
+            name="web_browser_screenshot",
+            description="网页截图",
+            keywords=("网页截图", "浏览器截图", "页面截图"),
+            builder=build_web_screenshot_plan,
+            tags=("web", "browser", "screenshot"),
+            weight=2,
+            domain="web_browser",
+            pack="web_browser",
+        ),
+        RuleTemplate(
+            name="web_browser_wait_text",
+            description="等待网页文本出现",
+            keywords=("等待文本", "等待出现", "动态加载"),
+            builder=build_web_wait_text,
+            tags=("web", "browser", "wait"),
+            weight=2,
+            domain="web_browser",
+            pack="web_browser",
+        ),
     ]
 
 
@@ -807,6 +901,9 @@ __all__ = [
     "WebBrowserSemantics",
     "build_pack",
     "build_web_content",
+    "build_web_links",
+    "build_web_screenshot_plan",
+    "build_web_wait_text",
     "chrome_dump_dom",
     "clip_output",
     "resolve_chrome",

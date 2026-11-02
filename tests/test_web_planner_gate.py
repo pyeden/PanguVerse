@@ -144,7 +144,9 @@ def test_t2_missing_atoms_returns_422_without_graph(api: WebAPI) -> None:
     assert status == 422, body
     error = body["error"]
     assert error["code"] == "capability_gap"
-    assert {"web_screenshot", "ocr_image"} <= set(error["missing_atoms"])
+    # 截图原子已实现（web_screenshot），只剩 OCR 是真正的能力缺口
+    assert "ocr_image" in set(error["missing_atoms"])
+    assert "web_screenshot" not in set(error["missing_atoms"])
     assert error["suggestions"]
     assert "graph" not in body
     assert not list((api.root / ".panguverse" / "studio").glob("w-*"))

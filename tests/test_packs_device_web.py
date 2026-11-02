@@ -22,6 +22,7 @@ from panguverse.axe.memory import Workspace
 from panguverse.core.context import RunContext
 from panguverse.core.errors import AtomFailure
 from panguverse.core.pack import builtin_pack_registry
+from panguverse.core.registry import default_registry
 from panguverse.packs import android_adb, ios_sim, web_browser
 from panguverse.packs.android_adb import (
     android_devices,
@@ -49,6 +50,7 @@ from panguverse.packs.web_browser import (
     web_screenshot,
     web_wait_for_text,
 )
+from panguverse.web import planner_gate
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 LIVE = os.environ.get("PANGUVERSE_LIVE") == "1"
@@ -530,6 +532,57 @@ def test_ios_terminate_not_running_is_ok(fake_sim_env, monkeypatch: pytest.Monke
     monkeypatch.setenv("FAKE_SIM_MODE", "notrunning")
     out = ios_sim_terminate.invoke(ctx, {"udid": "AAAA-1111-2222", "bundle_id": "com.example.app"})
     assert out["ok"] is True
+
+
+# --------------------------------------------------------------------------- #
+# 规划器领域路由 / 能力缺口（与运行时环境缺失区分）
+# --------------------------------------------------------------------------- #
+def test_intent_routes_web_browser_page_content() -> None:
+    intent = "用无头浏览器打开网页 https://example.com 并提取正文"
+    analysis = planner_gate.analyze_intent(intent)
+    assert analysis.domain == "web_browser"
+    assert {"web_open", "web_get_text"} <= set(analysis.requested_atoms)
+    assert analysis.missing_atoms == []
+
+    draft = planner_gate.plan_draft(default_registry(reload=True), intent=intent, allow_llm=False)
+    atoms = [step.use for case in draft.plan.cases for step in case.steps]
+    assert atoms[0] == "web_open"
+    assert "web_get_text" in atoms
+    assert draft.analysis["domain"] == "web_browser"
+    assert draft.capability_gaps == []
+    open_step = next(step for case in draft.plan.cases for step in case.steps if step.use == "web_open")
+    assert open_step.with_["url"] == "https://example.com"
+
+
+def test_intent_routes_android_tap_without_capability_gap() -> None:
+    intent = "在安卓设备上点击坐标 100,200"
+    analysis = planner_gate.analyze_intent(intent)
+    assert analysis.domain == "android_adb"
+    assert "android_tap" in analysis.requested_atoms
+    # 原子存在：无设备是运行期 missing_device，不是能力缺口
+    assert analysis.missing_atoms == []
+
+    draft = planner_gate.plan_draft(default_registry(reload=True), intent=intent, allow_llm=False)
+    atoms = [step.use for case in draft.plan.cases for step in case.steps]
+    assert "android_devices" in atoms
+    assert "android_tap" in atoms
+    assert draft.capability_gaps == []
+
+
+def test_intent_ios_click_returns_capability_gap() -> None:
+    intent = "点击 iOS 模拟器上的登录按钮"
+    analysis = planner_gate.analyze_intent(intent)
+    assert analysis.domain == "ios_sim"
+    assert "ios_tap" in analysis.missing_atoms
+    assert analysis.suggestions
+
+    with pytest.raises(planner_gate.PlanGateError) as excinfo:
+        planner_gate.plan_draft(default_registry(reload=True), intent=intent, allow_llm=False)
+    failure = excinfo.value
+    assert failure.code == "capability_gap"
+    assert failure.status == 422
+    assert "ios_tap" in failure.details["missing_atoms"]
+    assert failure.details["suggestions"]
 
 
 # --------------------------------------------------------------------------- #

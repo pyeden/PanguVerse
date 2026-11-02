@@ -908,6 +908,45 @@ def build_android_launch_shot() -> dict[str, Any]:
     }
 
 
+def build_android_devices() -> dict[str, Any]:
+    """「列出/探测安卓设备」的参数化计划。"""
+    return {
+        "id": "android_devices_probe",
+        "name": "探测安卓设备",
+        "tags": ["android", "device", "probe"],
+        "description": "列出 adb 设备；无设备时返回空数组",
+        "steps": [
+            {"id": "devices", "use": "android_devices", "name": "列出安卓设备"},
+        ],
+    }
+
+
+def build_android_tap() -> dict[str, Any]:
+    """「点击安卓坐标」的参数化计划（坐标可用环境变量覆盖）。"""
+    return {
+        "id": "android_tap_coordinates",
+        "name": "安卓点击坐标",
+        "tags": ["android", "device", "tap"],
+        "description": "在已连接的安卓设备上点击给定坐标",
+        "steps": [
+            {
+                "id": "devices",
+                "use": "android_devices",
+                "name": "确认设备在线",
+            },
+            {
+                "id": "tap",
+                "use": "android_tap",
+                "name": "点击坐标",
+                "with": {
+                    "x": "${env.ANDROID_X|default:100|int}",
+                    "y": "${env.ANDROID_Y|default:200|int}",
+                },
+            },
+        ],
+    }
+
+
 def android_intent_templates() -> list[Any]:
     from ..core.contract import RuleTemplate
 
@@ -921,7 +960,27 @@ def android_intent_templates() -> list[Any]:
             weight=1,
             domain="android_adb",
             pack="android_adb",
-        )
+        ),
+        RuleTemplate(
+            name="android_devices_probe",
+            description="探测/列出安卓设备（无设备返回空数组）",
+            keywords=("安卓设备", "安卓设备列表", "adb devices", "连接设备"),
+            builder=build_android_devices,
+            tags=("android", "device", "probe"),
+            weight=2,
+            domain="android_adb",
+            pack="android_adb",
+        ),
+        RuleTemplate(
+            name="android_tap_coordinates",
+            description="在安卓设备上点击坐标",
+            keywords=("安卓点击", "点击坐标", "安卓 tap", "tap 坐标"),
+            builder=build_android_tap,
+            tags=("android", "device", "tap"),
+            weight=2,
+            domain="android_adb",
+            pack="android_adb",
+        ),
     ]
 
 
