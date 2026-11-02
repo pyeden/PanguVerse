@@ -203,7 +203,7 @@ export function TasksPage() {
           if (includeArchived) next.delete('include_archived')
           else next.set('include_archived', '1')
           navigate(withQuery('/tasks', next), { replace: true })
-        }} aria-pressed={includeArchived}>
+        }} aria-pressed={includeArchived} data-testid="toggle-archived">
           <span className="toggle-track"><span /></span>
           显示已归档
         </button>
@@ -367,6 +367,7 @@ export function TasksPage() {
         title={archiveNext ? '归档任务' : '取消归档任务'}
         message={archiveNext ? <>确定归档任务「{archiveTarget?.name}」？<br />只归档，不删除配置与历史运行；归档后默认列表不再显示。</> : <>确定取消归档任务「{archiveTarget?.name}」？取消后任务会重新出现在默认列表。</>}
         confirmLabel={archiveNext ? '归档任务' : '取消归档'}
+        confirmTestId="confirm-archive"
         danger={archiveNext}
         busy={archiveMutation.isPending}
         onClose={() => setArchiveTarget(null)}

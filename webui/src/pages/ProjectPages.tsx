@@ -866,6 +866,7 @@ export function ProjectSettingsPage() {
         title={archiveProjectNext ? '归档项目' : '取消归档项目'}
         message={archiveProjectNext ? <>确定归档项目「{project.name}」？<br />只归档，不删历史运行、报告与套件配置；默认列表将不再显示。</> : <>确定取消归档项目「{project.name}」？项目会重新出现在默认列表。</>}
         confirmLabel={archiveProjectNext ? '归档项目' : '取消归档'}
+        confirmTestId="confirm-archive"
         danger={archiveProjectNext}
         busy={archiveProjectMutation.isPending}
         onClose={() => setArchiveProjectOpen(false)}

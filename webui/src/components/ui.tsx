@@ -454,6 +454,7 @@ export function ConfirmDialog({
   title,
   message,
   confirmLabel = '确认',
+  confirmTestId,
   danger = false,
   busy = false,
   onConfirm,
@@ -463,6 +464,7 @@ export function ConfirmDialog({
   title: string
   message: ReactNode
   confirmLabel?: string
+  confirmTestId?: string
   danger?: boolean
   busy?: boolean
   onConfirm: () => void
@@ -477,7 +479,7 @@ export function ConfirmDialog({
       footer={
         <>
           <Button variant="ghost" onClick={onClose} disabled={busy}>取消</Button>
-          <Button variant={danger ? 'danger' : 'primary'} onClick={onConfirm} loading={busy}>{confirmLabel}</Button>
+          <Button variant={danger ? 'danger' : 'primary'} onClick={onConfirm} loading={busy} data-testid={confirmTestId}>{confirmLabel}</Button>
         </>
       }
     >

@@ -110,7 +110,7 @@ export function ProjectsPage() {
             if (includeArchived) next.delete('include_archived')
             else next.set('include_archived', '1')
             navigate(withQuery('/projects', next), { replace: true })
-          }} aria-pressed={includeArchived}><span className="toggle-track"><span /></span>显示已归档</button>
+          }} aria-pressed={includeArchived} data-testid="toggle-archived"><span className="toggle-track"><span /></span>显示已归档</button>
           <Badge tone="neutral">{filtered.length} / {projects.length} 个项目</Badge>
           {includeArchived ? <span className="muted">{archivedCount} 个已归档</span> : <span className="muted">按最近更新排序</span>}
         </div>
@@ -199,6 +199,7 @@ export function ProjectsPage() {
         title={archiveNext ? '归档项目' : '取消归档项目'}
         message={archiveNext ? <>确定归档项目「{archiveTarget?.name}」？<br />只归档，不删历史运行、报告与套件配置；归档后默认列表不显示。</> : <>确定取消归档项目「{archiveTarget?.name}」？取消后会重新出现在默认列表。</>}
         confirmLabel={archiveNext ? '归档项目' : '取消归档'}
+        confirmTestId="confirm-archive"
         danger={archiveNext}
         busy={archiveMutation.isPending}
         onClose={() => setArchiveTarget(null)}

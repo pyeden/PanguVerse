@@ -245,7 +245,7 @@ export function ExecutionsPage() {
         footer={
           <>
             <Button variant="ghost" disabled={cancel.isPending} onClick={() => { setCancelTarget(null); setCancelError('') }}>保留运行</Button>
-            <Button variant="danger" icon="close" loading={cancel.isPending} onClick={() => cancelTarget && cancel.mutate(cancelTarget)}>确认取消</Button>
+            <Button variant="danger" icon="close" loading={cancel.isPending} onClick={() => cancelTarget && cancel.mutate(cancelTarget)} data-testid="confirm-cancel">确认取消</Button>
           </>
         }
       >

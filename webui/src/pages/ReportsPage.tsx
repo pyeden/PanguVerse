@@ -336,6 +336,7 @@ export function ReportsPage() {
               loading={sign.isPending}
               disabled={signTarget?.voided || (signTarget?.signed && !force)}
               onClick={() => sign.mutate()}
+              data-testid="confirm-sign"
             >{signTarget?.signed ? '覆盖并签署' : '确认签署'}</Button>
           </>
         }
@@ -380,7 +381,7 @@ export function ReportsPage() {
         subtitle={voidTarget ? `${voidTarget.run_id} · 不可撤销` : ''}
         size="sm"
         dismissible={!voidReport.isPending}
-        footer={<><Button variant="ghost" disabled={voidReport.isPending} onClick={() => setVoidTarget(null)}>取消</Button><Button variant="danger" icon="trash" loading={voidReport.isPending} disabled={!voidReason.trim()} onClick={() => voidReport.mutate()}>确认作废</Button></>}
+        footer={<><Button variant="ghost" disabled={voidReport.isPending} onClick={() => setVoidTarget(null)}>取消</Button><Button variant="danger" icon="trash" loading={voidReport.isPending} disabled={!voidReason.trim()} onClick={() => voidReport.mutate()} data-testid="confirm-void">确认作废</Button></>}
       >
         <div className="stack-lg">
           <div className="step-error"><Icon name="warning" size={14} />作废后报告不可再签署，且不可撤销；报告本体与历史执行仍保留。</div>
