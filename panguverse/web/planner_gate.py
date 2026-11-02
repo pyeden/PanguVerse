@@ -66,6 +66,22 @@ _MISSING_BY_DOMAIN: dict[str, dict[str, tuple[str, str]]] = {
     "ios_sim": IOS_MISSING_ACTIONS,
 }
 
+#: 设备域：意图里出现设备词时，设备域优先于网页域
+_DEVICE_DOMAINS: tuple[str, ...] = ("android_adb", "ios_sim")
+
+#: 强 iOS 词：只有它们出现时才把「模拟器」算作 iOS（避免「安卓模拟器」串味）
+_IOS_STRONG_HINTS: tuple[str, ...] = (
+    "ios",
+    "iphone",
+    "ipad",
+    "ios 模拟器",
+    "ios模拟器",
+    "simulator",
+    "simctl",
+    "xcrun",
+    "xcode",
+)
+
 #: 领域词 → 领域包
 _DOMAIN_HINTS: dict[str, tuple[str, ...]] = {
     "web_research": (
@@ -262,14 +278,40 @@ _ANDROID_ACTION_WORDS: dict[str, tuple[str, ...]] = {
     "wait": ("等待文本", "等待控件"),
 }
 
+# 多段词用 ``#`` 分隔：按顺序出现即可，中间允许插入限定语。
 _IOS_ACTION_WORDS: dict[str, tuple[str, ...]] = {
-    "list": ("模拟器列表", "列出模拟器", "设备列表", "list"),
-    "boot": ("启动模拟器", "boot"),
-    "shutdown": ("关闭模拟器", "shutdown"),
-    "install": ("安装 ipa", "安装 app", "install"),
-    "launch": ("启动 app", "启动应用", "launch"),
-    "terminate": ("结束 app", "终止 app", "terminate"),
-    "openurl": ("打开 url", "深链", "openurl"),
+    "list": (
+        "模拟器列表",
+        "列出#模拟器",
+        "列举#模拟器",
+        "有哪些#模拟器",
+        "模拟器#有哪些",
+        "列出#设备",
+        "设备列表",
+        "list",
+    ),
+    "boot": ("启动#模拟器", "启动模拟器", "启动#simulator", "boot", "开机"),
+    "shutdown": ("关闭#模拟器", "关闭模拟器", "shutdown", "关机"),
+    "install": ("安装 ipa", "安装#app", "安装#应用", "install"),
+    "launch": (
+        "启动 app",
+        "启动#app",
+        "启动#应用",
+        "打开#app",
+        "launch",
+        "safari",
+    ),
+    "terminate": ("终止#app", "结束#app", "终止应用", "terminate"),
+    "openurl": (
+        "打开#网页",
+        "打开#链接",
+        "打开#url",
+        "打开#页面",
+        "访问#网页",
+        "深链",
+        "deeplink",
+        "openurl",
+    ),
     "screenshot": ("截图", "截屏", "screenshot"),
     "tap": ("点击", "tap"),
     "input": ("输入", "输入文字", "输入文本", "input text"),
@@ -373,9 +415,29 @@ class DraftPlan:
 # --------------------------------------------------------------------------- #
 # 意图分析
 # --------------------------------------------------------------------------- #
-def _hits(text: str, words: Iterable[str]) -> list[str]:
+def _word_hit(text: str, word: str) -> bool:
+    """单词命中；词里的 ``#`` 表示按顺序出现的多段子串。
+
+    ``列出#模拟器`` 能命中「列出 iOS 模拟器」，但不会命中「启动 iOS 模拟器」，
+    这样既容忍限定语插入，又不会把不同动作混为一谈。
+    """
     lowered = text.lower()
-    return [word for word in words if word.lower() in lowered]
+    target = word.lower()
+    if "#" not in target:
+        return target in lowered
+    cursor = 0
+    for part in (chunk.strip() for chunk in target.split("#")):
+        if not part:
+            continue
+        found = lowered.find(part, cursor)
+        if found < 0:
+            return False
+        cursor = found + len(part)
+    return True
+
+
+def _hits(text: str, words: Iterable[str]) -> list[str]:
+    return [word for word in words if _word_hit(text, word)]
 
 
 def _domain_hits(text: str, domain: str) -> list[str]:
@@ -411,20 +473,33 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     analysis.url = urls[0] if urls else ""
 
     # 先做领域 + 动作路由（新领域靠词表和动作词参与同一套打分）
-    candidates = (
-        [domain_pack]
-        if domain_pack
-        else ["web_browser", "web_research", "android_adb", "ios_sim", "local_fs", "api_testing"]
-    )
+    # 设备域优先：同时出现「iOS/模拟器」和「网页/浏览器」时走设备域，
+    # 不能把「在 iOS 模拟器上打开网页并截图」抢去 web_browser。
+    if domain_pack:
+        candidates = [domain_pack]
+    else:
+        device_hits = [domain for domain in _DEVICE_DOMAINS if _domain_hits(text, domain)]
+        if "ios_sim" in device_hits and "android_adb" in device_hits and not _hits(text, _IOS_STRONG_HINTS):
+            # 「安卓模拟器」里的「模拟器」不是 iOS
+            device_hits.remove("ios_sim")
+        candidates = device_hits or [
+            "web_browser",
+            "web_research",
+            "android_adb",
+            "ios_sim",
+            "local_fs",
+            "api_testing",
+        ]
     best: tuple[int, str, list[str]] | None = None
+    fallback: tuple[int, str] | None = None
     for domain in candidates:
         domain_hits = _domain_hits(text, domain)
-        actions = [
-            action
-            for action, words in _action_words(domain).items()
-            if _hits(text, words)
-        ]
-        if not domain_hits or not actions:
+        if not domain_hits:
+            continue
+        actions = [action for action, words in _action_words(domain).items() if _hits(text, words)]
+        if not actions:
+            if fallback is None or len(domain_hits) > fallback[0]:
+                fallback = (len(domain_hits), domain)
             continue
         score = len(domain_hits) + len(actions) * 2
         if best is None or score > best[0]:
@@ -439,16 +514,18 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
                 if atom_name not in atoms:
                     atoms.append(atom_name)
         analysis.requested_atoms = atoms
+    elif fallback is not None:
+        # 领域命中但动作没命中：保留领域，便于 422 给出该域的候选原子
+        analysis.domain = fallback[1]
     elif domain_pack:
         analysis.domain = domain_pack
 
     # 缺失动作：按**已路由到的领域**查表，避免把 iOS/安卓点击误判成浏览器点击
-    lowered = text.lower()
     missing: list[str] = []
     suggestions: list[str] = []
     table = _MISSING_BY_DOMAIN.get(analysis.domain, WEB_MISSING_ACTIONS)
     for word, (atom_name, hint) in table.items():
-        if word.lower() in lowered and atom_name not in missing:
+        if _word_hit(text, word) and atom_name not in missing:
             missing.append(atom_name)
             suggestions.append(f"需要新增原子：{hint}")
     analysis.missing_atoms = missing
@@ -471,11 +548,63 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
             analysis.missing_atoms.insert(0, "http_get_page")
         analysis.suggestions.append("请提供目标网页 URL（如 https://example.com）")
         analysis.assumptions.append("需要提供目标网页 URL")
-    if analysis.domain == "web_browser" and not analysis.url and (
-        "open" in analysis.actions or "screenshot" in analysis.actions
+    if (
+        analysis.domain == "web_browser"
+        and not analysis.url
+        and ("open" in analysis.actions or "screenshot" in analysis.actions)
     ):
         analysis.assumptions.append("需要提供目标网页 URL（env.PAGE_URL）")
     return analysis
+
+
+def _candidate_atoms(analysis: IntentAnalysis) -> list[str]:
+    """给出该领域可用的候选原子，保证 422 不会出现空的 ``missing_atoms``。"""
+    if analysis.requested_atoms:
+        return list(analysis.requested_atoms)
+    atoms: list[str] = []
+    for names in _ACTION_ATOMS.get(analysis.domain, {}).values():
+        for atom_name in names:
+            if atom_name not in atoms:
+                atoms.append(atom_name)
+    return atoms
+
+
+def _mapping_gap(
+    analysis: IntentAnalysis,
+    *,
+    suggestions: Iterable[str] = (),
+) -> tuple[str, list[str], list[str]]:
+    """把「无法映射」的意图翻译成可解释的 422 明细。
+
+    - 真正的原子缺口 → ``capability_gap`` + ``missing_atoms``；
+    - 有领域但没命中动作/模板 → ``intent_unmapped`` + 候选原子；
+    - 什么都命中不了 → ``intent_unmapped`` + 明确说明，``missing_atoms`` 用
+      ``intent_unmapped`` 占位，绝不返回空数组。
+    """
+    extra = list(suggestions)
+    if analysis.missing_atoms:
+        return "capability_gap", list(analysis.missing_atoms), [*analysis.suggestions, *extra]
+    candidates = _candidate_atoms(analysis)
+    if candidates:
+        return (
+            "intent_unmapped",
+            candidates,
+            [
+                "意图无法映射到已落地的动作/模板；候选原子：" + "、".join(candidates),
+                *analysis.suggestions,
+                *extra,
+            ],
+        )
+    return (
+        "intent_unmapped",
+        ["intent_unmapped"],
+        [
+            "意图无法映射到已有原子：未命中任何领域或动作词；请把意图拆成更具体的子任务，或显式指定 domain_pack",
+            *analysis.suggestions,
+            *extra,
+        ],
+    )
+
 
 # --------------------------------------------------------------------------- #
 # 覆盖率（语义校验用）
@@ -589,6 +718,90 @@ def _build_web_spec(intent: str, analysis: IntentAnalysis) -> dict[str, Any]:
     return spec
 
 
+_IOS_SAFARI_BUNDLE = "com.apple.mobilesafari"
+
+
+def _ios_bundle_id(intent: str) -> str:
+    return _IOS_SAFARI_BUNDLE if "safari" in intent.lower() else "${env.IOS_BUNDLE_ID}"
+
+
+def _build_ios_spec(intent: str, analysis: IntentAnalysis) -> dict[str, Any]:
+    """把 iOS 动作组合成 simctl 步骤；元素级交互仍由能力缺口拦截。"""
+    actions = set(analysis.actions)
+    udid = "${env.IOS_UDID}"
+    steps: list[dict[str, Any]] = []
+    if "list" in actions:
+        steps.append({"id": "devices", "use": "ios_sim_list", "name": "列出 iOS 模拟器"})
+    if actions & {"boot", "install", "launch", "openurl", "screenshot"}:
+        steps.append({"id": "boot", "use": "ios_sim_boot", "name": "启动模拟器", "with": {"udid": udid}})
+    if "install" in actions:
+        steps.append(
+            {
+                "id": "install",
+                "use": "ios_sim_install",
+                "name": "安装 App",
+                "with": {"udid": udid, "app_path": "${env.IOS_APP_PATH}"},
+            }
+        )
+    if "launch" in actions:
+        steps.append(
+            {
+                "id": "launch",
+                "use": "ios_sim_launch",
+                "name": "启动 App",
+                "with": {"udid": udid, "bundle_id": _ios_bundle_id(intent)},
+            }
+        )
+    if "openurl" in actions:
+        steps.append(
+            {
+                "id": "openurl",
+                "use": "ios_sim_openurl",
+                "name": "打开网页/深链",
+                "with": {"udid": udid, "url": analysis.url or "${env.PAGE_URL}"},
+            }
+        )
+    if "terminate" in actions:
+        steps.append(
+            {
+                "id": "terminate",
+                "use": "ios_sim_terminate",
+                "name": "结束 App",
+                "with": {"udid": udid, "bundle_id": _ios_bundle_id(intent)},
+            }
+        )
+    if "shutdown" in actions:
+        steps.append({"id": "shutdown", "use": "ios_sim_shutdown", "name": "关闭模拟器", "with": {"udid": udid}})
+    if "screenshot" in actions:
+        steps.append(
+            {
+                "id": "shot",
+                "use": "ios_sim_screenshot",
+                "name": "模拟器截图",
+                "with": {"udid": udid, "name": "ios-screenshot.png"},
+            }
+        )
+    labels = {
+        "list": "列出模拟器",
+        "boot": "启动模拟器",
+        "install": "安装 App",
+        "launch": "启动 App",
+        "openurl": "打开网页",
+        "terminate": "结束 App",
+        "shutdown": "关闭模拟器",
+        "screenshot": "截图",
+    }
+    ordered = ["list", "boot", "install", "launch", "openurl", "terminate", "shutdown", "screenshot"]
+    title = "iOS 模拟器：" + " → ".join(labels[action] for action in ordered if action in actions)
+    return {
+        "id": "ios_sim_actions",
+        "name": title,
+        "tags": ["ios", "device", "simulator"],
+        "description": "通过 xcrun simctl 执行 iOS 模拟器动作组合",
+        "steps": steps,
+    }
+
+
 def _build_rule_plan(
     registry: Any,
     *,
@@ -601,10 +814,25 @@ def _build_rule_plan(
 
     templates = _templates_for(registry, domain)
     if not templates:
+        code, missing, suggestions = _mapping_gap(analysis, suggestions=[f"安装/启用 {domain} 领域包"])
         raise PlanGateError(
-            "capability_gap",
+            code,
             f"领域包 {domain} 没有可用的意图模板",
-            details={"missing_atoms": analysis.missing_atoms, "suggestions": ["安装/启用对应领域包"]},
+            details={"missing_atoms": missing, "suggestions": suggestions, "intent": intent},
+        )
+
+    if domain == "ios_sim" and analysis.actions:
+        spec = expand_case_spec(_build_ios_spec(intent, analysis), registry=registry)
+        from ..core.molecule import Molecule
+
+        return TestPlan(
+            cases=[Molecule.from_spec(spec, source="template")],
+            source="template",
+            planner="template",
+            intent=intent,
+            env={},
+            notes=["iOS 模拟器模板：simctl 动作组合"],
+            meta={"template": "ios_sim_actions", "llm_used": False},
         )
 
     if domain == "web_research":
@@ -634,14 +862,14 @@ def _build_rule_plan(
             chosen_names.append(name)
     chosen = [template for template in (_template_named(templates, name) for name in chosen_names) if template]
     if not chosen:
-        # 领域 + 动作命中但模板未覆盖：视为能力缺口，不产出无关模板
+        # 领域 + 动作命中但模板未覆盖：给出候选原子，不产出无关模板
+        code, missing, suggestions = _mapping_gap(
+            analysis, suggestions=[f"为 {domain} 增加动作模板，或改用场景 YAML 精确描述"]
+        )
         raise PlanGateError(
-            "capability_gap",
+            code,
             "当前领域包没有覆盖该动作的意图模板",
-            details={
-                "missing_atoms": analysis.missing_atoms,
-                "suggestions": [f"为 {domain} 增加动作模板，或改用场景 YAML 精确描述"],
-            },
+            details={"missing_atoms": missing, "suggestions": suggestions, "intent": intent},
         )
     specs = []
     for template in chosen:
@@ -723,15 +951,14 @@ def plan_draft(
     explicit = bool(domain_pack)
 
     if not explicit and not analysis.hit:
+        code, missing, suggestions = _mapping_gap(
+            analysis,
+            suggestions=["补充领域包/原子，或把意图拆成更具体的子任务"],
+        )
         raise PlanGateError(
-            "capability_gap",
+            code,
             "当前原子库无法表达该意图：未同时命中领域与动作",
-            details={
-                "missing_atoms": analysis.missing_atoms,
-                "suggestions": analysis.suggestions
-                or ["补充领域包/原子，或把意图拆成更具体的子任务"],
-                "intent": intent,
-            },
+            details={"missing_atoms": missing, "suggestions": suggestions, "intent": intent},
         )
     if analysis.missing_atoms:
         raise PlanGateError(
@@ -744,14 +971,14 @@ def plan_draft(
             },
         )
     if analysis.domain == "web_research" and not analysis.actions:
+        code, missing, suggestions = _mapping_gap(
+            analysis,
+            suggestions=["明确要抓取/提取正文/分析布局/生成报告，或换用匹配的领域包"],
+        )
         raise PlanGateError(
-            "capability_gap",
+            code,
             "意图没有命中网页研究动作，不能套用 web_research 模板",
-            details={
-                "missing_atoms": analysis.missing_atoms,
-                "suggestions": ["明确要抓取/提取正文/分析布局/生成报告，或换用匹配的领域包"],
-                "intent": intent,
-            },
+            details={"missing_atoms": missing, "suggestions": suggestions, "intent": intent},
         )
     if analysis.domain == "web_research" and not analysis.url:
         raise PlanGateError(
@@ -801,10 +1028,11 @@ def plan_draft(
                 kept.append(case)
         plan.cases = kept
     if not plan.cases:
+        code, missing, suggestions = _mapping_gap(analysis, suggestions=["检查 exclude_atoms 是否把唯一动作排除了"])
         raise PlanGateError(
-            "capability_gap",
+            code,
             "意图没有生成任何可执行步骤（检查 exclude_atoms / 原子能力）",
-            details={"missing_atoms": analysis.missing_atoms, "suggestions": []},
+            details={"missing_atoms": missing, "suggestions": suggestions, "intent": intent},
         )
 
     assumptions = list(analysis.assumptions)

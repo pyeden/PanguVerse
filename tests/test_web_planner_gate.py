@@ -180,12 +180,16 @@ def test_t2_missing_atoms_returns_422_without_graph(api: WebAPI) -> None:
     assert not list((api.root / ".panguverse" / "studio").glob("w-*"))
 
 
-def test_t2_unmatched_intent_returns_capability_gap(api: WebAPI) -> None:
+def test_t2_unmatched_intent_returns_explained_422(api: WebAPI) -> None:
     status, body = call(
         api, "POST", "/api/studio/drafts", {"intent": "给我泡一杯咖啡"}
     )
     assert status == 422
-    assert body["error"]["code"] == "capability_gap"
+    error = body["error"]
+    # 无法映射时用 intent_unmapped + suggestions 说清，且 missing_atoms 不为空数组
+    assert error["code"] in {"capability_gap", "intent_unmapped"}
+    assert error["missing_atoms"]
+    assert error["suggestions"]
     assert "graph" not in body
 
 
@@ -444,3 +448,74 @@ def test_llm_planner_prompt_has_ports_and_rejects_unknown_atoms() -> None:
     assert "端口契约" in prompt
     assert "http_get_page" in prompt
     assert "required" in prompt
+
+
+# --------------------------------------------------------------------------- #
+# iOS 正向路由：设备域优先 + 能力缺口不返回空数组
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("intent", "required_atoms"),
+    [
+        ("列出 iOS 模拟器", {"ios_sim_list"}),
+        (
+            "启动 iOS 模拟器上的 Safari 并截图",
+            {"ios_sim_boot", "ios_sim_launch", "ios_sim_screenshot"},
+        ),
+        (
+            "在 iOS 模拟器上打开网页并截图",
+            {"ios_sim_openurl", "ios_sim_screenshot"},
+        ),
+    ],
+)
+def test_ios_intents_route_to_ios_sim(
+    api: WebAPI, intent: str, required_atoms: set[str]
+) -> None:
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": intent})
+    assert status == 201, body
+    assert body["domain_pack"] == "ios_sim"
+    atoms = [node["atom"] for node in body["graph"]["nodes"]]
+    assert required_atoms <= set(atoms)
+    # 设备域优先：不得再被 web_browser 抢走
+    assert not [atom for atom in atoms if atom.startswith("web_")]
+
+    status, full = call(api, "GET", f"/api/studio/{body['wid']}")
+    assert status == 200
+    assert full["domain_pack"] == "ios_sim"
+
+
+def test_ios_safari_intent_binds_safari_bundle(api: WebAPI) -> None:
+    status, body = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "启动 iOS 模拟器上的 Safari 并截图"},
+    )
+    assert status == 201, body
+    launch = next(node for node in body["graph"]["nodes"] if node["atom"] == "ios_sim_launch")
+    assert launch["params"]["bundle_id"] == "com.apple.mobilesafari"
+    shot = next(node for node in body["graph"]["nodes"] if node["atom"] == "ios_sim_screenshot")
+    assert shot["params"]["name"] == "ios-screenshot.png"
+
+
+def test_ios_click_still_returns_capability_gap(api: WebAPI) -> None:
+    status, body = call(
+        api, "POST", "/api/studio/drafts", {"intent": "点击 iOS 模拟器上的登录按钮"}
+    )
+    assert status == 422, body
+    error = body["error"]
+    assert error["code"] == "capability_gap"
+    assert error["missing_atoms"] == ["ios_tap"]
+    assert error["suggestions"]
+    assert "graph" not in body
+
+
+def test_ios_domain_without_action_returns_candidate_atoms(api: WebAPI) -> None:
+    status, body = call(
+        api, "POST", "/api/studio/drafts", {"intent": "在 iOS 模拟器上随便操作一下"}
+    )
+    assert status == 422, body
+    error = body["error"]
+    assert error["code"] == "intent_unmapped"
+    # 不允许空数组：至少要给出该领域的候选原子
+    assert error["missing_atoms"]
+    assert "ios_sim_list" in error["missing_atoms"]
