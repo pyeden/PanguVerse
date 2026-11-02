@@ -303,10 +303,28 @@ export interface Risk {
   acknowledged?: boolean
 }
 
+export interface CoverageStat {
+  matched: number
+  total: number
+  ratio: number
+}
+
+export interface CapabilityGap {
+  atom?: string
+  name?: string
+  message?: string
+  suggestions?: string[]
+  suggestion?: string
+  [key: string]: any
+}
+
 export interface Validation {
   errors?: ValidationIssue[]
   warnings?: ValidationIssue[]
   risks?: Risk[]
+  coverage?: CoverageStat | null
+  missing_env?: string[]
+  capability_gaps?: Array<CapabilityGap | string>
 }
 
 export interface DiffItem {
@@ -329,6 +347,43 @@ export interface StudioDiff {
   audit_tail?: AnyRecord[]
   base_rev?: number
   rev?: number
+  [key: string]: any
+}
+
+export type DebugNodeStatus = 'pending' | 'running' | 'passed' | 'failed' | 'skipped' | string
+
+export interface DebugNodeState {
+  node_id: string
+  status: DebugNodeStatus
+  reason?: string | null
+  attempts?: number
+  duration_ms?: number
+  error?: unknown
+  inputs?: AnyRecord
+  outputs?: AnyRecord
+  started_at?: number
+  finished_at?: number
+  [key: string]: any
+}
+
+export interface DebugSummary {
+  passed: number
+  failed: number
+  skipped: number
+  total?: number
+  by_reason?: Record<string, number>
+  [key: string]: any
+}
+
+export interface DebugSession {
+  session_id?: string
+  nodes: DebugNodeState[]
+  cursor?: number | string
+  done: boolean
+  summary: DebugSummary
+  variables?: AnyRecord
+  error?: string | null
+  legacy?: boolean
   [key: string]: any
 }
 
@@ -369,6 +424,11 @@ export interface Workflow {
   nodes?: StudioNode[]
   edges?: StudioEdge[]
   validation?: Validation
+  planner?: 'llm' | 'rules' | 'template' | string
+  plan_source?: 'llm' | 'rules' | 'template' | string
+  confidence?: number
+  assumptions?: string[]
+  capability_gaps?: Array<CapabilityGap | string>
   audit?: AnyRecord[]
   audit_tail?: AnyRecord[]
   created_at?: number

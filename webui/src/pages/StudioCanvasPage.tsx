@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Background,
@@ -18,16 +18,18 @@ import {
   type Node,
   type NodeChange,
   type NodeProps,
+  type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { api, isStudioMock, onStudioMockChange, studioApi } from '../shared/api'
-import { navigate, href } from '../shared/router'
+import { api, debugReasonLabel, isStudioMock, onStudioMockChange, readStudioProvenance, studioApi } from '../shared/api'
+import { navigate, href, useRoute } from '../shared/router'
 import { errorText, formatDuration, pretty, statusLabel } from '../shared/utils'
 import type {
   AnyRecord,
   Atom,
-  DebugResult,
-  DebugStep,
+  DebugNodeState,
+  DebugSession,
+  DebugSummary,
   Risk,
   StudioEdge,
   StudioNode,
@@ -57,6 +59,57 @@ interface AtomNodeData extends Record<string, unknown> {
   studioNode: StudioNode
   issues: ValidationIssue[]
   risks: Risk[]
+  debugStatus?: string
+  debugReason?: string
+  debugCurrent?: boolean
+}
+
+interface GapItem {
+  atom: string
+  suggestions: string[]
+  message?: string
+}
+
+function gapItems(value: unknown): GapItem[] {
+  if (!Array.isArray(value)) return []
+  return value.map((item, index) => {
+    if (typeof item === 'string') return { atom: item, suggestions: [] }
+    const record = item as AnyRecord
+    const suggestions = Array.isArray(record.suggestions)
+      ? record.suggestions.map(String)
+      : record.suggestion
+        ? [String(record.suggestion)]
+        : []
+    return {
+      atom: String(record.atom || record.name || record.missing_atom || record.message || `gap-${index}`),
+      suggestions,
+      message: record.message ? String(record.message) : undefined,
+    }
+  })
+}
+
+function summarizeNodes(nodes: DebugNodeState[], total: number, base?: DebugSummary): DebugSummary {
+  let passed = 0
+  let failed = 0
+  let skipped = 0
+  const byReason: Record<string, number> = {}
+  nodes.forEach((node) => {
+    if (node.status === 'passed') passed += 1
+    else if (node.status === 'failed') failed += 1
+    else if (node.status === 'skipped') {
+      skipped += 1
+      const reason = node.reason || 'unknown'
+      byReason[reason] = (byReason[reason] || 0) + 1
+    }
+  })
+  return {
+    ...(base || {}),
+    passed,
+    failed,
+    skipped,
+    total: total || base?.total || nodes.length,
+    by_reason: byReason,
+  }
 }
 
 type AtomFlowNode = Node<AtomNodeData, 'atom'>
@@ -72,21 +125,35 @@ function atomEffects(node: StudioNode): string[] {
   return ['pure']
 }
 
-function AtomNode({ data, selected }: NodeProps<AtomFlowNode>) {
+const AtomNode = memo(function AtomNode({ data, selected }: NodeProps<AtomFlowNode>) {
   const node = data.studioNode
+  const debugStatus = data.debugStatus || ''
+  const debugReason = data.debugReason || ''
+  const reasonLabel = debugReasonLabel(debugReason)
   const effects = atomEffects(node)
   const hasDestructive = effects.includes('destructive')
   const hasWrite = effects.includes('write') || effects.includes('mutate')
   const errors = data.issues.length
   const risks = data.risks.length
   return (
-    <div className={`flow-node ${selected ? 'is-selected' : ''} ${errors ? 'has-error' : ''} ${node.locked ? 'is-locked' : ''}`}>
+    <div
+      className={`flow-node ${selected ? 'is-selected' : ''} ${errors ? 'has-error' : ''} ${node.locked ? 'is-locked' : ''} ${debugStatus ? `is-debug-${debugStatus}` : ''} ${data.debugCurrent ? 'is-debug-current' : ''}`}
+      data-node-id={node.node_id}
+      data-debug-status={debugStatus || undefined}
+      data-debug-reason={debugReason || undefined}
+    >
       <Handle type="target" position={Position.Left} className="flow-handle" />
       <div className="flow-node-top">
-        <span className="flow-status" aria-hidden="true" />
+        <span className={`flow-status ${debugStatus ? `debug-${debugStatus}` : ''}`} aria-hidden="true" />
         <span className="flow-atom mono">{node.atom}</span>
         <span className={`flow-origin ${node.origin === 'human' ? 'human' : 'ai'}`}>{node.origin === 'human' ? '人工' : 'AI'}</span>
         {node.locked ? <span className="flow-lock" title="锁定节点，AI 不可改写"><Icon name="lock" size={11} /></span> : null}
+        {debugStatus ? (
+          <span className={`flow-debug-chip ${debugStatus}`} title={reasonLabel ? `${statusLabel(debugStatus)} · ${reasonLabel}` : statusLabel(debugStatus)}>
+            {debugStatus === 'running' ? <span className="mini-pulse" /> : null}
+            {statusLabel(debugStatus)}
+          </span>
+        ) : null}
       </div>
       <strong className="flow-name">{node.name || node.atom}</strong>
       <div className="flow-params">
@@ -95,6 +162,9 @@ function AtomNode({ data, selected }: NodeProps<AtomFlowNode>) {
         ))}
         {!Object.keys(node.with || {}).length ? <span className="muted">无参数</span> : null}
       </div>
+      {debugStatus === 'skipped' && reasonLabel ? (
+        <div className="flow-debug-reason">跳过 · {reasonLabel} <code>{debugReason}</code></div>
+      ) : null}
       <div className="flow-node-foot">
         <div className="flow-effects">
           {hasDestructive ? <span className="effect-badge destructive">破坏性</span> : hasWrite ? <span className="effect-badge write">写副作用</span> : <span className="effect-badge pure">纯</span>}
@@ -105,7 +175,7 @@ function AtomNode({ data, selected }: NodeProps<AtomFlowNode>) {
       <Handle type="source" position={Position.Right} className="flow-handle" />
     </div>
   )
-}
+})
 
 const nodeTypes = { atom: AtomNode }
 
@@ -140,6 +210,7 @@ export function StudioCanvasPage({ wid }: { wid: string }) {
 }
 
 function StudioCanvasInner({ wid }: { wid: string }) {
+  const route = useRoute()
   const queryClient = useQueryClient()
   const { push } = useToast()
   const [mock, setMock] = useState(isStudioMock())
@@ -160,8 +231,28 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [debugOpen, setDebugOpen] = useState(false)
   const [debugMode, setDebugMode] = useState<'only' | 'from_start' | 'downstream'>('from_start')
   const [debugNodeId, setDebugNodeId] = useState('')
-  const [debugResult, setDebugResult] = useState<DebugResult | null>(null)
-  const [debugStep, setDebugStep] = useState<DebugStep | null>(null)
+  const [debugSession, setDebugSession] = useState<DebugSession | null>(null)
+  const [debugSessionId, setDebugSessionId] = useState('')
+  const [debugPolling, setDebugPolling] = useState(false)
+  const [debugError, setDebugError] = useState('')
+  const [debugTotal, setDebugTotal] = useState(0)
+  const [debugSyncing, setDebugSyncing] = useState(false)
+  const [debugStep, setDebugStep] = useState<DebugNodeState | null>(null)
+  const [followDebug, setFollowDebug] = useState(true)
+  const cursorRef = useRef<number>(0)
+  const flowRef = useRef<ReactFlowInstance<AtomFlowNode, Edge> | null>(null)
+  const rowRefs = useRef<Map<string, HTMLButtonElement>>(new Map())
+  const debugStatusRef = useRef<Map<string, DebugNodeState>>(new Map())
+  const debugSessionRef = useRef<DebugSession | null>(null)
+  const lastCenteredRef = useRef('')
+  const debugQueueRef = useRef<Array<{ node: DebugNodeState; seq: number }>>([])
+  const debugSeenSeqRef = useRef(0)
+  const backendDoneRef = useRef(false)
+  const finalSummaryRef = useRef<DebugSummary | null>(null)
+  const drainTimerRef = useRef(0)
+  const toastDoneRef = useRef(false)
+  const drainRef = useRef<() => void>(() => {})
+  const storedProvenance = useMemo(() => readStudioProvenance(wid), [wid])
   const [panelOpen, setPanelOpen] = useState(false)
   const [paramName, setParamName] = useState('')
   const [paramWith, setParamWith] = useState<AnyRecord>({})
@@ -207,11 +298,19 @@ function StudioCanvasInner({ wid }: { wid: string }) {
       }
       const nodeIssues = issues.filter((issue) => issue.node_id === node.node_id)
       const nodeRisks = risks.filter((risk) => (risk.node_ids || []).includes(node.node_id))
+      const debugState = debugStatusRef.current.get(node.node_id)
       return {
         id: node.node_id,
         type: 'atom',
         position: { x: Number(pos.x) || 50 + (index % 5) * 280, y: Number(pos.y) || 70 + Math.floor(index / 5) * 210 },
-        data: { studioNode: node, issues: nodeIssues, risks: nodeRisks },
+        data: {
+          studioNode: node,
+          issues: nodeIssues,
+          risks: nodeRisks,
+          debugStatus: debugState?.status || '',
+          debugReason: debugState?.reason || '',
+          debugCurrent: debugState?.status === 'running',
+        },
         selected: node.node_id === selectedId,
       }
     })
@@ -331,15 +430,37 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     onError: (error: Error) => push(error.message, 'error'),
   })
 
-  const debug = useMutation({
+  const startDebug = useMutation({
     mutationFn: () => {
       if (!debugNodeId) throw new Error('请选择调试点')
-      return studioApi.debug(wid, { rev: workflow?.current_rev ?? 0, node_id: debugNodeId, mode: debugMode })
+      return studioApi.startDebug(wid, { rev: workflow?.current_rev ?? 0, node_id: debugNodeId, mode: debugMode })
     },
     onSuccess: (result) => {
-      setDebugResult(result)
-      setDebugStep((result.trace || result.steps || [])[0] || null)
-      push('调试完成；未写入正式历史', 'ok')
+      setDebugError('')
+      setDebugStep(null)
+      setDebugSession(result.legacy || null)
+      debugSessionRef.current = result.legacy || null
+      cursorRef.current = 0
+      lastCenteredRef.current = ''
+      debugQueueRef.current = []
+      debugSeenSeqRef.current = 0
+      backendDoneRef.current = false
+      finalSummaryRef.current = null
+      toastDoneRef.current = false
+      setDebugSyncing(false)
+      window.clearTimeout(drainTimerRef.current)
+      drainTimerRef.current = 0
+      setDebugTotal(Number(result.total || result.legacy?.summary.total || 0))
+      if (result.session_id) {
+        setDebugSessionId(result.session_id)
+        push('调试会话已创建，正在轮询节点状态…', 'info')
+      } else if (result.legacy) {
+        setDebugStep(result.legacy.nodes[0] || null)
+        push('后端仍返回同步调试结果（v6.0 会话接口未联调）', 'warn')
+      } else {
+        setDebugSessionId('')
+        push('调试请求未返回 session_id', 'error')
+      }
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
@@ -360,6 +481,187 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     setEdgeVia(captureKey)
     setEdgeKind('data')
   }, [workflow])
+
+  const centerNode = useCallback((nodeId: string) => {
+    const instance = flowRef.current
+    const flowNode = nodes.find((node) => node.id === nodeId)
+    if (!instance || !flowNode) return
+    const width = flowNode.measured?.width || 214
+    const height = flowNode.measured?.height || 96
+    instance.setCenter(flowNode.position.x + width / 2, flowNode.position.y + height / 2, {
+      zoom: Math.max(instance.getZoom(), 1),
+      duration: 420,
+    })
+  }, [nodes])
+
+  const locateNode = useCallback((nodeId?: string) => {
+    if (!nodeId) return
+    setSelectedId(nodeId)
+    setPanelOpen(true)
+    centerNode(nodeId)
+  }, [centerNode])
+
+  useEffect(() => {
+    const target = route.query.get('node')
+    if (!target || !workflow?.graph?.nodes?.some((node) => node.node_id === target)) return
+    setSelectedId(target)
+    setPanelOpen(true)
+  }, [route.path, route.query, workflow?.wid])
+
+  const debugNodes = useMemo(() => debugSession?.nodes || [], [debugSession])
+  const debugStatusMap = useMemo(
+    () => new Map(debugNodes.map((node) => [node.node_id, node])),
+    [debugNodes],
+  )
+  debugStatusRef.current = debugStatusMap
+
+  useEffect(() => {
+    setNodes((current) => {
+      let changed = false
+      const next = current.map((node) => {
+        const state = debugStatusMap.get(node.id)
+        const status = state?.status || ''
+        const reason = state?.reason || ''
+        const isCurrent = status === 'running'
+        if ((node.data.debugStatus || '') === status
+          && (node.data.debugReason || '') === reason
+          && Boolean(node.data.debugCurrent) === isCurrent) return node
+        changed = true
+        return { ...node, data: { ...node.data, debugStatus: status, debugReason: reason, debugCurrent: isCurrent } }
+      })
+      return changed ? next : current
+    })
+  }, [debugStatusMap])
+
+  const drainDebugQueue = useCallback(() => {
+    drainTimerRef.current = 0
+    const item = debugQueueRef.current.shift()
+    if (!item) {
+      setDebugSyncing(false)
+      const previous = debugSessionRef.current
+      if (backendDoneRef.current && previous) {
+        const summary = summarizeNodes(previous.nodes, debugTotal, finalSummaryRef.current || previous.summary)
+        const doneSession = { ...previous, done: true, summary }
+        debugSessionRef.current = doneSession
+        setDebugSession(doneSession)
+        setDebugPolling(false)
+        if (!toastDoneRef.current) {
+          toastDoneRef.current = true
+          push(`调试完成：通过 ${summary.passed} / 失败 ${summary.failed} / 跳过 ${summary.skipped}`, summary.failed ? 'error' : 'ok')
+        }
+      }
+      return
+    }
+    setDebugSession((previous) => {
+      if (!previous) return previous
+      const nodeMap = new Map(previous.nodes.map((node) => [node.node_id, node]))
+      nodeMap.set(item.node.node_id, item.node)
+      const nodes = Array.from(nodeMap.values())
+      const nextSession = { ...previous, nodes, summary: summarizeNodes(nodes, debugTotal, previous.summary), done: false }
+      debugSessionRef.current = nextSession
+      return nextSession
+    })
+    drainTimerRef.current = window.setTimeout(() => drainRef.current(), 220)
+  }, [debugTotal, push])
+  drainRef.current = drainDebugQueue
+
+  useEffect(() => {
+    if (!debugSessionId) return
+    let cancelled = false
+    let timer = 0
+    const tick = async () => {
+      try {
+        const next = await studioApi.debugSession(debugSessionId, cursorRef.current)
+        if (cancelled) return
+        cursorRef.current = Number(next.cursor ?? cursorRef.current)
+        const rawEvents = Array.isArray((next as AnyRecord).events) ? (next as AnyRecord).events as AnyRecord[] : []
+        rawEvents.forEach((event) => {
+          if (event.type && event.type !== 'node') return
+          const status = String(event.status || '')
+          if (!['passed', 'failed', 'skipped'].includes(status)) return
+          const seq = Number(event.seq || 0)
+          if (seq && seq <= debugSeenSeqRef.current) return
+          if (seq) debugSeenSeqRef.current = seq
+          const nodeId = String(event.node_id || '')
+          if (!nodeId) return
+          if (debugQueueRef.current.some((item) => item.node.node_id === nodeId && item.node.status === status)) return
+          debugQueueRef.current.push({
+            node: { ...event, node_id: nodeId, status, reason: event.reason || null } as DebugNodeState,
+            seq,
+          })
+        })
+        backendDoneRef.current = next.done
+        if (next.done) finalSummaryRef.current = next.summary
+        const previous = debugSessionRef.current
+        const nodeMap = new Map(previous?.nodes.map((node) => [node.node_id, node]) || [])
+        const hasQueue = debugQueueRef.current.length > 0
+        next.nodes.forEach((node) => {
+          if (hasQueue && ['passed', 'failed', 'skipped'].includes(node.status)) return
+          nodeMap.set(node.node_id, node)
+        })
+        const nodes = Array.from(nodeMap.values())
+        const hasSummary = next.nodes.length > 0 || next.summary.passed + next.summary.failed + next.summary.skipped > 0
+        const merged: DebugSession = {
+          ...next,
+          nodes,
+          variables: { ...(previous?.variables || {}), ...(next.variables || {}) },
+          summary: summarizeNodes(nodes, debugTotal, hasSummary ? next.summary : previous?.summary),
+          done: next.done && !hasQueue,
+        }
+        debugSessionRef.current = merged
+        setDebugSession(merged)
+        setDebugError(next.error ? String(next.error) : '')
+        setDebugPolling(!next.done)
+        if (hasQueue) {
+          setDebugSyncing(true)
+          if (!drainTimerRef.current) drainTimerRef.current = window.setTimeout(() => drainRef.current(), 220)
+        }
+        if (!next.done) {
+          timer = window.setTimeout(tick, 150)
+        } else if (!hasQueue && !toastDoneRef.current) {
+          toastDoneRef.current = true
+          setDebugSyncing(false)
+          push(`调试完成：通过 ${merged.summary.passed} / 失败 ${merged.summary.failed} / 跳过 ${merged.summary.skipped}`, merged.summary.failed ? 'error' : 'ok')
+        }
+      } catch (error) {
+        if (cancelled) return
+        setDebugPolling(false)
+        setDebugError((error as Error).message)
+      }
+    }
+    setDebugPolling(true)
+    timer = window.setTimeout(tick, 120)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+      window.clearTimeout(drainTimerRef.current)
+      drainTimerRef.current = 0
+      setDebugPolling(false)
+      setDebugSyncing(false)
+    }
+  }, [debugSessionId, debugTotal, push])
+
+  const runningDebugId = useMemo(
+    () => debugNodes.find((node) => node.status === 'running')?.node_id || '',
+    [debugNodes],
+  )
+  const lastFinishedDebugId = useMemo(
+    () => [...debugNodes].reverse().find((node) => ['passed', 'failed', 'skipped'].includes(node.status))?.node_id || '',
+    [debugNodes],
+  )
+  const currentDebugId = runningDebugId || lastFinishedDebugId
+
+  useEffect(() => {
+    if (!followDebug || !currentDebugId) return
+    const state = debugStatusMap.get(currentDebugId)
+    if (!state) return
+    setDebugStep(state)
+    rowRefs.current.get(currentDebugId)?.scrollIntoView({ block: 'nearest', behavior: 'smooth' })
+    if (lastCenteredRef.current !== currentDebugId) {
+      lastCenteredRef.current = currentDebugId
+      centerNode(currentDebugId)
+    }
+  }, [followDebug, currentDebugId, debugStatusMap, centerNode])
 
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
@@ -399,8 +701,30 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   if (workflowQuery.isLoading) return <div className="page"><Loading label="正在读取流程…" /></div>
   if (workflowQuery.error || !workflow) return <div className="page"><ErrorState error={workflowQuery.error} onRetry={() => workflowQuery.refetch()} title="流程读取失败" /></div>
   const currentRev = workflow.current_rev ?? 0
-  const debugSteps = debugResult?.trace || debugResult?.steps || []
-  const debugNode = workflow.graph?.nodes.find((node) => node.node_id === debugNodeId)
+  const debugSummary = debugSession?.summary || { passed: 0, failed: 0, skipped: 0, total: workflow.graph?.nodes?.length || 0 }
+  const totalCount = debugTotal || Number(debugSummary.total ?? 0) || workflow.graph?.nodes?.length || 0
+  const finishedCount = debugSummary.passed + debugSummary.failed + debugSummary.skipped
+  const progressPct = totalCount ? Math.min(100, Math.round((finishedCount / totalCount) * 100)) : 0
+  const runningDebug = debugNodes.find((node) => node.status === 'running') || null
+  const skipGroups: Array<{ reason: string; ids: string[]; count: number }> = Object.entries(debugSummary.by_reason || {})
+    .filter(([, count]) => Number(count) > 0)
+    .map(([reason, count]) => ({
+      reason,
+      count: Number(count),
+      ids: debugNodes.filter((node) => node.status === 'skipped' && (node.reason || 'unknown') === reason).map((node) => node.node_id),
+    }))
+  const nodeLabel = (nodeId: string) =>
+    workflow.graph?.nodes.find((node) => node.node_id === nodeId)?.name
+    || debugStatusMap.get(nodeId)?.node
+    || nodeId
+  const plannerRaw = String(workflow.planner || workflow.plan_source || storedProvenance?.planner || storedProvenance?.plan_source || '')
+  const planMode = plannerRaw === 'llm' ? 'ai' : plannerRaw === 'rules' || plannerRaw === 'template' ? 'rules' : 'unknown'
+  const confidenceValue = Number(workflow.confidence ?? storedProvenance?.confidence)
+  const confidence = Number.isFinite(confidenceValue) ? confidenceValue : null
+  const assumptions = (workflow.assumptions || storedProvenance?.assumptions || []).map(String)
+  const capabilityGaps = gapItems(workflow.capability_gaps || storedProvenance?.capability_gaps || validation.capability_gaps || [])
+  const coverage = validation.coverage || null
+  const missingEnv = validation.missing_env || []
 
   return (
     <div className="studio-page studio-canvas-page">
@@ -418,6 +742,12 @@ function StudioCanvasInner({ wid }: { wid: string }) {
           </div>
         </div>
         <div className="studio-top-actions">
+          {coverage ? (
+            <span className={`validation-pill ${coverage.ratio < 0.6 ? 'bad' : 'ok'}`} title={`意图覆盖率 ${coverage.matched}/${coverage.total}`}>
+              <Icon name="atoms" size={14} />
+              覆盖 {coverage.matched}/{coverage.total}
+            </span>
+          ) : null}
           <span className={`validation-pill ${blockingErrors ? 'bad' : warnings.length ? 'warn' : 'ok'}`} title={blockingErrors ? '存在校验错误，不能提交审阅' : '校验通过'}>
             <Icon name={blockingErrors ? 'warning' : 'check'} size={14} />
             {errors.length} 错误 · {warnings.length} 警告
@@ -441,6 +771,33 @@ function StudioCanvasInner({ wid }: { wid: string }) {
 
       <div className="studio-workspace">
         <section className="canvas-panel">
+          <div className={`plan-banner plan-${planMode}`} data-testid="plan-banner">
+            <span className="plan-source">
+              <Icon name={planMode === 'ai' ? 'spark' : planMode === 'rules' ? 'layers' : 'warning'} size={14} />
+              {planMode === 'ai' ? 'AI 规划' : planMode === 'rules' ? `规则模板${plannerRaw === 'template' ? ' · 模板' : ''}` : '来源未标注'}
+            </span>
+            <span className="plan-confidence">置信度 <strong>{confidence === null ? '—' : confidence.toFixed(2)}</strong></span>
+            {planMode === 'rules' ? <span className="plan-low"><Icon name="warning" size={12} />低置信度，请人工核对</span> : null}
+            {planMode === 'unknown' ? <span className="plan-low">请人工核对计划来源</span> : null}
+            {assumptions.length ? (
+              <span className="plan-assumptions">
+                待确认环境变量
+                {assumptions.map((item) => <code key={item}>{item}</code>)}
+              </span>
+            ) : <span className="plan-assumptions muted">没有待确认假设</span>}
+          </div>
+          {capabilityGaps.length ? (
+            <div className="capability-gap-bar" data-testid="capability-gap-bar">
+              <Icon name="warning" size={14} />
+              <strong>能力缺口 {capabilityGaps.length}</strong>
+              {capabilityGaps.map((gap) => (
+                <span className="gap-chip" key={gap.atom} title={gap.message || ''}>
+                  <code>{gap.atom}</code>
+                  {gap.suggestions.length ? <em>{gap.suggestions.join(' / ')}</em> : null}
+                </span>
+              ))}
+            </div>
+          ) : null}
           <div className="canvas-toolbar">
             <div className="canvas-toolbar-left">
               <Button size="sm" variant="ghost" icon="plus" onClick={() => setAddOpen(true)}>添加节点</Button>
@@ -464,6 +821,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               onNodeClick={(_, node) => { setSelectedId(node.id); setPanelOpen(true) }}
               onPaneClick={() => { setSelectedId(''); setPanelOpen(false) }}
               onNodeDoubleClick={(_, node) => { setSelectedId(node.id); setPanelOpen(true) }}
+              onInit={(instance) => { flowRef.current = instance }}
               fitView
               fitViewOptions={{ padding: 0.14 }}
               minZoom={0.2}
@@ -493,7 +851,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
             <button type="button" className={`debug-trigger ${debugOpen ? 'is-active' : ''}`} onClick={() => setDebugOpen((value) => !value)}>
               <Icon name="bug" size={15} />
               调试
-              {debugResult ? <Badge tone="ok">{debugSteps.length} 步</Badge> : null}
+              {debugSession ? <Badge tone={debugSession.done ? 'ok' : 'warn'}>{finishedCount}/{totalCount}</Badge> : null}
             </button>
           </div>
 
@@ -501,11 +859,24 @@ function StudioCanvasInner({ wid }: { wid: string }) {
             <div className="debug-drawer" role="region" aria-label="调试抽屉">
               <div className="debug-head">
                 <div className="debug-title">
-                  <span className="debug-label"><span className="debug-pulse" /> 调试执行</span>
+                  <span className="debug-label"><span className={`debug-pulse ${debugPolling ? '' : 'is-idle'}`} /> 调试执行</span>
                   <Badge tone="warn">不影响历史</Badge>
-                  <span className="debug-sub">独立 RunContext · 入 studio/debug/</span>
+                  {debugSessionId ? <Badge tone={debugPolling ? 'warn' : 'ok'}>{debugPolling ? '轮询中' : debugSession?.done ? '已完成' : '等待'}</Badge> : null}
+                  {debugSession?.legacy ? <Badge tone="warn">同步旧接口</Badge> : null}
+                  <span className="debug-sub">POST 202 · GET cursor 增量</span>
                 </div>
-                <IconButton label="收起调试" icon="close" onClick={() => setDebugOpen(false)} />
+                <div className="debug-head-actions">
+                  <button
+                    type="button"
+                    className={`follow-toggle ${followDebug ? 'is-on' : ''}`}
+                    onClick={() => setFollowDebug((value) => !value)}
+                    title={followDebug ? '暂停自动跟随当前节点' : '恢复自动跟随当前节点'}
+                  >
+                    <Icon name={followDebug ? 'check' : 'play'} size={11} />
+                    {followDebug ? '自动跟随' : '已暂停跟随'}
+                  </button>
+                  <IconButton label="收起调试" icon="close" onClick={() => setDebugOpen(false)} />
+                </div>
               </div>
               <div className="debug-controls">
                 <div className="segmented debug-modes">
@@ -517,39 +888,118 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   <option value="">选择节点</option>
                   {(workflow.graph?.nodes || []).map((node) => <option key={node.node_id} value={node.node_id}>{node.name || node.atom}</option>)}
                 </Select>
-                <Button size="sm" variant="primary" icon="play" loading={debug.isPending} onClick={() => debug.mutate()}>运行调试</Button>
+                <Button size="sm" variant="primary" icon="play" loading={startDebug.isPending} onClick={() => startDebug.mutate()}>运行调试</Button>
+              </div>
+              {debugError ? (
+                <div className="debug-error-banner"><Icon name="warning" size={13} /><span>{debugError}</span></div>
+              ) : null}
+              <div className="debug-progress" data-testid="debug-progress">
+                <div className="debug-progress-head">
+                  <span className="mono debug-progress-count">{finishedCount}/{totalCount}</span>
+                  <span className="debug-progress-label">
+                    {debugSyncing ? <>状态同步中 <strong>{finishedCount}/{totalCount}</strong></> : runningDebug ? <>正在跑 <strong>{nodeLabel(runningDebug.node_id)}</strong></> : debugSession?.done ? '调试完成' : debugSessionId ? '等待首个节点…' : '尚未开始'}
+                  </span>
+                  {debugSyncing ? <span className="sync-hint">逐节点回放</span> : null}
+                  <span className="debug-counts">
+                    <span className="count passed">通过 {debugSummary.passed}</span>
+                    <span className="count failed">失败 {debugSummary.failed}</span>
+                    <span className="count skipped">跳过 {debugSummary.skipped}</span>
+                  </span>
+                </div>
+                <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={totalCount} aria-valuenow={finishedCount}>
+                  <span className={`progress-fill ${debugSummary.failed ? 'has-fail' : ''}`} style={{ width: `${progressPct}%` }} />
+                  {totalCount ? <span className="progress-ticks">{Array.from({ length: Math.min(totalCount, 12) }).map((_, index) => <i key={index} />)}</span> : null}
+                </div>
+                {skipGroups.length ? (
+                  <div className="skip-groups">
+                    <span className="skip-groups-label">跳过原因</span>
+                    {skipGroups.map((group) => (
+                      <details className="skip-group" key={group.reason} open={skipGroups.length <= 2}>
+                        <summary>
+                          <code className="skip-reason-code">{group.reason}</code>
+                          <span>{debugReasonLabel(group.reason)}</span>
+                          <Badge tone="neutral">{group.count}</Badge>
+                        </summary>
+                        <div className="skip-group-nodes">
+                          {group.ids.map((nodeId) => (
+                            <button
+                              type="button"
+                              key={nodeId}
+                              onClick={() => {
+                                const state = debugStatusMap.get(nodeId)
+                                if (state) setDebugStep(state)
+                                setFollowDebug(false)
+                                centerNode(nodeId)
+                              }}
+                            >
+                              {nodeLabel(nodeId)} <code>{nodeId}</code>
+                            </button>
+                          ))}
+                        </div>
+                      </details>
+                    ))}
+                  </div>
+                ) : null}
               </div>
               <div className="debug-body">
-                <div className="debug-trace">
-                  <div className="debug-trace-head"><span>节点</span><span>状态</span><span>耗时</span><span>错误</span></div>
-                  {debugSteps.length ? debugSteps.map((step, index) => (
-                    <button type="button" key={`${step.node_id || step.node || index}`} className={`debug-row ${debugStep === step ? 'is-active' : ''}`} onClick={() => setDebugStep(step)}>
-                      <span><strong>{step.name || step.node || step.atom || step.node_id}</strong><small className="mono">{step.atom || step.node_id}</small></span>
-                      <StatusBadge status={step.status} />
-                      <span className="mono">{formatDuration(step.duration_ms ?? step.duration)}</span>
-                      <span className="debug-error">{errorText(step.error) || '—'}</span>
+                <div className="debug-trace" data-testid="debug-trace">
+                  <div className="debug-trace-head"><span>节点</span><span>状态</span><span>耗时</span><span>原因 / 错误</span></div>
+                  {debugNodes.length ? debugNodes.map((step) => (
+                    <button
+                      type="button"
+                      key={step.node_id}
+                      ref={(element) => {
+                        if (element) rowRefs.current.set(step.node_id, element)
+                        else rowRefs.current.delete(step.node_id)
+                      }}
+                      className={`debug-row is-${step.status} ${debugStep?.node_id === step.node_id ? 'is-active' : ''} ${debugStatusMap.get(step.node_id)?.status === 'running' ? 'is-current' : ''}`}
+                      data-node-id={step.node_id}
+                      data-debug-status={step.status}
+                      data-debug-reason={step.reason || undefined}
+                      onClick={() => {
+                        setDebugStep(step)
+                        setFollowDebug(false)
+                        centerNode(step.node_id)
+                      }}
+                    >
+                      <span><strong>{nodeLabel(step.node_id)}</strong><small className="mono">{step.node_id} · {step.atom || workflow.graph?.nodes.find((node) => node.node_id === step.node_id)?.atom}</small></span>
+                      <span className={`debug-status ${step.status}`}>{step.status === 'running' ? <span className="mini-pulse" /> : null}{statusLabel(step.status)}</span>
+                      <span className="mono">{step.status === 'pending' || step.status === 'running' ? '—' : formatDuration(step.duration_ms)}</span>
+                      <span className="debug-error">{step.reason ? `${debugReasonLabel(step.reason)} · ${step.reason}` : errorText(step.error) || '—'}</span>
                     </button>
                   )) : (
                     <div className="debug-empty">
                       <Icon name="terminal" size={20} />
-                      <span>选择节点和模式后运行；结果只用于验证，不写入执行历史。</span>
+                      <span>选择节点和模式后运行。调试只使用项目已配置环境，不写入执行历史。</span>
                     </div>
                   )}
                 </div>
                 <div className="debug-detail">
                   {debugStep ? (
                     <>
-                      <div className="debug-detail-head"><strong>{debugStep.name || debugStep.node || debugStep.atom}</strong><span className="mono">{debugStep.node_id}</span></div>
+                      <div className="debug-detail-head">
+                        <strong>{nodeLabel(debugStep.node_id)}</strong>
+                        <span className="mono">{debugStep.node_id}</span>
+                        <StatusBadge status={debugStep.status} />
+                      </div>
+                      {debugStep.reason ? (
+                        <div className="debug-reason" data-testid="debug-reason">
+                          <Icon name="warning" size={13} />
+                          <span>{debugStep.status === 'skipped' ? '跳过原因' : '原因'}：{debugReasonLabel(debugStep.reason)}</span>
+                          <code>{debugStep.reason}</code>
+                        </div>
+                      ) : null}
+                      {debugStep.error ? <div className="debug-reason failed"><Icon name="warning" size={13} /><span>{errorText(debugStep.error)}</span></div> : null}
                       <div className="debug-io">
                         <div><span className="io-label">inputs</span><JsonTree data={debugStep.inputs || {}} /></div>
                         <div><span className="io-label">outputs</span><JsonTree data={debugStep.outputs || {}} /></div>
                       </div>
                     </>
-                  ) : <div className="debug-empty"><Icon name="code" size={20} /><span>点开一条 trace 查看 inputs/outputs。</span></div>}
+                  ) : <div className="debug-empty"><Icon name="code" size={20} /><span>点开一条节点查看 reason 与 inputs/outputs。</span></div>}
                   <div className="variable-box">
                     <div className="variable-head"><strong>变量快照</strong><Badge tone="neutral">snapshot</Badge></div>
                     {(() => {
-                      const bag = debugResult?.variables || {}
+                      const bag = debugSession?.variables || {}
                       const vars = (bag.vars && typeof bag.vars === 'object') ? bag.vars as AnyRecord : bag
                       const env = (bag.env && typeof bag.env === 'object') ? bag.env as AnyRecord : null
                       const entries = Object.entries(vars).filter(([key]) => key !== 'vars' && key !== 'env')
@@ -679,18 +1129,26 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 </div>
               </div>
 
-              {debugResult && (debugResult.trace || debugResult.steps || []).some((step) => step.node_id === selectedNode.node_id) ? (
+              {debugStatusMap.get(selectedNode.node_id) ? (
                 <div className="recent-debug">
                   <span><Icon name="bug" size={13} /> 最近调试</span>
                   {(() => {
-                    const step = (debugResult.trace || debugResult.steps || []).find((item) => item.node_id === selectedNode.node_id)!
+                    const step = debugStatusMap.get(selectedNode.node_id)!
                     return <><StatusBadge status={step.status} /><span className="mono">{formatDuration(step.duration_ms)}</span></>
                   })()}
+                  {debugStatusMap.get(selectedNode.node_id)?.reason ? (
+                    <span className="recent-debug-reason">原因：{debugReasonLabel(debugStatusMap.get(selectedNode.node_id)?.reason)} <code>{debugStatusMap.get(selectedNode.node_id)?.reason}</code></span>
+                  ) : null}
                   <details className="recent-debug-io">
-                    <summary>查看 inputs / outputs</summary>
+                    <summary>查看 reason / inputs / outputs</summary>
                     {(() => {
-                      const step = (debugResult.trace || debugResult.steps || []).find((item) => item.node_id === selectedNode.node_id)!
-                      return <div className="debug-io"><div><span className="io-label">inputs</span><JsonTree data={step.inputs || {}} /></div><div><span className="io-label">outputs</span><JsonTree data={step.outputs || {}} /></div></div>
+                      const step = debugStatusMap.get(selectedNode.node_id)!
+                      return (
+                        <>
+                          {step.reason ? <div className="debug-reason"><Icon name="warning" size={13} /><span>{debugReasonLabel(step.reason)}</span><code>{step.reason}</code></div> : null}
+                          <div className="debug-io"><div><span className="io-label">inputs</span><JsonTree data={step.inputs || {}} /></div><div><span className="io-label">outputs</span><JsonTree data={step.outputs || {}} /></div></div>
+                        </>
+                      )
                     })()}
                   </details>
                 </div>
@@ -709,16 +1167,39 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 <div><span>错误</span><strong className={errors.length ? 'bad' : 'ok'}>{errors.length}</strong></div>
                 <div><span>警告</span><strong className={warnings.length ? 'warn' : 'ok'}>{warnings.length}</strong></div>
               </div>
+              <div className="validation-digest">
+                <div className="param-section-head"><span>语义校验</span><span>{coverage ? `${Math.round(coverage.ratio * 100)}%` : '未提供'}</span></div>
+                {coverage ? (
+                  <div className={`coverage-line ${coverage.ratio < 0.6 ? 'bad' : 'ok'}`}>
+                    <span>意图覆盖率</span>
+                    <strong className="mono">{coverage.matched}/{coverage.total} = {coverage.ratio.toFixed(2)}</strong>
+                  </div>
+                ) : <p className="muted">后端未返回 coverage；无法判断意图覆盖。</p>}
+                {missingEnv.length ? (
+                  <div className="digest-block">
+                    <span className="io-label">missing_env</span>
+                    <div className="digest-chips">{missingEnv.map((key) => <code key={key}>{key}</code>)}</div>
+                  </div>
+                ) : null}
+                {capabilityGaps.length ? (
+                  <div className="digest-block">
+                    <span className="io-label">capability_gaps</span>
+                    {capabilityGaps.map((gap) => (
+                      <div className="digest-gap" key={gap.atom}><code>{gap.atom}</code>{gap.suggestions.length ? <small>{gap.suggestions.join(' / ')}</small> : null}</div>
+                    ))}
+                  </div>
+                ) : null}
+              </div>
               <div className="issue-list">
                 <div className="param-section-head"><span>校验问题</span><span>{errors.length + warnings.length}</span></div>
                 {errors.map((issue) => (
-                  <button type="button" key={issue.id || issue.message} className="issue-row bad" onClick={() => { if (issue.node_id) { setSelectedId(issue.node_id); setPanelOpen(true) } }}>
-                    <Icon name="warning" size={13} /><span>{issue.message}</span><Icon name="chevron" size={12} />
+                  <button type="button" key={issue.id || issue.message} className="issue-row bad" data-node-id={issue.node_id || undefined} onClick={() => locateNode(issue.node_id)} disabled={!issue.node_id} title={issue.node_id ? `定位节点 ${issue.node_id}` : issue.message}>
+                    <Icon name="warning" size={13} /><span>{issue.message}{issue.code ? <small className="issue-code">{issue.code}</small> : null}</span><Icon name="chevron" size={12} />
                   </button>
                 ))}
                 {warnings.map((issue) => (
-                  <button type="button" key={issue.id || issue.message} className="issue-row warn" onClick={() => { if (issue.node_id) { setSelectedId(issue.node_id); setPanelOpen(true) } }}>
-                    <Icon name="bolt" size={13} /><span>{issue.message}</span><Icon name="chevron" size={12} />
+                  <button type="button" key={issue.id || issue.message} className="issue-row warn" data-node-id={issue.node_id || undefined} onClick={() => locateNode(issue.node_id)} disabled={!issue.node_id} title={issue.node_id ? `定位节点 ${issue.node_id}` : issue.message}>
+                    <Icon name="bolt" size={13} /><span>{issue.message}{issue.code ? <small className="issue-code">{issue.code}</small> : null}</span><Icon name="chevron" size={12} />
                   </button>
                 ))}
                 {!errors.length && !warnings.length ? <div className="inspector-ok"><Icon name="check" size={14} />当前版本校验通过</div> : null}

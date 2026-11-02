@@ -1,9 +1,9 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { api, isStudioMock, onStudioMockChange, studioApi } from '../shared/api'
+import { ApiError, api, isStudioMock, onStudioMockChange, studioApi } from '../shared/api'
 import { navigate, href } from '../shared/router'
 import { relativeTime, statusLabel } from '../shared/utils'
-import type { Atom, Pack, Workflow } from '../shared/types'
+import type { AnyRecord, Atom, Pack, Workflow } from '../shared/types'
 import { Icon } from '../components/Icon'
 import {
   Badge,
@@ -28,6 +28,11 @@ const quickPrompts: Record<string, { title: string; text: string }[]> = {
     { title: '配置巡检', text: '检查配置目录中的必要文件是否存在，并读取 JSON 校验 version 字段。' },
     { title: '清理临时文件', text: '列出临时目录文件，删除超过保留期的文件，并记录删除数量。' },
   ],
+  web_research: [
+    { title: '首页布局报告', text: '打开 https://seres-ai.com 首页，提取正文文本，并给出布局与结构报告。' },
+    { title: '文章要点总结', text: '抓取指定文章页面，提取正文并总结三条要点。' },
+    { title: '链接结构盘点', text: '抓取页面 HTML，统计标题层级、链接与区块结构。' },
+  ],
 }
 
 export function StudioNewPage() {
@@ -36,6 +41,7 @@ export function StudioNewPage() {
   const [pack, setPack] = useState('api_testing')
   const [excluded, setExcluded] = useState<string[]>([])
   const [mock, setMock] = useState(isStudioMock())
+  const [planError, setPlanError] = useState<{ message: string; missing: string[]; suggestions: string[] } | null>(null)
   const atomsQuery = useQuery({ queryKey: ['atoms'], queryFn: api.atoms, staleTime: 60_000 })
   const packsQuery = useQuery({ queryKey: ['packs'], queryFn: api.packs, staleTime: 60_000 })
   const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: studioApi.listDrafts })
@@ -55,7 +61,9 @@ export function StudioNewPage() {
     const pool = inPack.length ? inPack : atoms.filter((atom) => pack === 'local_fs' ? atom.domain === 'fs' : atom.domain === 'api')
     const preferred = pack === 'local_fs'
       ? ['fs_read_text', 'fs_write_json', 'fs_exists', 'assert_file_exists', 'fs_list']
-      : ['http_request', 'assert_status', 'json_get', 'assert_body_contains', 'assert_json']
+      : pack === 'web_research'
+        ? ['http_get_page', 'html_extract_text', 'html_extract_structure', 'llm_summarize']
+        : ['http_request', 'assert_status', 'json_get', 'assert_body_contains', 'assert_json']
     return [...pool].sort((a, b) => {
       const ai = preferred.indexOf(a.name)
       const bi = preferred.indexOf(b.name)
@@ -69,13 +77,26 @@ export function StudioNewPage() {
   const create = useMutation({
     mutationFn: () => studioApi.createDraft({ intent: intent.trim(), domain_pack: pack, exclude_atoms: excluded }),
     onSuccess: (workflow) => {
+      setPlanError(null)
       push(`已生成 rev ${workflow.current_rev ?? 0} · ${workflow.graph?.nodes?.length || 0} 个节点`, 'ok')
       navigate(`/studio/${workflow.wid}`)
     },
-    onError: (error: Error) => push(error.message, 'error'),
+    onError: (error: Error) => {
+      if (error instanceof ApiError) {
+        const raw = (error.data?.error && typeof error.data.error === 'object' ? error.data.error : error.data) as AnyRecord | undefined
+        const missing = Array.isArray(raw?.missing_atoms) ? raw!.missing_atoms.map(String) : []
+        const suggestions = Array.isArray(raw?.suggestions) ? raw!.suggestions.map(String) : []
+        if (error.status === 422 || error.code === 'capability_gap' || missing.length) {
+          setPlanError({ message: error.message, missing, suggestions })
+          return
+        }
+      }
+      push(error.message, 'error')
+    },
   })
 
   const submit = () => {
+    setPlanError(null)
     if (!intent.trim()) { push('先写一句要自动化的意图', 'error'); return }
     if (intent.trim().length < 6) { push('意图太短，补充目标与期望结果', 'error'); return }
     create.mutate()
@@ -89,6 +110,24 @@ export function StudioNewPage() {
         description="AI 只负责提议：拆解意图、选择原子、生成初稿。你可以在画布上改、锁、调试，再逐条审阅后发布。"
         actions={<a className="btn btn-ghost btn-sm" href={href('/atoms')}><Icon name="atoms" size={15} />查看能力清单</a>}
       />
+
+      {planError ? (
+        <div className="capability-gap-panel" data-testid="plan-gap-panel">
+          <span className="gap-panel-icon"><Icon name="warning" size={17} /></span>
+          <div className="gap-panel-body">
+            <strong>没有生成流程：能力缺口（422 {planError.missing.length ? `· 缺少 ${planError.missing.length} 个原子` : ''}）</strong>
+            <p>{planError.message}</p>
+            {planError.missing.length ? (
+              <div className="gap-panel-row"><span>缺失原子</span>{planError.missing.map((atom) => <code key={atom}>{atom}</code>)}</div>
+            ) : null}
+            {planError.suggestions.length ? (
+              <ul className="gap-panel-suggestions">{planError.suggestions.map((item) => <li key={item}>{item}</li>)}</ul>
+            ) : null}
+            <small>不会产出占位图。请调整意图、补齐原子，或更换领域包。</small>
+          </div>
+          <button type="button" className="gap-panel-close" onClick={() => setPlanError(null)} aria-label="关闭能力缺口提示"><Icon name="close" size={13} /></button>
+        </div>
+      ) : null}
 
       {mock ? (
         <div className="demo-banner">

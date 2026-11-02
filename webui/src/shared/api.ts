@@ -22,7 +22,10 @@ import type {
   Validation,
   ValidationIssue,
   Workflow,
+  DebugSession,
+  DebugNodeState,
   DebugResult,
+  CapabilityGap,
   DiffItem,
   Risk,
 } from './types'
@@ -30,12 +33,14 @@ import type {
 export class ApiError extends Error {
   status: number
   code: string
+  data?: AnyRecord
 
-  constructor(message: string, status = 0, code = '') {
+  constructor(message: string, status = 0, code = '', data?: AnyRecord) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.data = data
   }
 }
 
@@ -95,7 +100,8 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       (typeof payload === 'string' && payload.trim().slice(0, 300)) ||
       `请求失败（HTTP ${response.status}）`
     const code = (body?.error && typeof body.error === 'object' && body.error.code) || `http_${response.status}`
-    throw new ApiError(String(message), response.status, String(code))
+    const data = body && typeof body === 'object' ? body : undefined
+    throw new ApiError(String(message), response.status, String(code), data)
   }
   return (noContent ? null : payload) as T
 }
@@ -225,6 +231,44 @@ function setStudioMock(value: boolean): void {
   mockListeners.forEach((listener) => listener(value))
 }
 
+/* Planner provenance ------------------------------------------------------- */
+
+export interface StudioProvenance {
+  planner?: string
+  plan_source?: string
+  confidence?: number
+  assumptions?: string[]
+  capability_gaps?: Array<CapabilityGap | string>
+}
+
+const PROVENANCE_PREFIX = 'panguverse.studio.provenance.'
+
+export function rememberStudioProvenance(wid: string, payload: AnyRecord): void {
+  if (!wid) return
+  const source = (payload.provenance && typeof payload.provenance === 'object' ? payload.provenance : payload) as AnyRecord
+  if (source.planner === undefined && source.plan_source === undefined && source.confidence === undefined) return
+  try {
+    sessionStorage.setItem(PROVENANCE_PREFIX + wid, JSON.stringify({
+      planner: source.planner,
+      plan_source: source.plan_source,
+      confidence: source.confidence,
+      assumptions: source.assumptions,
+      capability_gaps: source.capability_gaps,
+    }))
+  } catch {
+    /* session storage is best-effort */
+  }
+}
+
+export function readStudioProvenance(wid: string): StudioProvenance | null {
+  try {
+    const raw = sessionStorage.getItem(PROVENANCE_PREFIX + wid)
+    return raw ? JSON.parse(raw) as StudioProvenance : null
+  } catch {
+    return null
+  }
+}
+
 export function normalizeGraph(workflow: Workflow | null | undefined): StudioGraph {
   if (!workflow) return { nodes: [], edges: [] }
   const graph = workflow.graph || workflow
@@ -307,6 +351,7 @@ export const studioApi = {
       async () => {
         const payload = await request<AnyRecord>('api/studio/drafts', { method: 'POST', body })
         const wid = String(payload.wid || payload.workflow_id)
+        rememberStudioProvenance(wid, payload)
         const normalized = normalizeWorkflow(payload)
         normalized.wid = wid
         if (!normalized.graph?.nodes?.length) {
@@ -427,14 +472,36 @@ export const studioApi = {
     )
   },
 
-  async debug(wid: string, body: { rev: number; node_id: string; mode: string }): Promise<DebugResult> {
+  async startDebug(
+    wid: string,
+    body: { rev: number; node_id: string; mode: string },
+  ): Promise<{ session_id: string | null; legacy?: DebugSession; total?: number }> {
     return realOrMock(
-      async () => request<DebugResult>(`api/studio/${encode(wid)}/debug`, { method: 'POST', body }),
       async () => {
-        const { mockDebug } = await import('./studioMock')
-        return mockDebug(wid, body)
+        const payload = await request<AnyRecord>(`api/studio/${encode(wid)}/debug`, { method: 'POST', body })
+        const sid = payload.session_id || payload.sid || payload.debug_session_id
+        if (sid) return { session_id: String(sid), total: Number(payload.total || 0) }
+        const trace = payload.trace || payload.steps
+        if (Array.isArray(trace)) return { session_id: null, legacy: legacyDebugSession(payload) }
+        return { session_id: null }
+      },
+      async () => {
+        const { mockStartDebug } = await import('./studioMock')
+        return mockStartDebug(wid, body)
       },
     )
+  },
+
+  async debugSession(sessionId: string, cursor: number | string = 0): Promise<DebugSession> {
+    const mockMode = await ensureStudioMode()
+    if (mockMode) {
+      const { mockPollDebugSession } = await import('./studioMock')
+      return mockPollDebugSession(sessionId, cursor)
+    }
+    const payload = await request<AnyRecord>(
+      `api/studio/debug/${encode(sessionId)}?cursor=${encodeURIComponent(String(cursor ?? 0))}`,
+    )
+    return normalizeDebugSession(payload)
   },
 
   async review(wid: string, baseRev: number, rev: number): Promise<StudioDiff> {
@@ -533,11 +600,111 @@ export function normalizeValidation(payload: AnyRecord): Validation {
         }
       })
     : []
+  const coverageRaw = payload.coverage && typeof payload.coverage === 'object' ? payload.coverage as AnyRecord : null
+  const coverage = coverageRaw
+    ? (() => {
+        const total = Number(coverageRaw.total ?? 0)
+        const matched = Number(coverageRaw.matched ?? 0)
+        const ratio = coverageRaw.ratio === undefined || coverageRaw.ratio === null
+          ? (total > 0 ? matched / total : 0)
+          : Number(coverageRaw.ratio)
+        return { matched, total, ratio: Number.isFinite(ratio) ? ratio : 0 }
+      })()
+    : null
+  const missingEnv = Array.isArray(payload.missing_env)
+    ? payload.missing_env.map((item: unknown) => typeof item === 'string' ? item : String((item as AnyRecord)?.name || item))
+    : []
+  const rawGaps = Array.isArray(payload.capability_gaps) ? payload.capability_gaps : []
+  const capabilityGaps = rawGaps.length
+    ? rawGaps
+    : asIssues(payload.errors).filter((issue) => issue.code === 'capability_gap').map((issue) => issue.message)
   return {
     errors: asIssues(payload.errors),
     warnings: asIssues(payload.warnings),
     risks,
+    coverage,
+    missing_env: missingEnv,
+    capability_gaps: capabilityGaps as Array<CapabilityGap | string>,
   }
+}
+
+export function debugReasonLabel(reason?: string | null): string {
+  const map: Record<string, string> = {
+    when_false: '条件为假',
+    foreach_empty: '循环为空',
+    upstream_failed: '上游失败',
+    optional: '可选节点',
+    assertion: '断言失败',
+    network: '网络错误',
+    missing_env: '缺少环境变量',
+    missing_llm: '未配置 LLM',
+    cancelled: '已取消',
+  }
+  return reason ? map[reason] || reason : ''
+}
+
+export function normalizeDebugSession(payload: AnyRecord, fallbackDone = false): DebugSession {
+  const rawNodes = Array.isArray(payload.nodes)
+    ? payload.nodes
+    : Array.isArray(payload.trace)
+      ? payload.trace
+      : Array.isArray(payload.steps)
+        ? payload.steps
+        : []
+  const byNode = new Map<string, DebugNodeState>()
+  rawNodes.forEach((item: AnyRecord, index: number) => {
+    const nodeId = String(item.node_id || item.node || item.id || `node-${index}`)
+    byNode.set(nodeId, {
+      ...item,
+      node_id: nodeId,
+      status: String(item.status || 'pending'),
+      reason: item.reason || null,
+    })
+  })
+  const nodes: DebugNodeState[] = Array.from(byNode.values())
+  const counts = { passed: 0, failed: 0, skipped: 0 }
+  const byReason: Record<string, number> = {}
+  nodes.forEach((node) => {
+    if (node.status === 'passed') counts.passed += 1
+    else if (node.status === 'failed') counts.failed += 1
+    else if (node.status === 'skipped') {
+      counts.skipped += 1
+      const reason = node.reason || 'unknown'
+      byReason[reason] = (byReason[reason] || 0) + 1
+    }
+  })
+  const rawSummary = payload.summary && typeof payload.summary === 'object' ? payload.summary as AnyRecord : {}
+  const summary = {
+    ...rawSummary,
+    passed: Number(rawSummary.passed ?? counts.passed),
+    failed: Number(rawSummary.failed ?? counts.failed),
+    skipped: Number(rawSummary.skipped ?? counts.skipped),
+    total: Number(rawSummary.total ?? payload.total ?? nodes.length),
+    by_reason: (rawSummary.by_reason && typeof rawSummary.by_reason === 'object')
+      ? rawSummary.by_reason as Record<string, number>
+      : byReason,
+  }
+  return {
+    ...payload,
+    session_id: payload.session_id ? String(payload.session_id) : undefined,
+    nodes,
+    cursor: payload.cursor ?? 0,
+    done: payload.done === undefined ? fallbackDone : Boolean(payload.done),
+    summary,
+    variables: payload.variables,
+    error: payload.error ?? null,
+  }
+}
+
+export function legacyDebugSession(payload: AnyRecord): DebugSession {
+  const trace = Array.isArray(payload.trace) ? payload.trace : Array.isArray(payload.steps) ? payload.steps : []
+  return normalizeDebugSession({
+    ...payload,
+    nodes: trace.map((step: AnyRecord) => ({ ...step, status: step.status || 'passed' })),
+    done: true,
+    cursor: 0,
+    legacy: true,
+  }, true)
 }
 
 export function normalizeDiff(payload: AnyRecord): StudioDiff {

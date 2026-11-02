@@ -1,6 +1,7 @@
 import type {
   AnyRecord,
-  DebugResult,
+  DebugSession,
+  DebugNodeState,
   DiffItem,
   Risk,
   StudioDiff,
@@ -360,6 +361,11 @@ export async function mockCreateDraft(body: { intent: string; domain_pack: strin
     state: 'draft',
     current_rev: 1,
     published_ref: '',
+    planner: 'llm',
+    plan_source: 'llm',
+    confidence: 0.78,
+    assumptions: [],
+    capability_gaps: [],
     graph,
     revisions: {
       '1': { graph: clone(graph), message: 'AI 初始规划', created_by: 'ai', created_at: now() },
@@ -503,7 +509,22 @@ export async function mockValidate(wid: string, rev?: number): Promise<Validatio
   return validateWorkflow(wid, rev)
 }
 
-export async function mockDebug(wid: string, body: { rev: number; node_id: string; mode: string }): Promise<DebugResult> {
+interface MockDebugSession {
+  sid: string
+  wid: string
+  mode: string
+  nodes: StudioNode[]
+  startedAt: number
+  cursor: number
+  variables: AnyRecord
+}
+
+const mockDebugSessions = new Map<string, MockDebugSession>()
+
+export async function mockStartDebug(
+  wid: string,
+  body: { rev: number; node_id: string; mode: string },
+): Promise<{ session_id: string; total: number; legacy?: never }> {
   const workflow = ensure(wid)
   const graph = workflow.revisions[String(body.rev)]?.graph || workflow.graph
   const index = Math.max(0, graph.nodes.findIndex((node) => node.node_id === body.node_id))
@@ -511,38 +532,94 @@ export async function mockDebug(wid: string, body: { rev: number; node_id: strin
   if (body.mode === 'only') selected = graph.nodes.slice(index, index + 1)
   else if (body.mode === 'from_start') selected = graph.nodes.slice(0, index + 1)
   else selected = graph.nodes.slice(index)
-  const variables: AnyRecord = {}
-  const trace = selected.map((node, i) => {
-    const status = node.node_id === 'n-check' && body.mode === 'downstream' ? 'failed' : 'passed'
-    const outputs: AnyRecord = {
-      status_code: 200,
-      ok: true,
-      body: { user: 'demo', access_token: '***', orders: [{ id: 'ord_1042' }, { id: 'ord_1043' }] },
-      elapsed_ms: 42 + i * 17,
+  const sid = uid('dbg')
+  mockDebugSessions.set(sid, {
+    sid,
+    wid,
+    mode: body.mode,
+    nodes: clone(selected),
+    startedAt: Date.now(),
+    cursor: 0,
+    variables: {},
+  })
+  return { session_id: sid, total: selected.length }
+}
+
+export async function mockPollDebugSession(sessionId: string, cursor: number | string = 0): Promise<DebugSession> {
+  const session = mockDebugSessions.get(sessionId)
+  if (!session) throw new Error('调试会话不存在或已过期')
+  const perNodeMs = 420
+  const total = session.nodes.length
+  const elapsed = (Date.now() - session.startedAt) / perNodeMs
+  const finishedCount = Math.min(total, Math.floor(elapsed))
+  const runningIndex = finishedCount < total ? finishedCount : -1
+  let previousFailed = false
+  const nodes: DebugNodeState[] = session.nodes.map((node, index) => {
+    let status = 'pending'
+    let reason: string | null = null
+    let error: string | null = null
+    if (index < finishedCount) {
+      if (String(node.with?.when) === 'false') {
+        status = 'skipped'
+        reason = 'when_false'
+      } else if (previousFailed) {
+        status = 'skipped'
+        reason = 'upstream_failed'
+      } else if (node.node_id === 'n-check' && session.mode === 'downstream') {
+        status = 'failed'
+        reason = 'assertion'
+        error = '断言失败：目标目录不可写（演示数据）'
+      } else {
+        status = 'passed'
+      }
+    } else if (index === runningIndex) {
+      status = 'running'
     }
+    if (status === 'failed') previousFailed = true
+    const outputs: AnyRecord = status === 'running' || status === 'pending'
+      ? {}
+      : {
+          status_code: 200,
+          ok: status === 'passed',
+          elapsed_ms: 42 + index * 17,
+          preview: node.atom.startsWith('html_') ? '<html>…</html>' : 'demo-value',
+        }
     Object.entries(node.capture || {}).forEach(([key]) => {
-      variables[key] = { value: key.toLowerCase().includes('token') ? '***' : 'demo-value', from: node.node_id, snapshot: true }
+      if (status === 'passed') {
+        session.variables[key] = { value: key.toLowerCase().includes('token') ? '***' : 'demo-value', from: node.node_id, snapshot: true }
+      }
     })
     return {
       node_id: node.node_id,
       node: node.name,
       atom: node.atom,
       status,
-      duration_ms: 42 + i * 17,
-      inputs: {
-        ...(node.with || {}),
-        password: '***',
-      },
+      reason,
+      duration_ms: status === 'pending' || status === 'running' ? undefined : 42 + index * 17,
+      inputs: { ...(node.with || {}), password: '***' },
       outputs,
-      error: status === 'failed' ? '断言失败：目标目录不可写（演示数据）' : null,
-      snapshot: true,
+      error,
     }
   })
+  session.cursor = (Number(cursor) || 0) + 1
+  const summary = {
+    passed: nodes.filter((node) => node.status === 'passed').length,
+    failed: nodes.filter((node) => node.status === 'failed').length,
+    skipped: nodes.filter((node) => node.status === 'skipped').length,
+    total,
+    by_reason: nodes.filter((node) => node.status === 'skipped').reduce((acc: Record<string, number>, node) => {
+      const reason = node.reason || 'unknown'
+      acc[reason] = (acc[reason] || 0) + 1
+      return acc
+    }, {}),
+  }
   return {
-    trace,
-    variables,
-    debug_id: uid('dbg'),
-    ran_at: new Date().toISOString(),
+    session_id: sessionId,
+    nodes,
+    cursor: session.cursor,
+    done: finishedCount >= total,
+    summary,
+    variables: session.variables,
   }
 }
 

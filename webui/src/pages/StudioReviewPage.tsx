@@ -293,10 +293,33 @@ export function StudioReviewPage({ wid }: { wid: string }) {
           <div className="validation-columns">
             <div>
               <h3 className="subsection-title">校验问题</h3>
+              {validationQuery.data?.coverage ? (
+                <div className={`coverage-line ${validationQuery.data.coverage.ratio < 0.6 ? 'bad' : 'ok'}`}>
+                  <span>意图覆盖率</span>
+                  <strong className="mono">{validationQuery.data.coverage.matched}/{validationQuery.data.coverage.total} = {validationQuery.data.coverage.ratio.toFixed(2)}</strong>
+                </div>
+              ) : null}
+              {validationQuery.data?.missing_env?.length ? (
+                <div className="digest-block"><span className="io-label">missing_env</span><div className="digest-chips">{validationQuery.data.missing_env.map((key) => <code key={key}>{key}</code>)}</div></div>
+              ) : null}
+              {validationQuery.data?.capability_gaps?.length ? (
+                <div className="digest-block"><span className="io-label">capability_gaps</span>{validationQuery.data.capability_gaps.map((gap, index) => {
+                  const label = typeof gap === 'string' ? gap : gap.atom || gap.name || gap.message || `gap-${index}`
+                  return <div className="digest-gap" key={label}><code>{label}</code></div>
+                })}</div>
+              ) : null}
               {blockingErrors.length || warnings.length ? (
                 <div className="issue-list">
-                  {blockingErrors.map((issue, index) => <div className="issue-row bad" key={issue.id || index}><Icon name="warning" size={13} /><span>{issue.message}</span></div>)}
-                  {warnings.map((issue, index) => <div className="issue-row warn" key={issue.id || `w-${index}`}><Icon name="bolt" size={13} /><span>{issue.message}</span></div>)}
+                  {blockingErrors.map((issue, index) => (
+                    <button type="button" className="issue-row bad" key={issue.id || index} disabled={!issue.node_id} onClick={() => issue.node_id && navigate(`/studio/${wid}?node=${encodeURIComponent(issue.node_id)}`)} title={issue.node_id ? `定位节点 ${issue.node_id}` : issue.message}>
+                      <Icon name="warning" size={13} /><span>{issue.message}{issue.code ? <small className="issue-code">{issue.code}</small> : null}</span>{issue.node_id ? <Icon name="chevron" size={12} /> : null}
+                    </button>
+                  ))}
+                  {warnings.map((issue, index) => (
+                    <button type="button" className="issue-row warn" key={issue.id || `w-${index}`} disabled={!issue.node_id} onClick={() => issue.node_id && navigate(`/studio/${wid}?node=${encodeURIComponent(issue.node_id)}`)} title={issue.node_id ? `定位节点 ${issue.node_id}` : issue.message}>
+                      <Icon name="bolt" size={13} /><span>{issue.message}{issue.code ? <small className="issue-code">{issue.code}</small> : null}</span>{issue.node_id ? <Icon name="chevron" size={12} /> : null}
+                    </button>
+                  ))}
                 </div>
               ) : <div className="inspector-ok"><Icon name="check" size={14} />校验通过</div>}
             </div>
