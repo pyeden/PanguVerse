@@ -682,10 +682,18 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   }, [])
 
   const closeDebugDetail = useCallback(() => {
+    const target = debugListScrollRef.current
     setDebugDetailOpen(false)
-    window.setTimeout(() => {
-      if (debugTabPanelRef.current) debugTabPanelRef.current.scrollTop = debugListScrollRef.current
-    }, 0)
+    const restore = () => {
+      if (debugTabPanelRef.current) debugTabPanelRef.current.scrollTop = target
+    }
+    window.requestAnimationFrame(() => {
+      restore()
+      window.requestAnimationFrame(() => {
+        restore()
+        window.setTimeout(restore, 0)
+      })
+    })
   }, [])
 
   useEffect(() => {
@@ -1061,7 +1069,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 </div>
               </div>
               <div className="debug-tabs" role="tablist" aria-label="调试视图">
-                <button type="button" role="tab" data-testid="debug-tab-timeline" aria-selected={debugTab === 'timeline'} className={debugTab === 'timeline' ? 'is-active' : ''} onClick={() => { setDebugTab('timeline'); setDebugDetailOpen(false) }}>时间线</button>
+                <button type="button" role="tab" data-testid="debug-tab-timeline" aria-selected={debugTab === 'timeline'} className={debugTab === 'timeline' ? 'is-active' : ''} onClick={() => setDebugTab('timeline')}>时间线</button>
                 <button type="button" role="tab" data-testid="debug-tab-output" aria-selected={debugTab === 'output'} className={debugTab === 'output' ? 'is-active' : ''} onClick={() => setDebugTab('output')}>输出</button>
                 <button type="button" role="tab" data-testid="debug-tab-vars" aria-selected={debugTab === 'vars'} className={debugTab === 'vars' ? 'is-active' : ''} onClick={() => setDebugTab('vars')}>变量</button>
               </div>
