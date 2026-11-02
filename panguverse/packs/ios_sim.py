@@ -49,6 +49,15 @@ DEFAULT_TIMEOUT = 30.0
 _TOOL_ENV = "PANGUVERSE_SIMCTL"
 _XCRUN_CANDIDATES = ("xcrun", "/usr/bin/xcrun")
 
+#: simctl 在「没有已启动模拟器」时返回的诊断文本（真机 code 405）。
+_MISSING_DEVICE_MARKERS = (
+    "unable to lookup",
+    "no booted",
+    "current state: shutdown",
+)
+#: 结构化输出里的 simctl 错误码（``code=405`` / ``"code": 405``）。
+_SIMCTL_405_RE = re.compile(r'(?:\bcode\s*=\s*405\b|"code"\s*:\s*405\b)')
+
 #: iOS 交互能力缺口：规划器必须返回 capability_gap，不得伪造原子
 IOS_CAPABILITY_GAPS = (
     "ios_tap（iOS 元素点击，需要 XCUITest/WebDriverAgent）",
@@ -154,7 +163,43 @@ def _run_simctl(args: list[str], *, timeout: float = DEFAULT_TIMEOUT) -> tuple[i
     )
 
 
+def _is_missing_device(code: int, out: str, err: str) -> bool:
+    """判断 simctl 失败是否等价于「没有已启动的模拟器」。
+
+    真机在 ``simctl shutdown all`` 之后执行 launch/terminate/openurl/screenshot/install
+    会返回 exit 405 或消息 ``Unable to lookup in current state: Shutdown``；这类失败
+    属于环境缺失，不是命令参数写错，必须归到 ``missing_device``。
+    """
+    if int(code) == 405:
+        return True
+    text = f"{out}\n{err}"
+    lowered = text.lower()
+    if any(marker in lowered for marker in _MISSING_DEVICE_MARKERS):
+        return True
+    return bool(_SIMCTL_405_RE.search(text))
+
+
+def _missing_device_failure(code: int, out: str, err: str, *, action: str) -> AtomFailure:
+    raw = clip_output(err).strip() or clip_output(out).strip() or f"exit={code}"
+    return AtomFailure(
+        f"{action}失败：没有已启动的模拟器，请先 boot"
+        "（用 ios_sim_list 查看可启动设备，再 ios_sim_boot 或 xcrun simctl boot <udid>）；"
+        f"simctl 返回：{raw}",
+        kind="missing_device",
+        failure_class="missing_resource",
+        detail={
+            "exit_code": code,
+            "stdout": clip_output(out),
+            "stderr": clip_output(err),
+            "simctl_code": 405,
+            "hint": "没有已启动的模拟器，请先 boot",
+        },
+    )
+
+
 def _command_failed(code: int, out: str, err: str, *, action: str) -> AtomFailure:
+    if _is_missing_device(code, out, err):
+        return _missing_device_failure(code, out, err, action=action)
     message = clip_output(err).strip() or clip_output(out).strip() or f"exit={code}"
     return AtomFailure(
         f"{action}失败：{message}",
@@ -210,11 +255,13 @@ def parse_simctl_devices(payload: str) -> list[dict[str, Any]]:
                 continue
             if item.get("isAvailable") is False:
                 continue
+            state = str(item.get("state") or "")
             devices.append(
                 {
                     "name": str(item.get("name") or ""),
                     "udid": str(item.get("udid") or ""),
-                    "state": str(item.get("state") or ""),
+                    "state": state,
+                    "booted": state == "Booted",
                     "runtime": _pretty_runtime(str(runtime)),
                     "runtime_id": str(runtime),
                 }
@@ -289,19 +336,24 @@ def _relative(path: Path, root: Path) -> str:
 # --------------------------------------------------------------------------- #
 @atom(
     "ios_sim_list",
-    description="列出可用 iOS 模拟器（name/udid/state/runtime）；无模拟器返回空数组",
+    description="列出可用 iOS 模拟器（name/udid/state/booted/runtime）；无模拟器返回空数组",
     category="device",
     tags=("device", "ios", "simctl", "read", "tool:simctl"),
     inputs={},
-    outputs={"devices": "array", "count": "integer"},
+    outputs={"devices": "array", "count": "integer", "booted_count": "integer"},
     required=(),
     effects=("read",),
     capabilities=("device",),
     domain="ios_sim",
 )
 def ios_sim_list(ctx: RunContext) -> dict[str, Any]:
+    """列出全部可用模拟器；``booted``/``booted_count`` 供调用方自行判断可用性。"""
     devices = list_simulators()
-    return {"devices": devices, "count": len(devices)}
+    return {
+        "devices": devices,
+        "count": len(devices),
+        "booted_count": sum(1 for item in devices if item.get("booted")),
+    }
 
 
 @atom(
@@ -449,6 +501,8 @@ def ios_sim_terminate(
     code, out, err = _run_simctl(
         ["terminate", device["udid"], bundle], timeout=timeout or DEFAULT_TIMEOUT
     )
+    if code != 0 and _is_missing_device(code, out, err):
+        raise _missing_device_failure(code, out, err, action="结束应用")
     if code != 0 and re.search(r"found nothing to terminate|not running", f"{out}\n{err}", re.IGNORECASE):
         return {"ok": True, "udid": device["udid"], "bundle_id": bundle}
     _assert_ok(code, out, err, action="结束应用")
@@ -515,6 +569,8 @@ def ios_sim_screenshot(
     if code != 0 or not path.exists() or path.stat().st_size == 0:
         with contextlib.suppress(OSError):
             path.unlink()
+        if _is_missing_device(code, out, err):
+            raise _missing_device_failure(code, out, err, action="模拟器截图")
         raise _command_failed(code, out, err, action="模拟器截图")
     with contextlib.suppress(OSError):
         os.chmod(path, 0o600)
@@ -585,7 +641,10 @@ class IosSimSemantics(GenericSemantics):
     def advice(self, *, kind: str, failure_class: FailureClass) -> str:
         texts = {
             "missing_tool": "未找到 xcrun/simctl：安装 Xcode 或 Command Line Tools",
-            "missing_device": "没有可用模拟器：在 Xcode 的 Devices 里创建并下载 iOS Simulator",
+            "missing_device": (
+                "没有已启动的模拟器：先 ios_sim_boot 或 xcrun simctl boot <udid>；"
+                "没有设备时在 Xcode 的 Devices 里创建并下载 iOS Simulator"
+            ),
             "device_command_failed": "simctl 命令失败：检查 UDID、bundle id 与 .app 路径",
             "timeout": "simctl 命令超时：确认模拟器有响应",
             "parse": "simctl 输出无法解析：确认版本支持 -j JSON 输出",
@@ -595,7 +654,7 @@ class IosSimSemantics(GenericSemantics):
 
     def planning_hints(self) -> tuple[str, ...]:
         return (
-            "先跑 ios_sim_list 探测；无模拟器返回空数组，不要编造成功",
+            "先跑 ios_sim_list 探测；用 booted/booted_count 判断有无已启动设备，不要编造成功",
             "install/launch/terminate/openurl/boot/shutdown 都是 mutate=true",
             "iOS 元素级点击/输入/滑动不在本包能力内 → 必须返回 capability_gap",
             "截图 path 相对 workspace 根（.panguverse/artifacts/ios/…）",

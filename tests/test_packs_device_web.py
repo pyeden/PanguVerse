@@ -40,6 +40,7 @@ from panguverse.packs.ios_sim import (
     ios_sim_install,
     ios_sim_launch,
     ios_sim_list,
+    ios_sim_openurl,
     ios_sim_screenshot,
     ios_sim_terminate,
 )
@@ -563,6 +564,7 @@ def test_d8_ios_list_without_simulator_returns_empty(
     out = ios_sim_list.invoke(ctx, {})
     assert out["devices"] == []
     assert out["count"] == 0
+    assert out["booted_count"] == 0
 
 
 def test_d9_ios_launch_without_simulator_fails_missing_device(
@@ -577,6 +579,75 @@ def test_d9_ios_launch_without_simulator_fails_missing_device(
     assert semantics.is_retryable(
         ios_sim_launch, {}, kind="missing_device", failure_class=ios_sim.FailureClass.MISSING_RESOURCE
     ) is False
+
+
+def test_ios_list_marks_booted_per_device(fake_sim_env, ctx: RunContext) -> None:
+    out = ios_sim_list.invoke(ctx, {})
+    assert out["count"] == 2
+    assert out["booted_count"] == 1
+    assert all(isinstance(item["booted"], bool) for item in out["devices"])
+    booted = next(item for item in out["devices"] if item["udid"] == "BBBB-3333-4444")
+    assert booted["state"] == "Booted"
+    assert booted["booted"] is True
+    shutdown = next(item for item in out["devices"] if item["udid"] == "AAAA-1111-2222")
+    assert shutdown["state"] == "Shutdown"
+    assert shutdown["booted"] is False
+
+
+def test_ios_launch_without_booted_device_is_missing_device(
+    fake_sim_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """真机 ``simctl shutdown all`` 后 launch 返回 405，应归为 missing_device。"""
+    monkeypatch.setenv("FAKE_SIM_MODE", "nostate")
+    with pytest.raises(AtomFailure) as excinfo:
+        ios_sim_launch.invoke(ctx, {"udid": "AAAA-1111-2222", "bundle_id": "com.example.app"})
+    failure = excinfo.value
+    assert failure.kind == "missing_device"
+    assert failure.failure_class == "missing_resource"
+    assert "请先 boot" in str(failure)
+    assert failure.detail["simctl_code"] == 405
+    semantics = ios_sim.IosSimSemantics()
+    assert (
+        semantics.is_retryable(
+            ios_sim_launch,
+            {},
+            kind="missing_device",
+            failure_class=ios_sim.FailureClass.MISSING_RESOURCE,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "operation, inputs",
+    [
+        (ios_sim_launch, {"bundle_id": "com.example.app"}),
+        (ios_sim_terminate, {"bundle_id": "com.example.app"}),
+        (ios_sim_openurl, {"url": "https://example.com"}),
+        (ios_sim_screenshot, {}),
+        (ios_sim_install, {"app_path": "__APP__"}),
+    ],
+)
+def test_ios_actions_405_json_map_to_missing_device(
+    fake_sim_env,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    ctx: RunContext,
+    operation,
+    inputs: dict[str, str],
+) -> None:
+    """JSON 形式的 simctl 405 也必须映射到 missing_device（不可重试）。"""
+    monkeypatch.setenv("FAKE_SIM_MODE", "json405")
+    app = tmp_path / "App.app"
+    app.mkdir()
+    payload = {"udid": "AAAA-1111-2222"}
+    payload.update({key: (str(app) if value == "__APP__" else value) for key, value in inputs.items()})
+    with pytest.raises(AtomFailure) as excinfo:
+        operation.invoke(ctx, payload)
+    failure = excinfo.value
+    assert failure.kind == "missing_device"
+    assert failure.failure_class == "missing_resource"
+    assert "请先 boot" in str(failure)
 
 
 def test_ios_missing_tool(monkeypatch: pytest.MonkeyPatch, ctx: RunContext) -> None:

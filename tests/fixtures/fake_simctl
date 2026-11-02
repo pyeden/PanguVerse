@@ -1,9 +1,20 @@
 #!/bin/sh
 # 假 simctl：按 FAKE_SIM_MODE 返回 JSON/命令结果，供无模拟器环境验证解析。
-# 支持: normal | empty | fail
+# 支持: normal | empty | fail | notrunning | nostate(405 文本) | json405(405 JSON)
 mode="${FAKE_SIM_MODE:-normal}"
 if [ -n "$FAKE_SIM_LOG" ]; then
   printf '%s\n' "$*" >> "$FAKE_SIM_LOG"
+fi
+
+# 模拟「没有已启动的模拟器」：真机 exit 405 + Unable to lookup；另给 JSON 变体。
+if [ "$mode" = "nostate" ] && [ "$1" != "list" ]; then
+  echo "An error was encountered processing the command (domain=com.apple.CoreSimulator.SimError, code=405):" >&2
+  echo "Unable to lookup in current state: Shutdown" >&2
+  exit 405
+fi
+if [ "$mode" = "json405" ] && [ "$1" != "list" ]; then
+  echo '{"error":"Unable to lookup in current state: Shutdown","code":405}'
+  exit 1
 fi
 
 case "$1" in
