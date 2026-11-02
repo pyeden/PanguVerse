@@ -54,6 +54,9 @@ _MISSING_DEVICE_MARKERS = (
     "unable to lookup",
     "no booted",
     "current state: shutdown",
+    # 真机在设备未启动时 `simctl io screenshot` 报图像编码失败而不是 405。
+    "detected file type",
+    "error creating the image",
 )
 #: 结构化输出里的 simctl 错误码（``code=405`` / ``"code": 405``）。
 _SIMCTL_405_RE = re.compile(r'(?:\bcode\s*=\s*405\b|"code"\s*:\s*405\b)')
@@ -195,6 +198,30 @@ def _missing_device_failure(code: int, out: str, err: str, *, action: str) -> At
             "hint": "没有已启动的模拟器，请先 boot",
         },
     )
+
+
+def _not_booted_failure(device: Mapping[str, Any], *, action: str) -> AtomFailure:
+    """目标设备状态不是 Booted：截图等命令在 Shutdown 状态下必然失败。"""
+    udid = str(device.get("udid") or "")
+    state = str(device.get("state") or "Unknown")
+    return AtomFailure(
+        f"{action}失败：没有已启动的模拟器，请先 boot"
+        "（用 ios_sim_list 查看可启动设备，再 ios_sim_boot 或 xcrun simctl boot <udid>）；"
+        f"目标 {udid} 当前状态：{state}",
+        kind="missing_device",
+        failure_class="missing_resource",
+        detail={
+            "udid": udid,
+            "state": state,
+            "simctl_code": 405,
+            "hint": "没有已启动的模拟器，请先 boot",
+        },
+    )
+
+
+def _ensure_booted(device: Mapping[str, Any], *, action: str) -> None:
+    if str(device.get("state")) != "Booted":
+        raise _not_booted_failure(device, action=action)
 
 
 def _command_failed(code: int, out: str, err: str, *, action: str) -> AtomFailure:
@@ -557,6 +584,16 @@ def ios_sim_screenshot(
     timeout: float | None = None,
 ) -> dict[str, Any]:
     device = _resolve_device(udid)
+    # 预检：Shutdown 设备的 `io screenshot` 会报 PNG 编码失败（内部错误），
+    # 语义上应归为 missing_device；list 已在 _resolve_device 里取过，无额外调用。
+    _ensure_booted(device, action="模拟器截图")
+    # bootstatus -b 等到设备真正可用：`simctl boot` 返回后 screenshot 服务可能尚未
+    # 就绪，直接截图会报 ScreenshotError/Error creating the image。冷启动较慢，
+    # 这里放宽到至少 120s；已 booted 的设备上该命令约 0.1s。
+    boot_timeout = max(float(timeout or DEFAULT_TIMEOUT), 120.0)
+    code, out, err = _run_simctl(["bootstatus", device["udid"], "-b"], timeout=boot_timeout)
+    if code != 0:
+        raise _command_failed(code, out, err, action="模拟器截图前等待启动完成")
     directory, root = _artifact_dir(ctx, "ios")
     filename = Path(str(name)).name if name else f"ios-{int(time.time() * 1000)}-{os.getpid()}.png"
     if not filename.lower().endswith(".png"):

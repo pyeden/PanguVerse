@@ -710,12 +710,50 @@ def test_ios_boot_already_booted_skips_command(fake_sim_env, ctx: RunContext) ->
 
 
 def test_ios_screenshot_artifact(fake_sim_env, ctx: RunContext) -> None:
-    out = ios_sim_screenshot.invoke(ctx, {"udid": "AAAA-1111-2222", "name": "sim"})
+    out = ios_sim_screenshot.invoke(ctx, {"udid": "BBBB-3333-4444", "name": "sim"})
     assert out["path"].startswith("artifacts/ios/")
     target = Path(ctx.workspace.root) / out["path"]
     assert target.exists() and out["bytes"] == 70
     assert _mode(target.stat()) == 0o600
     assert _mode((Path(ctx.workspace.root) / "artifacts" / "ios").stat()) == 0o700
+
+
+def test_ios_screenshot_shutdown_device_is_missing_device(fake_sim_env, ctx: RunContext) -> None:
+    """预检：Shutdown 设备截图必须归为 missing_device，而不是发命令再报内部错误。"""
+    with pytest.raises(AtomFailure) as excinfo:
+        ios_sim_screenshot.invoke(ctx, {"udid": "AAAA-1111-2222"})
+    failure = excinfo.value
+    assert failure.kind == "missing_device"
+    assert failure.failure_class == "missing_resource"
+    assert "请先 boot" in str(failure)
+    assert failure.detail["simctl_code"] == 405
+    log_path = Path(fake_sim_env["FAKE_SIM_LOG"])
+    log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    assert "io AAAA-1111-2222 screenshot" not in log
+
+
+def test_ios_screenshot_booted_405_json_maps_to_missing_device(
+    fake_sim_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """预检通过后 simctl 仍返回 405 JSON：兵底逻辑保持 missing_device。"""
+    monkeypatch.setenv("FAKE_SIM_MODE", "json405")
+    with pytest.raises(AtomFailure) as excinfo:
+        ios_sim_screenshot.invoke(ctx, {"udid": "BBBB-3333-4444"})
+    assert excinfo.value.kind == "missing_device"
+    assert excinfo.value.detail["simctl_code"] == 405
+
+
+def test_ios_screenshot_png_error_text_is_missing_device(
+    fake_sim_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """真机文案 ``Detected file type`` / ``Error creating the image`` 也要识别。"""
+    monkeypatch.setenv("FAKE_SIM_MODE", "pngfail")
+    with pytest.raises(AtomFailure) as excinfo:
+        ios_sim_screenshot.invoke(ctx, {"udid": "BBBB-3333-4444"})
+    failure = excinfo.value
+    assert failure.kind == "missing_device"
+    assert failure.failure_class == "missing_resource"
+    assert failure.detail["simctl_code"] == 405
 
 
 def test_ios_install_missing_app(fake_sim_env, ctx: RunContext) -> None:

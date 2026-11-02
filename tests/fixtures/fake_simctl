@@ -16,6 +16,12 @@ if [ "$mode" = "json405" ] && [ "$1" != "list" ]; then
   echo '{"error":"Unable to lookup in current state: Shutdown","code":405}'
   exit 1
 fi
+# 真机形态：设备未启动时 `simctl io screenshot` 报 PNG 编码失败，无 405 码。
+if [ "$mode" = "pngfail" ] && [ "$1" = "io" ]; then
+  echo "Detected file type 'PNG' from file extension: .png" >&2
+  echo "Error creating the image" >&2
+  exit 1
+fi
 
 case "$1" in
   list)
@@ -44,6 +50,10 @@ case "$1" in
       cp "${FAKE_SIM_PNG:?not set}" "$4"
       exit 0
     fi
+    echo ok
+    exit 0
+    ;;
+  bootstatus)
     echo ok
     exit 0
     ;;
