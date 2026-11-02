@@ -393,6 +393,12 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   }, [workflow, validation, buildFlowNodes, buildFlowEdges])
 
   useEffect(() => {
+    if (selectedId && workflow?.graph?.nodes?.some((node) => node.node_id === selectedId)) {
+      setDebugNodeId(selectedId)
+    }
+  }, [selectedId, workflow?.wid])
+
+  useEffect(() => {
     if (!workflow) return
     if (workflow.validation) setValidation(normalizeLocal(workflow.validation))
     studioApi.validate(wid).then((result) => setValidation(result)).catch(() => undefined)
@@ -480,14 +486,36 @@ function StudioCanvasInner({ wid }: { wid: string }) {
 
   const startDebug = useMutation({
     mutationFn: () => {
-      if (!debugNodeId) throw new Error('请选择调试点')
-      return studioApi.startDebug(wid, { rev: workflow?.current_rev ?? 0, node_id: debugNodeId, mode: debugMode })
+      const target = debugNodeId || selectedId || workflow?.graph?.nodes?.[0]?.node_id || ''
+      if (!target) throw new Error('先在画布上选一个节点')
+      return studioApi.startDebug(wid, { rev: workflow?.current_rev ?? 0, node_id: target, mode: debugMode })
     },
     onSuccess: (result) => {
       setDebugError('')
       setDebugStep(null)
-      setDebugSession(result.legacy || null)
-      debugSessionRef.current = result.legacy || null
+      const allNodes = workflow?.graph?.nodes || []
+      const targetIndex = Math.max(0, allNodes.findIndex((node) => node.node_id === (debugNodeId || selectedId)))
+      const previewNodes = debugMode === 'only'
+        ? allNodes.slice(targetIndex, targetIndex + 1)
+        : debugMode === 'from_start'
+          ? allNodes.slice(0, targetIndex + 1)
+          : allNodes.slice(targetIndex)
+      const previewTotal = Number(result.total || previewNodes.length || 0)
+      const previewSession = result.legacy || {
+        session_id: result.session_id || undefined,
+        nodes: previewNodes.map((node) => ({
+          node_id: node.node_id,
+          node: node.name,
+          atom: node.atom,
+          status: 'pending' as const,
+          reason: null,
+        })),
+        cursor: 0,
+        done: false,
+        summary: { passed: 0, failed: 0, skipped: 0, total: previewTotal, by_reason: {} },
+      }
+      setDebugSession(previewSession)
+      debugSessionRef.current = previewSession
       cursorRef.current = 0
       lastCenteredRef.current = ''
       debugQueueRef.current = []
@@ -498,7 +526,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
       setDebugSyncing(false)
       window.clearTimeout(drainTimerRef.current)
       drainTimerRef.current = 0
-      setDebugTotal(Number(result.total || result.legacy?.summary.total || 0))
+      setDebugTotal(previewTotal)
       if (result.session_id) {
         setDebugSessionId(result.session_id)
         push('调试会话已创建，正在轮询节点状态…', 'info')
@@ -510,7 +538,10 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         push('调试请求未返回 session_id', 'error')
       }
     },
-    onError: (error: Error) => push(error.message, 'error'),
+    onError: (error: Error) => {
+      setDebugError(error.message)
+      push(error.message, 'error')
+    },
   })
 
   const onNodesChange = useCallback((changes: NodeChange<AtomFlowNode>[]) => {
@@ -568,20 +599,25 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     if (event.button !== 0) return
     event.preventDefault()
     let lastX = event.clientX
+    let latestWidth = debugWidthRef.current
     setDebugResizing(true)
     const onMove = (moveEvent: PointerEvent) => {
-      const next = clampDebugWidth(debugWidthRef.current + (moveEvent.clientX - lastX))
+      latestWidth = clampDebugWidth(latestWidth + (moveEvent.clientX - lastX))
       lastX = moveEvent.clientX
-      setDebugWidth(next)
+      debugWidthRef.current = latestWidth
+      setDebugWidth(latestWidth)
     }
     const onUp = () => {
       setDebugResizing(false)
-      persistDebugWidth(debugWidthRef.current)
+      debugWidthRef.current = latestWidth
+      persistDebugWidth(latestWidth)
       window.removeEventListener('pointermove', onMove)
       window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
     }
     window.addEventListener('pointermove', onMove)
     window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
   }, [persistDebugWidth])
 
   useEffect(() => {
@@ -907,12 +943,16 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 role="separator"
                 aria-orientation="vertical"
                 aria-label="拖拽调整调试面板宽度"
+                aria-valuemin={240}
+                aria-valuemax={560}
+                aria-valuenow={debugWidth}
+                aria-valuetext={`${debugWidth}px`}
                 title="拖拽调整宽度，双击复位"
                 tabIndex={0}
                 onPointerDown={startDebugResize}
                 onKeyDown={(event) => {
-                  if (event.key === 'ArrowLeft') { event.preventDefault(); nudgeDebugWidth(-20) }
-                  if (event.key === 'ArrowRight') { event.preventDefault(); nudgeDebugWidth(20) }
+                  if (event.key === 'ArrowLeft') { event.preventDefault(); nudgeDebugWidth(-16) }
+                  if (event.key === 'ArrowRight') { event.preventDefault(); nudgeDebugWidth(16) }
                 }}
                 onDoubleClick={() => { setDebugWidth(320); persistDebugWidth(320) }}
               />
@@ -960,7 +1000,16 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   <option value="">选择节点</option>
                   {(workflow.graph?.nodes || []).map((node) => <option key={node.node_id} value={node.node_id}>{node.name || node.atom}</option>)}
                 </Select>
-                <Button size="sm" variant="primary" icon="play" loading={startDebug.isPending} onClick={() => startDebug.mutate()}>运行调试</Button>
+                <Button
+                  size="sm"
+                  variant="primary"
+                  icon="play"
+                  loading={startDebug.isPending}
+                  disabled={!debugNodeId}
+                  title={!debugNodeId ? '先在画布上选一个节点' : '运行调试'}
+                  onClick={() => startDebug.mutate()}
+                >运行调试</Button>
+                {!debugNodeId ? <span className="debug-hint">先在画布上选一个节点</span> : null}
               </div>
               {debugError ? (
                 <div className="debug-error-banner"><Icon name="warning" size={13} /><span>{debugError}</span></div>
