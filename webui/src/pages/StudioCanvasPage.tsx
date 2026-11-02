@@ -204,11 +204,12 @@ function savePositions(wid: string, nodes: Node<AtomNodeData>[]): void {
 }
 
 const DEBUG_WIDTH_KEY = 'panguverse.studio.debugWidth'
+const DEBUG_OPEN_KEY = 'panguverse.studio.debugOpen'
 
 function loadDebugWidth(): number {
   try {
     const value = Number(localStorage.getItem(DEBUG_WIDTH_KEY))
-    if (Number.isFinite(value) && value > 0) return Math.min(620, Math.max(260, Math.round(value)))
+    if (Number.isFinite(value) && value > 0) return Math.min(560, Math.max(240, Math.round(value)))
   } catch {
     /* local preference only */
   }
@@ -216,7 +217,7 @@ function loadDebugWidth(): number {
 }
 
 function clampDebugWidth(value: number): number {
-  return Math.min(620, Math.max(260, Math.round(value)))
+  return Math.min(560, Math.max(240, Math.round(value)))
 }
 
 export function StudioCanvasPage({ wid }: { wid: string }) {
@@ -246,7 +247,14 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [edgeVia, setEdgeVia] = useState('')
   const [replanOpen, setReplanOpen] = useState(false)
   const [instruction, setInstruction] = useState('补充一条响应耗时断言，并保持锁定节点不变。')
-  const [debugOpen, setDebugOpen] = useState(false)
+  const [debugOpen, setDebugOpen] = useState<boolean>(() => {
+    try {
+      if (window.matchMedia('(max-width: 1099px)').matches) return false
+      return localStorage.getItem(DEBUG_OPEN_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
   const [debugWidth, setDebugWidth] = useState<number>(loadDebugWidth)
   const [debugResizing, setDebugResizing] = useState(false)
   const [nodeRailCollapsed, setNodeRailCollapsed] = useState(false)
@@ -292,6 +300,22 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const selectedAtom = atoms.find((atom) => atom.name === (selectedNode?.atom || paramAtom)) || null
 
   useEffect(() => onStudioMockChange(setMock), [])
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(DEBUG_OPEN_KEY, debugOpen ? '1' : '0')
+    } catch {
+      /* local preference only */
+    }
+  }, [debugOpen])
+
+  useEffect(() => {
+    const query = window.matchMedia('(max-width: 1099px)')
+    const apply = () => { if (query.matches) setDebugOpen(false) }
+    apply()
+    query.addEventListener('change', apply)
+    return () => query.removeEventListener('change', apply)
+  }, [])
 
   useEffect(() => {
     if (!selectedNode) {
@@ -864,14 +888,13 @@ function StudioCanvasInner({ wid }: { wid: string }) {
       </div>
 
       <div
-        className={`studio-workspace ${debugOpen ? 'is-debug-open' : 'is-debug-closed'} ${debugResizing ? 'is-resizing' : ''} ${nodeRailCollapsed ? 'is-node-collapsed' : ''}`}
-        style={{ '--debug-width': `${debugWidth}px` } as CSSProperties}
+        className={`studio-workbench ${debugOpen ? 'is-debug-open' : 'is-debug-closed'} ${debugResizing ? 'is-resizing' : ''} ${nodeRailCollapsed ? 'is-node-collapsed' : ''}`}
+        style={{ '--debug-w': debugOpen ? `${debugWidth}px` : '44px', '--props-w': nodeRailCollapsed ? '38px' : '300px' } as CSSProperties}
         data-debug-width={debugWidth}
         data-debug-open={debugOpen ? 'true' : 'false'}
       >
         {debugOpen ? (
           <>
-            <div className="debug-backdrop" onClick={() => setDebugOpen(false)} aria-hidden="true" />
             <section
               className="debug-column"
               role="region"
@@ -893,7 +916,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 }}
                 onDoubleClick={() => { setDebugWidth(320); persistDebugWidth(320) }}
               />
-            <div className="debug-drawer" role="region" aria-label="调试抽屉">
+            <div className="debug-panel" role="region" aria-label="调试面板">
               <div className="debug-head">
                 <div className="debug-title">
                   <span className="debug-label"><span className={`debug-pulse ${debugPolling ? '' : 'is-idle'}`} /> 调试执行</span>
@@ -901,7 +924,6 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   {debugSessionId ? <Badge tone={debugPolling ? 'warn' : 'ok'}>{debugPolling ? '轮询中' : debugSession?.done ? '已完成' : '等待'}</Badge> : null}
                   {debugSession?.legacy ? <Badge tone="warn">同步旧接口</Badge> : null}
                   <span className="debug-sub">POST 202 · GET cursor 增量</span>
-                  <span className="debug-mobile-note">窄屏以抽屉覆盖画布，关闭后恢复编辑</span>
                 </div>
                 <div className="debug-head-actions">
                   <button
@@ -915,7 +937,17 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                     <Icon name={followDebug ? 'check' : 'play'} size={11} />
                     {followDebug ? '自动跟随' : '已暂停跟随'}
                   </button>
-                  <IconButton label="收起调试" icon="close" onClick={() => setDebugOpen(false)} />
+                  <button
+                    type="button"
+                    className="debug-collapse-btn"
+                    data-testid="debug-collapse"
+                    aria-label="收起调试"
+                    title="收起调试"
+                    onClick={() => setDebugOpen(false)}
+                  >
+                    <Icon name="chevron" size={12} style={{ transform: 'rotate(180deg)' }} />
+                    <span>收起调试</span>
+                  </button>
                 </div>
               </div>
               <div className="debug-controls">
