@@ -1,9 +1,9 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
-import { errorText, formatDuration, formatTime, relativeTime, shortId, statusLabel, classForStatus } from '../shared/utils'
-import type { Execution } from '../shared/types'
+import { errorText, formatDuration, formatTime, relativeTime, shortId, statusLabel, classForStatus, toMs } from '../shared/utils'
+import type { Batch, Execution } from '../shared/types'
 import { Icon } from '../components/Icon'
 import {
   Badge,
@@ -36,6 +36,10 @@ export function ExecutionsPage() {
   const [triggerOpen, setTriggerOpen] = useState(false)
   const [taskId, setTaskId] = useState('')
   const [watchedBatches, setWatchedBatches] = useState<string[]>([])
+  const [cancelBatchTarget, setCancelBatchTarget] = useState('')
+  const [cancelBatchError, setCancelBatchError] = useState('')
+  const [cancelRequestedAt, setCancelRequestedAt] = useState<Record<string, number>>({})
+  const [now, setNow] = useState(Date.now())
 
   const params = useMemo(() => {
     const next = new URLSearchParams({ offset: String(offset), limit: String(pageSize), status: statusFilter })
@@ -62,25 +66,38 @@ export function ExecutionsPage() {
       return data && ['queued', 'running', 'cancelling'].includes(data.status) ? 1500 : false
     },
   })
-  const batchWatchQuery = useQuery({
-    queryKey: ['execution-batch-watch', watchedBatches],
-    queryFn: () => Promise.all(watchedBatches.map((batchId) => api.batch(batchId))),
-    enabled: watchedBatches.length > 0,
+  const currentBatchIds = useMemo(() => Array.from(new Set(executionsQuery.data?.executions?.map((item) => item.batch_id).filter((id): id is string => !!id) || [])).sort(), [executionsQuery.data])
+  const allBatchIds = useMemo(() => Array.from(new Set([...currentBatchIds, ...watchedBatches])).sort(), [currentBatchIds, watchedBatches])
+  const batchQuery = useQuery({
+    queryKey: ['execution-batches', allBatchIds.join(',')],
+    queryFn: async () => {
+      const rows = await Promise.all(allBatchIds.map((batchId) => api.batch(batchId).catch(() => null)))
+      return rows.filter((batch): batch is Batch => !!batch)
+    },
+    enabled: allBatchIds.length > 0,
     refetchInterval: (query) => {
       const data = query.state.data
       if (!data) return 1000
-      return data.every((batch) => ['done', 'failed', 'cancelled'].includes(batch.status)) ? false : 1200
+      return data.some((batch) => ['queued', 'running', 'cancelling'].includes(batch.status)) ? 1200 : false
     },
   })
+  const batchById = useMemo(() => Object.fromEntries((batchQuery.data || []).map((batch) => [batch.batch_id, batch])), [batchQuery.data])
 
   useEffect(() => {
-    if (!watchedBatches.length || !batchWatchQuery.data) return
-    if (!batchWatchQuery.data.every((batch) => ['done', 'failed', 'cancelled'].includes(batch.status))) return
-    const summary = batchWatchQuery.data.map((batch) => `${batch.batch_id}:${batch.status}`).join(' · ')
+    const timer = window.setInterval(() => setNow(Date.now()), 1000)
+    return () => window.clearInterval(timer)
+  }, [])
+
+  useEffect(() => {
+    if (!watchedBatches.length || !batchQuery.data) return
+    const watched = watchedBatches.map((batchId) => batchById[batchId]).filter((batch): batch is Batch => !!batch)
+    if (watched.length !== watchedBatches.length) return
+    if (!watched.every((batch) => ['done', 'failed', 'cancelled'].includes(batch.status))) return
+    const summary = watched.map((batch) => `${batch.batch_id}:${batch.status}`).join(' · ')
     setWatchedBatches([])
     queryClient.invalidateQueries({ queryKey: ['executions'] })
     push(`批次已到终态（${summary}）。已完成 run 保留，未开始套件已标记 cancelled。`, 'ok')
-  }, [batchWatchQuery.data, watchedBatches.length, queryClient, push])
+  }, [batchQuery.data, batchById, watchedBatches, queryClient, push])
 
   const executions = executionsQuery.data?.executions || []
   const total = executionsQuery.data?.total || 0
@@ -109,7 +126,11 @@ export function ExecutionsPage() {
       queryClient.invalidateQueries({ queryKey: ['executions'] })
       queryClient.invalidateQueries({ queryKey: ['execution', execution.eid] })
       queryClient.invalidateQueries({ queryKey: ['execution', execution.run_id] })
-      if (result.batch_id) setWatchedBatches((current) => current.includes(result.batch_id!) ? current : [...current, result.batch_id!])
+      if (result.batch_id) {
+        const batchId = result.batch_id
+        setWatchedBatches((current) => current.includes(batchId) ? current : [...current, batchId])
+        setCancelRequestedAt((current) => ({ ...current, [batchId]: Date.now() }))
+      }
       const suiteText = result.cancelled_suites?.length ? `；未开始套件 ${result.cancelled_suites.length} 个已标记 cancelled` : ''
       push(`取消请求已提交（${statusLabel(result.status)}）。当前步骤结束后停止；已完成 run 保留${suiteText}。正在等待批处理终态…`, 'ok')
       if (statusFilter !== 'all') {
@@ -121,6 +142,30 @@ export function ExecutionsPage() {
     },
     onError: (error: Error) => {
       setCancelError(error.message)
+      push(error.message, 'error')
+    },
+  })
+
+  const cancelBatch = useMutation({
+    mutationFn: (batchId: string) => api.cancelExecution(batchId, '从执行中心取消整批'),
+    onSuccess: (result) => {
+      const batchId = result.batch_id || result.eid
+      setCancelBatchTarget('')
+      setCancelBatchError('')
+      setWatchedBatches((current) => current.includes(batchId) ? current : [...current, batchId])
+      setCancelRequestedAt((current) => ({ ...current, [batchId]: Date.now() }))
+      queryClient.invalidateQueries({ queryKey: ['executions'] })
+      const suiteText = result.cancelled_suites?.length ? `；未开始套件 ${result.cancelled_suites.length} 个已标记 cancelled` : ''
+      push(`批次取消请求已提交（${statusLabel(result.status)}）。已完成 run 保留${suiteText}；正在等待批处理终态…`, 'ok')
+      if (statusFilter !== 'all') {
+        const next = new URLSearchParams(route.query)
+        next.delete('status')
+        next.delete('page')
+        navigate(withQuery('/executions', next), { replace: true })
+      }
+    },
+    onError: (error: Error) => {
+      setCancelBatchError(error.message)
       push(error.message, 'error')
     },
   })
@@ -140,6 +185,18 @@ export function ExecutionsPage() {
     setCancelError('')
     setCancelTarget(execution)
   }
+
+  const batchGroups = useMemo(() => {
+    const groups = new Map<string, Execution[]>()
+    const ungrouped: Execution[] = []
+    executions.forEach((execution) => {
+      if (!execution.batch_id) { ungrouped.push(execution); return }
+      const list = groups.get(execution.batch_id) || []
+      list.push(execution)
+      groups.set(execution.batch_id, list)
+    })
+    return { groups: [...groups.entries()].map(([batchId, rows]) => ({ batchId, rows, batch: batchById[batchId] })), ungrouped }
+  }, [executions, batchById])
 
   return (
     <div className="page executions-page">
@@ -203,7 +260,20 @@ export function ExecutionsPage() {
                 <tr><th>状态</th><th>执行 / 触发</th><th>项目 / 套件</th><th>结果</th><th>耗时</th><th>开始时间</th><th className="execution-actions-col">操作</th></tr>
               </thead>
               <tbody>
-                {executions.map((execution) => <ExecutionRow key={`${execution.eid}-${execution.job_id}`} execution={execution} onOpen={() => navigate(withQuery('/executions', { eid: execution.eid || execution.run_id || execution.job_id }), { replace: true })} onCancel={() => requestCancel(execution)} />)}
+                {batchGroups.groups.map((group) => (
+                  <Fragment key={group.batchId}>
+                    <BatchSummaryRow
+                      batchId={group.batchId}
+                      rows={group.rows}
+                      batch={group.batch}
+                      now={now}
+                      cancelRequestedAt={cancelRequestedAt[group.batchId]}
+                      onCancel={() => { setCancelBatchError(''); setCancelBatchTarget(group.batchId) }}
+                    />
+                    {group.rows.map((execution) => <ExecutionRow key={`${execution.eid}-${execution.job_id}`} execution={execution} onOpen={() => navigate(withQuery('/executions', { eid: execution.eid || execution.run_id || execution.job_id }), { replace: true })} onCancel={() => requestCancel(execution)} />)}
+                  </Fragment>
+                ))}
+                {batchGroups.ungrouped.map((execution) => <ExecutionRow key={`${execution.eid}-${execution.job_id}`} execution={execution} onOpen={() => navigate(withQuery('/executions', { eid: execution.eid || execution.run_id || execution.job_id }), { replace: true })} onCancel={() => requestCancel(execution)} />)}
               </tbody>
             </table>
           </div>
@@ -286,6 +356,28 @@ export function ExecutionsPage() {
       </Modal>
 
       <Modal
+        open={!!cancelBatchTarget}
+        onClose={() => { if (!cancelBatch.isPending) { setCancelBatchTarget(''); setCancelBatchError('') } }}
+        title="取消整个批次？"
+        subtitle={cancelBatchTarget ? `batch ${cancelBatchTarget}` : ''}
+        size="sm"
+        dismissible={!cancelBatch.isPending}
+        footer={
+          <>
+            <Button variant="ghost" disabled={cancelBatch.isPending} onClick={() => { setCancelBatchTarget(''); setCancelBatchError('') }}>保留批次</Button>
+            <Button variant="danger" icon="close" loading={cancelBatch.isPending} onClick={() => cancelBatch.mutate(cancelBatchTarget)} data-testid="confirm-cancel-batch">确认取消整批</Button>
+          </>
+        }
+      >
+        <div className="confirm-body">
+          <p><strong>当前步骤结束后停止</strong>，正在执行的套件按协作式取消；不会强制 kill 原子。</p>
+          <p style={{ marginTop: 8 }}><b>已完成 run 保留</b>；<b>未开始的套件标记 cancelled</b>，不会产生新 run。</p>
+          <p style={{ marginTop: 8 }}>批次取消后会自动轮询到 batch 终态，批次行会显示最终结果。</p>
+          {cancelBatchError ? <div className="step-error" style={{ marginTop: 10 }}><Icon name="warning" size={14} />{cancelBatchError}</div> : null}
+        </div>
+      </Modal>
+
+      <Modal
         open={triggerOpen}
         onClose={() => setTriggerOpen(false)}
         title="发起执行"
@@ -303,6 +395,47 @@ export function ExecutionsPage() {
         <p className="muted">没有任务？先到 <a className="inline-link" href={href('/tasks')}>任务页</a> 新建，或从工作台发布。</p>
       </Modal>
     </div>
+  )
+}
+
+function BatchSummaryRow({ batchId, rows, batch, now, cancelRequestedAt, onCancel }: { batchId: string; rows: Execution[]; batch?: Batch; now: number; cancelRequestedAt?: number; onCancel: () => void }) {
+  const active = batch ? ['queued', 'running', 'cancelling'].includes(batch.status) : rows.some((row) => ['queued', 'running', 'cancelling'].includes(row.status))
+  const suiteCount = batch?.suites.length ?? rows.length
+  const passed = batch?.aggregate?.passed ?? rows.reduce((sum, row) => sum + (row.passed || 0), 0)
+  const total = batch?.aggregate?.total ?? rows.reduce((sum, row) => sum + (row.total || 0), 0)
+  const currentSuite = batch?.suites.find((suite) => suite.status === 'running') || batch?.suites.find((suite) => suite.status === 'queued')
+  const currentExecution = rows.find((row) => row.status === 'running' && (!currentSuite || row.suite_id === currentSuite.suite_id)) || rows.find((row) => row.status === 'running')
+  const phase = currentExecution?.status === 'running' ? { name: 'execute' } : currentExecution?.phases?.slice(-1)[0]
+  const firstStarted = rows.map((row) => toMs(row.started_at || row.created_at)).filter((value) => value > 0).sort((a, b) => a - b)[0]
+  const waitFrom = cancelRequestedAt || firstStarted || now
+  const waited = Math.max(0, Math.floor((now - waitFrom) / 1000))
+  const status = batch?.status || (rows.some((row) => ['queued', 'running', 'cancelling'].includes(row.status)) ? 'running' : rows.every((row) => row.status === 'cancelled') ? 'cancelled' : 'done')
+  const cancelledCount = batch?.suites.filter((suite) => suite.status === 'cancelled').length ?? rows.filter((row) => row.status === 'cancelled').length
+  const doneCount = batch?.suites.filter((suite) => suite.status === 'done').length ?? rows.filter((row) => row.status === 'done').length
+  const failedCount = batch?.suites.filter((suite) => suite.status === 'failed').length ?? rows.filter((row) => row.status === 'failed').length
+  return (
+    <tr className={`batch-summary-row ${active ? 'is-active' : 'is-terminal'}`} data-testid={`batch-row-${batchId}`} data-batch-id={batchId}>
+      <td colSpan={7}>
+        <div className="batch-summary-cell">
+          <div className="batch-summary-main">
+            <span className="batch-icon"><Icon name="layers" size={15} /></span>
+            <div>
+              <div className="batch-title-line"><strong className="mono">batch {batchId}</strong><StatusBadge status={status} /><Badge tone="neutral">套件 {suiteCount}</Badge><Badge tone="neutral">用例 {passed}/{total}</Badge></div>
+              <span className="batch-current">{active ? (
+                currentSuite ? <>当前：<b>{currentSuite.name}</b>{phase ? <> · 阶段 <b>{phase.name}</b></> : null} · 等待当前步骤结束后停止{currentExecution?.error ? ` · ${errorText(currentExecution.error)}` : ''}</> : '等待批次启动…'
+              ) : (
+                <>
+                  {status === 'cancelled' ? `已取消：完成 ${doneCount} / 已取消 ${cancelledCount}${failedCount ? ` / 失败 ${failedCount}` : ''}` : status === 'failed' ? `批次失败：完成 ${doneCount} / 失败 ${failedCount}` : `批次完成：通过 ${doneCount} / 共 ${suiteCount} 个套件`}
+                  {' · '}已完成的 run 保留
+                </>
+              )}</span>
+            </div>
+          </div>
+          <div className="batch-wait">{active ? <><span className="batch-pulse" />{cancelRequestedAt ? '已等待' : '已运行'} {waited}s</> : <span className="batch-final">{status === 'cancelled' ? 'cancelled' : status === 'failed' ? 'failed' : 'done'}</span>}</div>
+          {active && !cancelRequestedAt ? <Button size="sm" variant="danger" icon="close" onClick={onCancel} data-testid={`cancel-batch-${batchId}`}>取消批次</Button> : active ? <Badge tone="warn">取消中 · 等待步骤边界</Badge> : null}
+        </div>
+      </td>
+    </tr>
   )
 }
 

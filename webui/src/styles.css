@@ -1555,3 +1555,26 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 
 .report-detail-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; padding: 8px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
 .report-detail-actions > span { margin-left: auto; color: var(--dim); font-size: 8.5px; }
+
+/* Batch-level execution summary */
+.batch-summary-row td { padding: 7px 10px !important; background: rgba(94,234,212,.025); border-top: 1px solid rgba(94,234,212,.12); border-bottom: 1px solid rgba(94,234,212,.08); }
+.batch-summary-row.is-terminal td { background: rgba(151,174,212,.025); border-top-color: var(--line-strong); }
+.batch-summary-cell { display: flex; align-items: center; gap: 10px; min-height: 34px; }
+.batch-summary-main { display: flex; align-items: center; gap: 8px; min-width: 0; flex: 1; }
+.batch-icon { width: 26px; height: 26px; border-radius: 7px; display: grid; place-items: center; color: var(--cyan); background: rgba(94,234,212,.08); flex: 0 0 auto; }
+.batch-summary-main > div { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.batch-title-line { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+.batch-title-line strong { font-size: 9px; color: #a8ded7; }
+.batch-title-line .badge { font-size: 7.5px; padding: 1px 5px; }
+.batch-current { color: var(--dim); font-size: 8.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 780px; }
+.batch-current b { color: var(--text-soft); font-weight: 500; }
+.batch-wait { color: var(--dim); font-size: 8.5px; white-space: nowrap; display: flex; align-items: center; gap: 5px; margin-left: auto; padding: 0 5px; }
+.batch-pulse { width: 5px; height: 5px; border-radius: 50%; background: var(--amber); animation: pulse 1.5s ease infinite; }
+.batch-final { font-family: var(--mono); font-size: 8px; color: var(--muted); }
+.batch-summary-cell > .btn { flex: 0 0 auto; }
+@media (max-width: 900px) {
+  .batch-summary-cell { flex-wrap: wrap; align-items: flex-start; }
+  .batch-wait { margin-left: 0; padding: 0 0 0 34px; }
+  .batch-current { white-space: normal; max-width: calc(100vw - 100px); }
+  .batch-summary-cell > .btn { margin-left: 34px; }
+}

@@ -191,6 +191,8 @@ export function classForStatus(status: string): string {
     error: 'bad',
     errored: 'bad',
     running: 'run',
+    cancelling: 'warn',
+    cancelled: 'bad',
     queued: 'dim',
     pending: 'dim',
     skipped: 'dim',
@@ -222,6 +224,7 @@ export function statusLabel(status: string | undefined): string {
     published: '已发布',
     deprecated: '已归档',
     cancelled: '已取消',
+    cancelling: '取消中',
   }
   return map[status || 'none'] || status || '未知'
 }
