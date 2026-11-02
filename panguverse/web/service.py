@@ -44,7 +44,7 @@ REPO_ROOT = WEB_DIR.parents[1]
 BUILTIN_SCENARIOS = REPO_ROOT / "scenarios"
 
 LLM_ENV_KEYS = ("PANGUVERSE_API_KEY", "OPENAI_API_KEY")
-VALID_MODES = ("demo", "scenario", "intent", "regression")
+VALID_MODES = ("demo", "scenario", "intent", "regression", "workflow")
 
 STATUS_BY_CODE = {
     "bad_request": 400,
@@ -356,6 +356,7 @@ class RunRequest:
     mode: str
     scenario: str = ""
     intent: str = ""
+    workflow_ref: str = ""
     env: dict[str, Any] = field(default_factory=dict)
     #: None 表示请求里没给，按模式取默认（demo 默认 True，其余默认 False）
     regression: bool | None = None
@@ -396,6 +397,10 @@ def parse_run_request(payload: Any) -> RunRequest:
         raise ApiError("bad_request", "mode=scenario 时必须提供 scenario")
     if mode == "intent" and not intent_text:
         raise ApiError("bad_request", "mode=intent 时必须提供非空 intent")
+    workflow_raw = payload.get("workflow_ref")
+    workflow_ref = workflow_raw.strip() if isinstance(workflow_raw, str) else ""
+    if mode == "workflow" and not workflow_ref:
+        raise ApiError("bad_request", "mode=workflow 时必须提供 workflow_ref")
     regression: bool | None = None
     if "regression" in payload:
         regression = bool(payload.get("regression"))
@@ -403,6 +408,7 @@ def parse_run_request(payload: Any) -> RunRequest:
         mode=mode,
         scenario=scenario_text,
         intent=intent_text,
+        workflow_ref=workflow_ref,
         env=_coerce_env(payload.get("env")),
         regression=regression,
         no_llm=bool(payload.get("no_llm", False)),
@@ -424,6 +430,8 @@ def submit_run(
         return jobs.submit("scenario", _scenario_task(root, request, suite), on_finish=on_finish)
     if request.mode == "intent":
         return jobs.submit("intent", _intent_task(root, request), on_finish=on_finish)
+    if request.mode == "workflow":
+        return jobs.submit("workflow", _workflow_task(root, request), on_finish=on_finish)
     return jobs.submit("regression", _regression_task(root, request), on_finish=on_finish)
 
 
@@ -571,6 +579,50 @@ def _intent_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, A
     return task
 
 
+def _workflow_task(
+    root: Path,
+    request: RunRequest,
+    *,
+    attribution: dict[str, str] | None = None,
+) -> Callable[[Job], dict[str, Any]]:
+    """运行已发布的工作流（``<wid>@<rev>``）；只读版本，不再规划/不让 AI 改写。"""
+
+    def task(job: Job) -> dict[str, Any]:
+        from . import studio  # 局部导入：避免模块级循环
+
+        published = studio.load_published(root, request.workflow_ref)
+        plan = studio.plan_from_revision(published)
+        baseline = load_last_env(root)
+        request_env = dict(request.env)
+        axe = build_axe(root, enable_llm=False)
+        trigger = "manual" if attribution is None else "task"
+        return _execute(
+            axe,
+            job,
+            plan=plan,
+            root=root,
+            request_env=request_env,
+            baseline=baseline,
+            evolve=False,
+            regression=bool(request.regression),
+            title="PanguVerse 工作流运行报告",
+            run_config={
+                "mode": "workflow",
+                "scenario": "",
+                "intent": plan.intent,
+                "workflow_ref": request.workflow_ref,
+                "regression": bool(request.regression),
+                "no_llm": True,
+                "uses_mock": False,
+                "trigger": trigger,
+            },
+            attribution=attribution,
+            extra_meta={"workflow_ref": request.workflow_ref},
+        )
+
+    return task
+
+
 def _regression_task(root: Path, request: RunRequest) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
         baseline = load_last_env(root)
@@ -654,6 +706,7 @@ def _execute(
     title: str,
     run_config: dict[str, Any] | None = None,
     attribution: dict[str, str] | None = None,
+    extra_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     job.add_phase("plan", "ok", f"{plan.size} 个用例来自 {plan.source}")
     if not plan.cases:
@@ -694,6 +747,9 @@ def _execute(
         value = (attribution or {}).get(key)
         if isinstance(value, str) and value:
             meta[key] = value
+    for key, value in (extra_meta or {}).items():
+        if isinstance(key, str) and key and value not in (None, ""):
+            meta[key] = value
     run = axe.executor.run(
         plan,
         env=effective_env,
@@ -723,6 +779,15 @@ def _execute(
     )
     artifacts["plan"] = str(plan_path)
     job.add_phase("report", "ok", f"产物目录 {out_dir}")
+    _write_execution_record(
+        root,
+        run_id,
+        job=job,
+        summary=summary,
+        run_config=run_config,
+        attribution=attribution,
+        extra_meta=extra_meta,
+    )
 
     # 全部用例 errored（目标不可达等基础设施问题）不算「测试没通过」：判 failed 并给首个原因
     if summary["passed"] == 0 and summary["errored"] == summary["total"]:
@@ -779,6 +844,59 @@ def _execute(
         "summary": _job_summary(run),
         "conclusion": _job_conclusion(run),
     }
+
+
+def _write_execution_record(
+    root: Path,
+    run_id: str,
+    *,
+    job: Job,
+    summary: dict[str, Any],
+    run_config: dict[str, Any] | None,
+    attribution: dict[str, str] | None,
+    extra_meta: dict[str, Any] | None,
+) -> None:
+    """把执行元信息落到 ``.panguverse/executions/<run_id>/execution.json``。
+
+    目录 ``0700``、文件 ``0600``、原子写；这是**旁路**记录，写失败不影响运行结果。
+    """
+    try:
+        directory = root / ".panguverse" / "executions" / run_id
+        directory.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            directory.chmod(0o700)
+        config = run_config or {}
+        payload = {
+            "execution_id": run_id,
+            "run_id": run_id,
+            "job_id": job.job_id,
+            "trigger": str(config.get("trigger") or "task"),
+            "mode": str(config.get("mode") or ""),
+            "status": "ok" if summary.get("success") else "failed",
+            "summary": summary,
+            "project_id": (attribution or {}).get("project_id"),
+            "suite_id": (attribution or {}).get("suite_id"),
+            "workflow_ref": (extra_meta or {}).get("workflow_ref")
+            or config.get("workflow_ref"),
+            "created_at": time.time(),
+        }
+        path = directory / "execution.json"
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(directory), prefix=".execution.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, path)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp_name)
+            raise
+    except OSError:
+        return
 
 
 def _first_error_message(run: RunResult) -> str:
@@ -1041,7 +1159,8 @@ def _clean_name(value: Any) -> str:
 def _clean_mode(value: Any) -> str:
     if not isinstance(value, str) or value not in VALID_MODES:
         raise ApiError(
-            "bad_request", f"mode 非法: {value!r}（可选 demo/scenario/intent/regression）"
+            "bad_request",
+            f"mode 非法: {value!r}（可选 demo/scenario/intent/regression/workflow）",
         )
     return value
 
@@ -1054,13 +1173,23 @@ def _clean_text(value: Any, *, field: str) -> str:
     return value.strip()
 
 
-def _validate_task_target(root: Path, mode: str, scenario: str, intent: str) -> None:
+def _validate_task_target(
+    root: Path,
+    mode: str,
+    scenario: str,
+    intent: str,
+    workflow_ref: str = "",
+) -> None:
     if mode == "scenario":
         if not scenario:
             raise ApiError("bad_request", "mode=scenario 时必须提供 scenario")
         resolve_scenario(root, scenario)  # realpath 前缀校验：越界/不存在一律 400
     if mode == "intent" and not intent:
         raise ApiError("bad_request", "mode=intent 时必须提供非空 intent")
+    if mode == "workflow":
+        if not workflow_ref:
+            raise ApiError("bad_request", "mode=workflow 时必须提供 workflow_ref")
+        _clean_workflow_ref(root, workflow_ref)
 
 
 def _merge_task_env(current: dict[str, Any], patch: Any) -> dict[str, Any]:
@@ -1095,7 +1224,7 @@ def task_summary(task: dict[str, Any]) -> dict[str, Any]:
     """列表摘要：**只暴露 env 键名**，不返回任何值。"""
     env = task.get("env")
     keys = sorted(str(key) for key in env) if isinstance(env, dict) else []
-    return {
+    summary = {
         "task_id": task.get("task_id", ""),
         "name": task.get("name", ""),
         "mode": task.get("mode", ""),
@@ -1106,6 +1235,9 @@ def task_summary(task: dict[str, Any]) -> dict[str, Any]:
         "last_status": task.get("last_status", ""),
         "env_keys": keys,
     }
+    if task.get("workflow_ref"):
+        summary["workflow_ref"] = task["workflow_ref"]
+    return summary
 
 
 def list_tasks(root: Path) -> list[dict[str, Any]]:
@@ -1122,8 +1254,9 @@ def create_task(root: Path, payload: Any) -> dict[str, Any]:
     mode = _clean_mode(data.get("mode"))
     scenario = _clean_text(data.get("scenario"), field="scenario")
     intent = _clean_text(data.get("intent"), field="intent")
+    workflow_ref = _clean_text(data.get("workflow_ref"), field="workflow_ref")
     env = _coerce_env(data.get("env"))
-    _validate_task_target(root, mode, scenario, intent)
+    _validate_task_target(root, mode, scenario, intent, workflow_ref)
     now = time.time()
     task = {
         "task_id": tasks_store.new_task_id(),
@@ -1139,6 +1272,8 @@ def create_task(root: Path, payload: Any) -> dict[str, Any]:
         "last_run_id": "",
         "last_status": "",
     }
+    if workflow_ref:
+        task["workflow_ref"] = workflow_ref
     return tasks_store.write_task(root, task)
 
 
@@ -1154,6 +1289,12 @@ def update_task(root: Path, task_id: str, payload: Any) -> dict[str, Any]:
         updated["scenario"] = _clean_text(data.get("scenario"), field="scenario")
     if "intent" in data:
         updated["intent"] = _clean_text(data.get("intent"), field="intent")
+    if "workflow_ref" in data:
+        workflow_ref = _clean_text(data.get("workflow_ref"), field="workflow_ref")
+        if workflow_ref:
+            updated["workflow_ref"] = workflow_ref
+        else:
+            updated.pop("workflow_ref", None)
     if "env" in data:
         updated["env"] = _merge_task_env(
             task.get("env") if isinstance(task.get("env"), dict) else {},
@@ -1168,6 +1309,7 @@ def update_task(root: Path, task_id: str, payload: Any) -> dict[str, Any]:
         str(updated.get("mode") or ""),
         str(updated.get("scenario") or ""),
         str(updated.get("intent") or ""),
+        str(updated.get("workflow_ref") or ""),
     )
     updated["updated_at"] = time.time()
     return tasks_store.write_task(root, updated)
@@ -1206,6 +1348,7 @@ def _task_run_payload(task: dict[str, Any], overrides: dict[str, Any]) -> dict[s
         "mode": task.get("mode") or "",
         "scenario": task.get("scenario") or "",
         "intent": task.get("intent") or "",
+        "workflow_ref": task.get("workflow_ref") or "",
         "env": env,
         "regression": bool(task.get("regression", False)),
         "no_llm": bool(task.get("no_llm", False)),
@@ -1323,6 +1466,11 @@ def _run_config_core(root: Path, run_id: str) -> tuple[dict[str, Any], dict[str,
         mode = "regression" if plan_source == "memory" else "scenario"
     scenario = config.get("scenario") if isinstance(config.get("scenario"), str) else ""
     intent = config.get("intent") if isinstance(config.get("intent"), str) else ""
+    workflow_ref = (
+        config.get("workflow_ref") if isinstance(config.get("workflow_ref"), str) else ""
+    )
+    if not workflow_ref and isinstance(meta.get("workflow_ref"), str):
+        workflow_ref = meta["workflow_ref"]
     if not intent and mode == "intent":
         intent = str(plan.get("intent") or "")
 
@@ -1336,6 +1484,8 @@ def _run_config_core(root: Path, run_id: str) -> tuple[dict[str, Any], dict[str,
         "plan_source": plan_source,
         "error": _first_failure(report),
     }
+    if workflow_ref:
+        resolved["workflow_ref"] = workflow_ref
     return resolved, meta
 
 
@@ -1363,6 +1513,7 @@ def rerun(jobs: JobManager, root: Path, run_id: str, payload: Any = None) -> Job
         "mode": mode,
         "scenario": config["scenario"],
         "intent": config["intent"],
+        "workflow_ref": config.get("workflow_ref", ""),
         "env": env,
         "regression": config["regression"],
         "no_llm": config["no_llm"],
@@ -1464,6 +1615,20 @@ def _clean_suite_scenario(root: Path, value: Any) -> str:
     return scenario
 
 
+def _clean_workflow_ref(root: Path, value: Any) -> str:
+    """套件绑定已发布流程：``<wid>@<rev>``，并确认发布记录存在（只读发布版本）。"""
+    ref = _clean_text(value, field="workflow_ref")
+    if not ref:
+        return ""
+    from . import studio
+
+    try:
+        studio.load_published(root, ref)
+    except studio.StudioError as exc:
+        raise ApiError("bad_request", f"workflow_ref 不可用: {exc.message}") from exc
+    return ref
+
+
 def _find_suite(project: dict[str, Any], suite_id: str) -> dict[str, Any]:
     projects.validate_suite_id(suite_id)
     for suite in project.get("suites") or []:
@@ -1511,10 +1676,16 @@ def delete_project(root: Path, project_id: str) -> None:
 
 def add_suite(root: Path, project_id: str, payload: Any) -> dict[str, Any]:
     data = _as_body(payload)
+    scenario_raw = _clean_text(data.get("scenario"), field="scenario")
+    workflow_ref = _clean_workflow_ref(root, data.get("workflow_ref"))
+    if bool(scenario_raw) == bool(workflow_ref):
+        raise ApiError("bad_request", "scenario 与 workflow_ref 必须且只能提供一个")
+    scenario = _clean_suite_scenario(root, scenario_raw) if scenario_raw else ""
     suite = {
         "suite_id": projects.new_suite_id(),
         "name": _clean_name(data.get("name")),
-        "scenario": _clean_suite_scenario(root, data.get("scenario")),
+        "scenario": scenario,
+        "workflow_ref": workflow_ref,
         "env": _coerce_env(data.get("env")),
         "tags": _clean_tags(data.get("tags")),
     }
@@ -1537,7 +1708,18 @@ def update_suite(
         if "name" in data:
             suite["name"] = _clean_name(data.get("name"))
         if "scenario" in data:
-            suite["scenario"] = _clean_suite_scenario(root, data.get("scenario"))
+            suite["scenario"] = _clean_text(data.get("scenario"), field="scenario")
+        if "workflow_ref" in data:
+            suite["workflow_ref"] = _clean_text(data.get("workflow_ref"), field="workflow_ref")
+        if "scenario" in data or "workflow_ref" in data:
+            scenario = str(suite.get("scenario") or "")
+            workflow_ref = str(suite.get("workflow_ref") or "")
+            if bool(scenario) == bool(workflow_ref):
+                raise ApiError("bad_request", "scenario 与 workflow_ref 必须且只能提供一个")
+            if scenario:
+                suite["scenario"] = _clean_suite_scenario(root, scenario)
+            if workflow_ref:
+                suite["workflow_ref"] = _clean_workflow_ref(root, workflow_ref)
         if "env" in data:
             current = suite.get("env") if isinstance(suite.get("env"), dict) else {}
             suite["env"] = _merge_task_env(current, data.get("env"))
@@ -1855,19 +2037,27 @@ def start_project_batch(
         suite_id = projects.validate_suite_id(suite.get("suite_id"))
         suite_name = str(suite.get("name") or "")
         scenario = str(suite.get("scenario") or "")
+        workflow_ref = str(suite.get("workflow_ref") or "")
         attribution = {"project_id": project_id, "suite_id": suite_id}
-        request = RunRequest(
-            mode="scenario",
-            scenario=scenario,
-            env=_merged_suite_env(root, project, suite, overrides),
-        )
-        job = jobs.create("scenario")
+        env = _merged_suite_env(root, project, suite, overrides)
+        if workflow_ref:
+            request = RunRequest(
+                mode="workflow",
+                workflow_ref=workflow_ref,
+                env=env,
+            )
+            job = jobs.create("workflow")
+            task = _workflow_task(root, request, attribution=attribution)
+        else:
+            request = RunRequest(mode="scenario", scenario=scenario, env=env)
+            job = jobs.create("scenario")
+            task = _suite_run_task(root, request, attribution)
         items.append(
             {
                 "suite_id": suite_id,
                 "name": suite_name,
                 "job": job,
-                "task": _suite_run_task(root, request, attribution),
+                "task": task,
             }
         )
 

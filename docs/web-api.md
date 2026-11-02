@@ -449,3 +449,117 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 - 回归库/经验库/`last_env.json` 是工作区文件，多个 job 并发写入时以「最后写入」为准（单用户场景可接受）。
 - env 基线只在「成功运行」后更新；一次失败的运行不会污染下一次的默认目标。
 - `axe/llm.py` 的 LLM 请求回环地址（本机 ollama）已走 `ProxyHandler({})` 直连，与 `http/client.py` 规则一致；非回环地址仍尊重系统/环境代理。
+
+## 7. 工作台（Studio，契约 `tasks/workbench-mvp-spec.md` v5.0）
+
+工作台把 planner 的线性计划转成图，并提供「草案 → 人工裁决 → 隔离调试 → 审阅发布 → 绑定项目运行」的后端能力。
+实现：`panguverse/web/graph.py`（纯函数）、`panguverse/web/studio.py`（落盘/审计/调试）。
+
+### 7.1 落盘
+
+```
+<ws>/.panguverse/studio/<wid>/workflow.json           # 指针：state/current_rev/locked/published_ref
+<ws>/.panguverse/studio/<wid>/revisions/<rev>.json    # 不可变：nodes/edges/env_schema/message/created_by
+<ws>/.panguverse/studio/<wid>/audit.jsonl             # append-only：state/publish/diff/revision/debug
+<ws>/.panguverse/studio/<wid>/proposals/<rev>.json    # replan 提案（未应用）
+<ws>/.panguverse/studio/<wid>/debug/<id>.json         # 调试快照（不进 runs）
+<ws>/.panguverse/studio/<wid>/ui.json                 # 画布坐标（不产生新 rev）
+<ws>/.panguverse/studio/<wid>/published/<rev>.json    # 发布记录（只写一次）
+<ws>/.panguverse/executions/<run_id>/execution.json   # trigger=task|studio|debug|manual
+```
+
+目录 `0700`、文件 `0600`，均原子写（临时文件 + `os.replace`）。版本文件与发布记录**只写一次**；
+除 `workflow.json` 指针外，任何接口都不修改既有版本。
+
+### 7.2 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/studio/drafts` | `{intent, domain_pack?, exclude_atoms?}` → 201 `{wid, rev:0, state, graph, validation}` |
+| GET | `/api/studio/drafts` | `?status=&domain_pack=` → `{drafts:[...]}` |
+| GET | `/api/studio/{wid}` | `?rev=` 取图 + 元信息 + `ui` |
+| PATCH | `/api/studio/{wid}/nodes/{nid}` | 改参数/改名/锁定/替换原子/`case_id` → 新 rev（`origin=human`） |
+| POST | `/api/studio/{wid}/nodes` | `{atom, params?, ..., after?}` → 新 rev（201） |
+| DELETE | `/api/studio/{wid}/nodes/{nid}` | 删除节点与相关边 → 新 rev |
+| POST | `/api/studio/{wid}/edges` | `{from,to,via?,kind?}` → 新 rev（201） |
+| POST | `/api/studio/{wid}/replan` | `{instruction}` → `{diff, proposed_rev}`；不自动应用 |
+| POST | `/api/studio/{wid}/apply-diff` | `{proposed_rev, accepted:[change_id]}` → 新 rev |
+| POST | `/api/studio/{wid}/validate` | `{rev?}` → `{errors,warnings,risks,affected_nodes}` |
+| POST | `/api/studio/{wid}/debug` | `{rev?, node_id, mode, project_id?, env?}` → `{trace,variables}` |
+| POST | `/api/studio/{wid}/review` | `{base_rev?, rev}` → `{diff, risks, validation, audit_tail}` |
+| POST | `/api/studio/{wid}/state` | `{to:"review|approved|rejected", note?, risk_ack?, confirmed_risks?}` |
+| POST | `/api/studio/{wid}/publish` | `{rev, message}` → `{workflow_ref:"<wid>@<rev>"}` |
+
+节点坐标：`PATCH .../nodes/{nid}` 只带 `{"ui":{"x":..,"y":..}}` 时只更新 `ui.json`，**不产生新 rev**。
+其它字段变更一律产生新 rev，并把 `state` 重置为 `draft`（旧批准失效）。
+
+### 7.3 图语义（不伪造依赖）
+
+- 节点字段：`{id, atom, name, params, capture, when, foreach, as, retry, ..., case_id, origin, locked}`。
+- **数据边**：扫描节点 `params/when/foreach/extra` 里的 `${var}`，以及 `capture` 键；只有能追到**前面**步骤
+  （步骤 id 或 capture 名）时才建 `kind:"data"`、`via:"<变量根名>"` 的边。
+- **顺序边**：相邻节点没有直接数据边时补 `kind:"order"`，固定 `order_only:true`、`via:null`。
+- 引用了找不到生产者的变量 → **不建边**，由 `validate` 报 P101；绝不把未知变量伪装成数据依赖。
+- `POST /edges` 若声明 `kind:"data"`，`via` 必须是 `from` 节点产出的变量，否则 400。
+
+### 7.4 锁定 / 提案 / diff
+
+- `locked=true` 的节点：`replan` 与 `apply-diff` 一律不得修改。
+- `replan` 先逐节点比对签名（`atom/name/params/capture/when/foreach/extra/...`），
+  锁定节点被删除或签名变化 → **409**，错误体额外带 `locked_nodes:["..."]`；不落提案。
+- `apply-diff` 只应用 `accepted` 里的 `change_id`；接受删节点但拒绝删边时，悬空边会被丢弃并在
+  `dropped_edges` 中列出。提案 `base_rev` 与当前 rev 不一致 → 409「提案已过期」。
+- 每个变更都有稳定 id：`node:<id>:added|changed|removed`、`edge:<id>:added|removed`。
+
+### 7.5 发布门禁
+
+- `state` 迁移只接受 `review|approved|rejected`。
+- `to:"approved"` 时若存在风险（`mutate/destructive` 副作用、密钥读写）：必须带 `risk_ack:true`，
+  或用 `confirmed_risks` 覆盖全部 `risk.id`，否则 **409 `risk_unconfirmed`** 并返回 `risks[]`。
+- `publish`：必须 `state=approved`、`rev=current_rev`、`message` 非空；否则 409/400。
+- 发布生成 `workflow_ref="<wid>@<rev>"`，写 `published/<rev>.json`；旧版本文件永不回溯修改。
+  同一 rev 重复发布幂等返回原记录（`reused:true`）。
+
+### 7.6 调试隔离与环境限制
+
+- 每次调试使用独立 `RunContext`（独立 run_id），结果只写 `studio/<wid>/debug/`，**不写** `runs/`，
+  因此 `GET /api/runs` 与 `/api/runs/query` 永远看不到调试记录。
+- `mode`：`only`（单节点）、`from_start`（从头到该节点）、`downstream`（从该节点到末尾）。
+- 环境只能来自：工作区 `last_env` 基线，或 `project_id` 对应项目的 `env`（项目 env 优先）。
+- 请求体若出现 `base_url` / `url` / `target` / `endpoint` 等 URL 类字段，或 `env` 里出现 URL 类键
+  （`BASE_URL`、`*_URL`、`HOST`…）→ **400**；`env` 里给出基线不存在的键、或值与基线不同，同样 400。
+- `trace[]` 含每步 `inputs/outputs/duration_ms/status/error`；`variables` 为 `{vars:{name:{value,source,from_snapshot}}, env:{...}}`。
+  inputs/outputs 先按执行期 `secret_values` 与敏感键名打码，再走与 HTTP 出口相同的 `mask_env_payload`；
+  磁盘调试快照同样只存打码后的副本。
+
+### 7.7 审计
+
+`audit.jsonl` 每行一条 JSON，append-only：
+
+```json
+{"action":"state|publish|diff_applied|revision|draft_created|debug","actor":"admin","wid":"w-...",
+ "from":"draft|0|null","to":"approved|w-...@1|2","rev":1,"note":"...","ts":...,"at":"...Z"}
+```
+
+`actor` 取自登录会话（关闭认证/单测时为 `local`）。`review` 返回最近 20 条 `audit_tail`。
+
+### 7.8 已发布流程绑定项目
+
+- 项目套件新增可选字段 `workflow_ref`（与 `scenario` **二选一**）：
+  `POST /api/projects/{pid}/suites {"name":"...","workflow_ref":"w-xxx@0"}`。
+- `POST /api/projects/{pid}/run` 会为 `workflow_ref` 套件创建一个 `mode:"workflow"` job，只读发布版本执行，
+  不再调用 planner/LLM。
+- 报告 `meta`、`meta.run_config` 与 `GET /api/runs/{id}/config` 都带 `workflow_ref`；
+  `.panguverse/executions/<run_id>/execution.json` 记录 `trigger`、`workflow_ref`、`project_id`、`suite_id`，
+  可从报告/执行回溯到 `wid@rev`。
+- 也可直接 `POST /api/runs {"mode":"workflow","workflow_ref":"w-xxx@0","env":{...}}`；
+  任务定义同样支持 `mode:"workflow"` + `workflow_ref`。
+- 运行仍走既有 `_execute`：真实报告、打码、`/api/runs` 数组形状、认证与错误体均不变。
+
+### 7.9 错误体
+
+统一为 `{"error":{"code","message", ...}}`；仅工作台冲突会追加结构化字段：
+
+- 锁定冲突：`locked_nodes:["node_id"]`
+- 未确认风险：`risks:[{id,node_id,kind,level,message}]`
+- 悬空/非法变更：`edges:[...]`（如适用）

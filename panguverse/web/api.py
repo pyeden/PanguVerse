@@ -16,12 +16,13 @@ from typing import Any
 from urllib.parse import parse_qs, unquote
 
 from ..report import html_report, junit
-from . import service
+from . import service, studio
 from .auth import AuthManager, build_cookie
 from .batches import BatchManager
 from .jobs import JobManager
 from .projects import ProjectStoreError
 from .service import ApiError
+from .studio import StudioError
 from .tasks_store import TaskStoreError
 
 JSON_CONTENT_TYPE = "application/json; charset=utf-8"
@@ -87,12 +88,19 @@ def json_response(data: Any, status: int = 200, *, headers: dict[str, str] | Non
     return Response(status=status, body=body, headers=merged)
 
 
-def error_response(code: str, message: str, status: int | None = None) -> Response:
+def error_response(
+    code: str,
+    message: str,
+    status: int | None = None,
+    *,
+    details: dict[str, Any] | None = None,
+) -> Response:
     http_status = status or service.STATUS_BY_CODE.get(code, 500)
-    return json_response(
-        {"error": {"code": code, "message": service.safe_message(message)}},
-        status=http_status,
-    )
+    error: dict[str, Any] = {"code": code, "message": service.safe_message(message)}
+    if details:
+        # 仅工作室冲突等需要结构化上下文时追加（A17–A62 的错误体仍是 code+message）
+        error.update(details)
+    return json_response({"error": error}, status=http_status)
 
 
 class WebAPI:
@@ -138,6 +146,10 @@ class WebAPI:
             self._check_auth(path, request_headers)
             return self._route(
                 method.upper(), path, params, body, headers=request_headers, client_ip=client_ip
+            )
+        except StudioError as exc:
+            return error_response(
+                exc.code, exc.message, exc.status, details=exc.details or None
             )
         except (ApiError, ProjectStoreError, TaskStoreError) as exc:
             return error_response(exc.code, exc.message, exc.status)
@@ -187,6 +199,9 @@ class WebAPI:
 
         if head == "auth":
             return self._handle_auth(method, rest, body, request_headers, client_ip)
+
+        if head == "studio":
+            return self._handle_studio(method, rest, query, body, request_headers)
 
         if method == "GET":
             if head == "status" and not rest:
@@ -354,6 +369,110 @@ class WebAPI:
         raise ApiError("not_found", "接口不存在")
 
     # ------------------------------------------------------------------ #
+    def _actor(self, headers: dict[str, str]) -> str:
+        """审计里的「谁」：认证开启时用登录名，本地/测试模式记 local。"""
+        if self.auth is None:
+            return "local"
+        return self.auth.user_from_headers(headers) or "local"
+
+    def _handle_studio(
+        self,
+        method: str,
+        rest: list[str],
+        query: dict[str, list[str]],
+        body: Any,
+        headers: dict[str, str],
+    ) -> Response:
+        """工作台 MVP（契约 v5.0 §2.2）：草案 → 图 → 调试 → 审阅 → 发布。"""
+        if not rest:
+            raise ApiError("not_found", "接口不存在")
+        actor = self._actor(headers)
+
+        if rest[0] == "drafts":
+            if len(rest) != 1:
+                raise ApiError("not_found", "接口不存在")
+            if method == "POST":
+                return json_response(
+                    studio.create_draft(self.root, body, actor=actor), status=201
+                )
+            if method == "GET":
+                return json_response(
+                    studio.list_drafts(
+                        self.root,
+                        status=_first(query, "status"),
+                        domain_pack=_first(query, "domain_pack"),
+                    )
+                )
+            raise ApiError("not_found", "接口不存在")
+
+        wid = rest[0]
+        tail = rest[1:]
+        if not tail:
+            if method != "GET":
+                raise ApiError("not_found", "接口不存在")
+            default_rev = int(studio.read_workflow(self.root, wid).get("current_rev") or 0)
+            rev = _rev_query(_first(query, "rev"), default_rev)
+            return json_response(studio.get_workflow(self.root, wid, rev=rev))
+
+        if len(tail) == 1:
+            action = tail[0]
+            if action == "nodes" and method == "POST":
+                return json_response(
+                    studio.add_node(self.root, wid, body, actor=actor), status=201
+                )
+            if action == "edges" and method == "POST":
+                return json_response(
+                    studio.add_edge(self.root, wid, body, actor=actor), status=201
+                )
+            if action == "replan" and method == "POST":
+                return json_response(studio.replan(self.root, wid, body, actor=actor))
+            if action == "apply-diff" and method == "POST":
+                return json_response(studio.apply_diff(self.root, wid, body, actor=actor))
+            if action == "validate" and method == "POST":
+                return json_response(self._studio_validate(wid, body))
+            if action == "debug" and method == "POST":
+                return json_response(
+                    studio.debug_workflow(self.root, wid, body, actor=actor)
+                )
+            if action == "review" and method == "POST":
+                return json_response(studio.review(self.root, wid, body))
+            if action == "publish" and method == "POST":
+                return json_response(studio.publish(self.root, wid, body, actor=actor))
+            if action == "state" and method == "POST":
+                return json_response(
+                    studio.transition_state(self.root, wid, body, actor=actor)
+                )
+
+        if len(tail) == 2 and tail[0] == "nodes":
+            node_id = tail[1]
+            if method == "PATCH":
+                return json_response(
+                    studio.patch_node(self.root, wid, node_id, body, actor=actor)
+                )
+            if method == "DELETE":
+                return json_response(
+                    studio.delete_node(self.root, wid, node_id, actor=actor)
+                )
+
+        raise ApiError("not_found", "接口不存在")
+
+    def _studio_validate(self, wid: str, body: Any) -> dict[str, Any]:
+        data = body if isinstance(body, dict) else {}
+        workflow = studio.read_workflow(self.root, wid)
+        current = int(workflow.get("current_rev") or 0)
+        rev = _rev_query(data.get("rev"), current)
+        revision = studio.read_revision(self.root, wid, rev)
+        return studio.validate_nodes(
+            self.root,
+            wid=wid,
+            rev=rev,
+            nodes=revision.get("nodes") or [],
+            edges=revision.get("edges") or [],
+            intent=str(workflow.get("intent") or ""),
+            env_schema=revision.get("env_schema") or [],
+        )
+
+    # ------------------------------------------------------------------ #
     def _handle_auth(
         self,
         method: str,
@@ -447,6 +566,20 @@ def _offset_query(query: dict[str, list[str]], key: str, default: int) -> int:
         raise ApiError("bad_request", f"{key} 必须是整数") from exc
     if value < 0:
         raise ApiError("bad_request", f"{key} 不能为负数")
+    return value
+
+
+def _rev_query(raw: Any, default: int) -> int:
+    if raw is None or raw == "":
+        return default
+    if isinstance(raw, bool):
+        raise ApiError("bad_request", "rev 必须是非负整数")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError) as exc:
+        raise ApiError("bad_request", "rev 必须是非负整数") from exc
+    if value < 0:
+        raise ApiError("bad_request", "rev 必须是非负整数")
     return value
 
 
