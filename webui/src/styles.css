@@ -1737,7 +1737,7 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .debug-column .debug-row > span:first-child { grid-area: node; }
 .debug-column .debug-row > .debug-status { grid-area: status; justify-self: end; }
 .debug-column .debug-row > .mono { display: none; }
-.debug-column .debug-error { grid-area: error; white-space: normal; line-height: 1.4; }
+.debug-column .debug-error { grid-area: error; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.4; }
 .debug-column .debug-detail { overflow: visible; padding-bottom: 14px; }
 .debug-column .debug-io { grid-template-columns: 1fr; }
 .debug-column .debug-io .json-block { max-height: 180px; }
@@ -1885,10 +1885,10 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 }
 .debug-tabs button:hover { color: var(--text-soft); background: rgba(154,177,214,.05); }
 .debug-tabs button.is-active { color: #ffd08c; background: rgba(247,187,99,.08); border-color: rgba(247,187,99,.2); }
-.debug-tabpanel { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; }
-.debug-list-wrap { min-height: 0; }
+.debug-tabpanel { flex: 1 1 auto; min-height: 0; overflow: auto; overscroll-behavior: contain; overflow-anchor: none; }
+.debug-list-wrap { min-height: 0; overflow-anchor: none; }
 .debug-trace { overflow: visible; }
-.debug-row { min-height: 46px; content-visibility: auto; contain-intrinsic-size: 46px; }
+.debug-row { height: 54px; min-height: 54px; overflow: hidden; content-visibility: auto; contain-intrinsic-size: 54px; }
 .debug-node-detail { display: flex; flex-direction: column; gap: 8px; padding: 9px 10px 16px; }
 .debug-back, .debug-jump-output {
   align-self: flex-start; border: 1px solid var(--line); border-radius: 6px;

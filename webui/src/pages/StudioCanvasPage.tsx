@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Background,
@@ -286,6 +286,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const flowWrapRef = useRef<HTMLDivElement | null>(null)
   const debugTabPanelRef = useRef<HTMLDivElement | null>(null)
   const debugListScrollRef = useRef(0)
+  const pendingScrollRestoreRef = useRef<number | null>(null)
   const debugWidthRef = useRef(debugWidth)
   debugWidthRef.current = debugWidth
   const storedProvenance = useMemo(() => readStudioProvenance(wid), [wid])
@@ -675,6 +676,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   }, [debugStatusMap, workflow?.graph?.edges])
 
   const openDebugDetail = useCallback((step: DebugNodeState) => {
+    pendingScrollRestoreRef.current = null
     debugListScrollRef.current = debugTabPanelRef.current?.scrollTop || 0
     setDebugStep(step)
     setDebugDetailOpen(true)
@@ -682,19 +684,43 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   }, [])
 
   const closeDebugDetail = useCallback(() => {
-    const target = debugListScrollRef.current
+    pendingScrollRestoreRef.current = debugListScrollRef.current
     setDebugDetailOpen(false)
-    const restore = () => {
-      if (debugTabPanelRef.current) debugTabPanelRef.current.scrollTop = target
-    }
-    window.requestAnimationFrame(() => {
-      restore()
-      window.requestAnimationFrame(() => {
-        restore()
-        window.setTimeout(restore, 0)
-      })
-    })
   }, [])
+
+  useLayoutEffect(() => {
+    if (debugDetailOpen) return
+    const target = pendingScrollRestoreRef.current
+    if (target === null) return
+    const el = debugTabPanelRef.current
+    if (!el) return
+    let cancelled = false
+    let tries = 0
+    const settle = () => {
+      if (cancelled || !el.isConnected) return
+      if (el.scrollHeight <= el.clientHeight && tries < 8) {
+        tries += 1
+        window.requestAnimationFrame(settle)
+        return
+      }
+      el.scrollTop = target
+      window.requestAnimationFrame(() => {
+        if (cancelled) return
+        el.scrollTop = target
+        window.requestAnimationFrame(() => {
+          if (cancelled) return
+          el.scrollTop = target
+          window.setTimeout(() => {
+            if (cancelled) return
+            el.scrollTop = target
+            pendingScrollRestoreRef.current = null
+          }, 0)
+        })
+      })
+    }
+    window.requestAnimationFrame(() => window.requestAnimationFrame(settle))
+    return () => { cancelled = true }
+  }, [debugDetailOpen])
 
   useEffect(() => {
     setNodes((current) => {
@@ -1076,7 +1102,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               <div className="debug-tabpanel" ref={debugTabPanelRef} data-testid="debug-tabpanel" data-tab={debugTab} role="tabpanel">
                 {debugTab === 'timeline' ? (
                   debugDetailOpen && debugStep ? (
-                    <div className="debug-node-detail" data-testid="debug-detail">
+                    <div className="debug-node-detail" data-testid="debug-detail" data-node-id={debugStep.node_id}>
                       <button type="button" className="debug-back" data-testid="debug-back" onClick={closeDebugDetail}>← 返回节点列表</button>
                       <div className="debug-detail-head">
                         <strong>{nodeLabel(debugStep.node_id)}</strong>
