@@ -22,6 +22,7 @@ import json
 import os
 import re
 import tempfile
+import threading
 import time
 import uuid
 from collections.abc import Iterable, Mapping
@@ -30,8 +31,11 @@ from typing import Any
 
 from ..axe.plan import PlanRequest
 from ..axe.planner import RuleBasedPlanner
+from ..core.context import MISSING, RunContext, split_path, walk_path
+from ..core.errors import AtomFailure, PanguError, StepFailure
+from ..core.molecule import Step
 from ..core.redact import mask_obj
-from . import projects
+from . import planner_gate, projects
 from .graph import (
     apply_graph_diff,
     diff_graphs,
@@ -66,6 +70,8 @@ _STATUS_BY_CODE = {
     "conflict": 409,
     "not_approved": 409,
     "risk_unconfirmed": 409,
+    "intent_mismatch": 409,
+    "capability_gap": 409,
     "internal_error": 500,
 }
 
@@ -280,8 +286,11 @@ def _commit_revision(
     base_rev: int | None,
     env_schema: list[str] | None = None,
     audit_note: str = "",
+    intent: str | None = None,
 ) -> dict[str, Any]:
     rev = int(workflow.get("current_rev") or 0) + 1
+    if intent is not None and str(intent).strip():
+        workflow["intent"] = str(intent)
     old_state = str(workflow.get("state") or "draft")
     revision = {
         "wid": wid,
@@ -376,6 +385,13 @@ def _registry() -> Any:
     return service.registry()
 
 
+def _baseline_env(root: Path) -> dict[str, Any]:
+    from . import service
+
+    baseline = service.load_last_env(root)
+    return baseline if isinstance(baseline, dict) else {}
+
+
 def _risks(nodes: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     registry = _registry()
     risks: list[dict[str, Any]] = []
@@ -444,6 +460,83 @@ def _downstream_nodes(nodes: Iterable[Mapping[str, Any]], edges: Iterable[Mappin
     return sorted(node for node in seen if node)
 
 
+def _assumption_env_keys(assumptions: Iterable[str]) -> set[str]:
+    keys: set[str] = set()
+    for item in assumptions or ():
+        for match in re.finditer(r"\b([A-Z][A-Z0-9_]{1,})\b", str(item)):
+            keys.add(match.group(1))
+    return keys
+
+
+def _semantic_issue(code: str, message: str, *, node_id: str = "", hint: str = "") -> dict[str, Any]:
+    issue: dict[str, Any] = {"code": code, "level": "error", "message": message, "node_id": node_id}
+    if hint:
+        issue["hint"] = hint
+    return issue
+
+
+def _semantic_checks(
+    *,
+    nodes: list[Mapping[str, Any]],
+    intent: str,
+    env_schema: Iterable[str],
+    assumptions: Iterable[str],
+    available_env: Iterable[str] | None,
+    checks: Mapping[str, Any] | None,
+    domain_pack: str = "",
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """意图覆盖 / 环境就绪 / 能力缺口三类语义检查（默认全开）。"""
+    enabled = {"intent": True, "env": True, "capability": True}
+    if isinstance(checks, Mapping):
+        for key in enabled:
+            if key in checks and checks[key] is False:
+                enabled[key] = False
+
+    coverage = planner_gate.intent_coverage(nodes, intent)
+    errors: list[dict[str, Any]] = []
+    if enabled["intent"] and intent and coverage["total"] and coverage["ratio"] < 0.6:
+        errors.append(
+            _semantic_issue(
+                "intent_mismatch",
+                f"意图覆盖率过低：{coverage['matched']}/{coverage['total']}"
+                f"（{coverage['ratio']:.0%}），当前图与意图不匹配",
+                hint="删除无关节点，或重新规划；阈值 60%",
+            )
+        )
+
+    missing_env: list[str] = []
+    if enabled["env"] and available_env is not None:
+        known = {str(key) for key in available_env} | _assumption_env_keys(assumptions)
+        missing_env = [str(key) for key in env_schema if str(key) not in known]
+        for key in missing_env:
+            errors.append(
+                _semantic_issue(
+                    "missing_env",
+                    f"计划引用了未提供的环境变量 env.{key}",
+                    hint="在项目 env / 运行基线中配置，或在 assumptions 中显式声明",
+                )
+            )
+
+    capability_gaps: list[str] = []
+    if enabled["capability"] and intent:
+        analysis = planner_gate.analyze_intent(intent, domain_pack=domain_pack)
+        capability_gaps = [atom for atom in analysis.missing_atoms if atom not in capability_gaps]
+        if capability_gaps:
+            errors.append(
+                _semantic_issue(
+                    "capability_gap",
+                    "意图需要当前原子库不具备的能力：" + ", ".join(capability_gaps),
+                    hint="；".join(analysis.suggestions),
+                )
+            )
+
+    return errors, {
+        "coverage": coverage,
+        "missing_env": missing_env,
+        "capability_gaps": capability_gaps,
+    }
+
+
 def validate_nodes(
     root: Path,
     *,
@@ -453,12 +546,27 @@ def validate_nodes(
     edges: Iterable[Mapping[str, Any]],
     intent: str = "",
     env_schema: Iterable[str] = (),
+    assumptions: Iterable[str] = (),
+    available_env: Iterable[str] | None = None,
+    checks: Mapping[str, Any] | None = None,
+    domain_pack: str = "",
 ) -> dict[str, Any]:
     nodes = list(nodes)
+    env_keys = list(env_schema) or _env_schema(nodes)
     plan = plan_from_nodes(nodes, source="studio", intent=intent)
-    result = plan.check(_registry(), known_variables=set(env_schema))
+    result = plan.check(_registry(), known_variables=set(env_keys))
     errors = [_issue_dict(issue) for issue in result.errors]
     warnings = [_issue_dict(issue) for issue in result.warnings]
+    semantic, detail = _semantic_checks(
+        nodes=nodes,
+        intent=intent,
+        env_schema=env_keys,
+        assumptions=assumptions,
+        available_env=available_env,
+        checks=checks,
+        domain_pack=domain_pack,
+    )
+    errors.extend(semantic)
     error_nodes = {item.get("node_id") for item in errors if item.get("node_id")}
     affected = _downstream_nodes(nodes, edges, error_nodes)
     return {
@@ -469,6 +577,7 @@ def validate_nodes(
         "warnings": warnings,
         "risks": _risks(nodes),
         "affected_nodes": affected,
+        **detail,
     }
 
 
@@ -529,10 +638,29 @@ def _clean_domain_pack(value: Any) -> str:
     domain = value.strip()
     if not domain:
         return ""
-    allowed = {"api_testing", "local_fs", "core"}
+    allowed = {"api_testing", "local_fs", "core", "web_research"}
     if domain not in allowed:
         raise StudioError("bad_request", f"未知的领域包: {domain}")
     return domain
+
+
+def _helper_node(node: dict[str, Any]) -> bool:
+    atom = str(node.get("atom") or "")
+    tags = {str(tag).lower() for tag in (node.get("tags") or ())}
+    if atom in planner_gate._HELPER_ATOMS or "assert" in tags:
+        node["helper"] = True
+        return True
+    return False
+
+
+def _llm_client() -> Any:
+    from . import service
+
+    if not service.llm_enabled():
+        return None
+    from ..axe.llm import LLMClient
+
+    return LLMClient()
 
 
 def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str, Any]:
@@ -540,9 +668,26 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     intent = _clean_text(data.get("intent"), field="intent", required=True, limit=500)
     domain_pack = _clean_domain_pack(data.get("domain_pack"))
     exclude = _clean_exclude(data.get("exclude_atoms"))
-    plan = _build_plan(root, intent=intent, domain_pack=domain_pack, exclude_atoms=exclude)
-
+    allow_llm = data.get("allow_llm") is True
+    try:
+        bundle = planner_gate.plan_draft(
+            _registry(),
+            intent=intent,
+            domain_pack=domain_pack,
+            exclude_atoms=exclude,
+            allow_llm=allow_llm,
+            llm_client=_llm_client(),
+            env={},
+        )
+    except planner_gate.PlanGateError as exc:
+        raise StudioError(
+            exc.code, exc.message, status=exc.status, details=exc.details
+        ) from exc
+    plan = bundle.plan
     graph = graph_from_plan(plan, origin="ai")
+    for node in graph["nodes"]:
+        _helper_node(node)
+
     wid = new_wid()
     env_schema = _env_schema(graph["nodes"])
     name = str(plan.cases[0].name or intent)[:80]
@@ -551,7 +696,12 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "wid": wid,
         "name": name,
         "intent": intent,
-        "domain_pack": domain_pack,
+        "domain_pack": domain_pack or bundle.analysis.get("domain") or "",
+        "planner": bundle.planner,
+        "plan_source": bundle.plan_source,
+        "confidence": bundle.confidence,
+        "assumptions": list(bundle.assumptions),
+        "capability_gaps": list(bundle.capability_gaps),
         "state": "draft",
         "current_rev": 0,
         "locked": [],
@@ -570,7 +720,12 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "message": "AI 生成初稿",
         "base_rev": None,
         "intent": intent,
-        "domain_pack": domain_pack,
+        "domain_pack": workflow["domain_pack"],
+        "planner": bundle.planner,
+        "plan_source": bundle.plan_source,
+        "confidence": bundle.confidence,
+        "assumptions": list(bundle.assumptions),
+        "capability_gaps": list(bundle.capability_gaps),
         "env_schema": env_schema,
         "nodes": graph["nodes"],
         "edges": graph["edges"],
@@ -587,7 +742,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
             "to": "draft",
             "rev": 0,
             "origin": "ai",
-            "note": f"意图：{intent}",
+            "note": f"意图：{intent}；planner={bundle.planner}；confidence={bundle.confidence}",
         },
     )
     validation = validate_nodes(
@@ -598,11 +753,20 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         edges=graph["edges"],
         intent=intent,
         env_schema=env_schema,
+        assumptions=bundle.assumptions,
+        available_env=None,
+        domain_pack=workflow["domain_pack"],
     )
     return {
         "wid": wid,
         "rev": 0,
         "state": "draft",
+        "planner": bundle.planner,
+        "plan_source": bundle.plan_source,
+        "confidence": bundle.confidence,
+        "assumptions": list(bundle.assumptions),
+        "capability_gaps": list(bundle.capability_gaps),
+        "analysis": bundle.analysis,
         "graph": graph,
         "validation": validation,
     }
@@ -674,6 +838,13 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
         "name": workflow.get("name"),
         "intent": workflow.get("intent"),
         "domain_pack": workflow.get("domain_pack"),
+        "planner": revision.get("planner") or workflow.get("planner") or "",
+        "plan_source": revision.get("plan_source") or workflow.get("plan_source") or "",
+        "confidence": revision.get("confidence", workflow.get("confidence", 0.0)),
+        "assumptions": list(revision.get("assumptions") or workflow.get("assumptions") or []),
+        "capability_gaps": list(
+            revision.get("capability_gaps") or workflow.get("capability_gaps") or []
+        ),
         "state": workflow.get("state"),
         "current_rev": workflow.get("current_rev"),
         "rev": target_rev,
@@ -800,6 +971,8 @@ def _update_ui(root: Path, wid: str, ui: Any) -> dict[str, Any]:
 def _node_payload(root: Path, wid: str, revision: Mapping[str, Any], workflow: dict[str, Any]) -> dict[str, Any]:
     nodes = list(revision.get("nodes") or [])
     edges = list(revision.get("edges") or [])
+    from . import service
+
     validation = validate_nodes(
         root,
         wid=wid,
@@ -808,6 +981,9 @@ def _node_payload(root: Path, wid: str, revision: Mapping[str, Any], workflow: d
         edges=edges,
         intent=str(workflow.get("intent") or ""),
         env_schema=revision.get("env_schema") or [],
+        assumptions=revision.get("assumptions") or workflow.get("assumptions") or [],
+        available_env=set(service.load_last_env(root)),
+        domain_pack=str(workflow.get("domain_pack") or ""),
     )
     return {
         "wid": wid,
@@ -1222,6 +1398,7 @@ def apply_diff(root: Path, wid: str, payload: Any, *, actor: str = "local") -> d
         message=f"应用 AI 建议（提案 {proposed_rev}）",
         base_rev=int(revision.get("rev") or 0),
         audit_note=f"apply-diff proposal={proposed_rev} accepted={len(applied)}",
+        intent=str(proposal.get("instruction") or "") or None,
     )
     _append_audit(
         _workflow_dir(root, wid),
@@ -1275,6 +1452,9 @@ def review(root: Path, wid: str, payload: Any) -> dict[str, Any]:
             edges=target.get("edges") or [],
             intent=str(workflow.get("intent") or ""),
             env_schema=target.get("env_schema") or [],
+            assumptions=target.get("assumptions") or workflow.get("assumptions") or [],
+            available_env=set(_baseline_env(root)),
+            domain_pack=str(workflow.get("domain_pack") or ""),
         ),
         "audit_tail": audit_tail(root, wid, limit=20),
     }
@@ -1342,6 +1522,31 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
     if rev != int(workflow.get("current_rev") or 0):
         raise StudioError("conflict", "只能发布当前版本（请先重新批准最新 rev）")
     revision = read_revision(root, wid, rev)
+    validation = validate_nodes(
+        root,
+        wid=wid,
+        rev=rev,
+        nodes=revision.get("nodes") or [],
+        edges=revision.get("edges") or [],
+        intent=str(workflow.get("intent") or ""),
+        env_schema=revision.get("env_schema") or [],
+        assumptions=revision.get("assumptions") or workflow.get("assumptions") or [],
+        available_env=set(_baseline_env(root)),
+        domain_pack=str(workflow.get("domain_pack") or ""),
+    )
+    blocking = [
+        item
+        for item in validation.get("errors") or []
+        if item.get("code") in {"intent_mismatch", "capability_gap"}
+    ]
+    if blocking:
+        first = blocking[0]
+        raise StudioError(
+            str(first.get("code") or "intent_mismatch"),
+            "语义校验未通过，不能发布：" + str(first.get("message") or ""),
+            status=409,
+            details={"validation": validation, "blocking": blocking},
+        )
 
     ref = f"{wid}@{rev}"
     published_path = _workflow_dir(root, wid) / "published" / f"{rev}.json"
@@ -1515,9 +1720,501 @@ def _select_nodes(
     return nodes[index:]
 
 
-def debug_workflow(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
-    from . import service
+_DEBUG_SID_RE = re.compile(r"^dbg-(w-[0-9a-f]{6,12})-([0-9a-f]{8})$")
+DEBUG_REASONS = (
+    "when_false",
+    "foreach_empty",
+    "upstream_failed",
+    "optional",
+    "assertion",
+    "network",
+    "missing_env",
+    "missing_llm",
+    "cancelled",
+)
+_DEBUG_RUNS: dict[str, _DebugSession] = {}
+_DEBUG_LOCK = threading.RLock()
 
+
+def _truthy(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no", "off", "null", "none"}
+    return bool(value)
+
+
+def _compact(value: Any, *, limit: int = 2000, depth: int = 0) -> Any:
+    """压缩调试输入/输出，避免把整页 HTML 写进会话。"""
+    if depth > 4:
+        return "…"
+    if isinstance(value, str):
+        return value if len(value) <= limit else value[:limit] + f"…（截断，共 {len(value)} 字符）"
+    if isinstance(value, Mapping):
+        return {str(key): _compact(item, limit=limit, depth=depth + 1) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        items = [_compact(item, limit=limit, depth=depth + 1) for item in list(value)[:50]]
+        if len(value) > 50:
+            items.append(f"…（共 {len(value)} 项）")
+        return items
+    return value
+
+
+def _exception_fields(exc: BaseException, atom: Any = None) -> tuple[str, str, str]:
+    if isinstance(exc, StepFailure):
+        return "assertion", "expectation", str(exc)
+    if isinstance(exc, AtomFailure):
+        kind = str(getattr(exc, "kind", "") or "assertion")
+        return kind, str(getattr(exc, "failure_class", "") or "internal"), str(exc)
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return "network", "transient", str(exc)
+    if isinstance(exc, PanguError):
+        kind = str(getattr(exc, "kind", "") or "assertion")
+        return kind, str(getattr(exc, "failure_class", "") or "internal"), str(exc)
+    return "assertion", "internal", f"{type(exc).__name__}: {exc}"
+
+
+def _reason_for(exc: BaseException, *, atom: Any = None, raw: Any = None) -> str:
+    kind, _failure_class, message = _exception_fields(exc, atom)
+    if kind in DEBUG_REASONS:
+        return kind
+    if kind in {"timeout", "llm_error", "server_error", "rate_limit", "not_found", "auth"}:
+        return "network" if kind in {"timeout", "llm_error", "server_error", "rate_limit"} else "assertion"
+    if kind in {"missing_llm", "empty_summary"}:
+        return "missing_llm" if kind == "missing_llm" else "assertion"
+    if kind == "missing_env":
+        return "missing_env"
+    if "env." in str(raw) and "变量不存在" in message:
+        return "missing_env"
+    return "assertion"
+
+
+def _append_jsonl(path: Path, payload: Mapping[str, Any], *, seq: int | None = None) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        path.parent.chmod(DIR_MODE)
+    data = dict(payload)
+    if seq is not None:
+        data["seq"] = seq
+    line = json.dumps(data, ensure_ascii=False, default=str) + "\n"
+    fd = os.open(path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, FILE_MODE)
+    try:
+        os.write(fd, line.encode("utf-8"))
+    finally:
+        os.close(fd)
+    with contextlib.suppress(OSError):
+        path.chmod(FILE_MODE)
+
+
+def _debug_root(root: Path, wid: str) -> Path:
+    return _workflow_dir(root, wid) / "debug"
+
+
+def _debug_node_step(node: Mapping[str, Any]) -> Step:
+    spec = {
+        "id": node.get("id"),
+        "use": node.get("atom") or node.get("use"),
+        "name": node.get("name") or "",
+        "with": copy.deepcopy(node.get("params") or {}),
+        "capture": copy.deepcopy(node.get("capture") or {}),
+        "when": node.get("when"),
+        "foreach": node.get("foreach"),
+        "as": node.get("as"),
+        "retry": node.get("retry"),
+        "optional": node.get("optional") or False,
+        "continue_on_failure": node.get("continue_on_failure") or False,
+        "tags": node.get("tags") or [],
+    }
+    return Step.from_spec(spec)
+
+
+def _select_nodes_payload(
+    nodes: list[dict[str, Any]], node_id: str, mode: str
+) -> list[dict[str, Any]]:
+    return _select_nodes(nodes, node_id, mode)
+
+
+class _DebugSession:
+    """一次异步调试会话：逐节点写 jsonl，GET 按 cursor 增量读取。"""
+
+    def __init__(
+        self,
+        *,
+        root: Path,
+        wid: str,
+        rev: int,
+        sid: str,
+        node_id: str,
+        mode: str,
+        nodes: list[dict[str, Any]],
+        env: dict[str, Any],
+        actor: str,
+    ) -> None:
+        self.root = root
+        self.wid = wid
+        self.rev = rev
+        self.sid = sid
+        self.node_id = node_id
+        self.mode = mode
+        self.nodes = nodes
+        self.env = env
+        self.actor = actor
+        self.path = _debug_root(root, wid) / f"{sid}.jsonl"
+        self.snapshot_path = _debug_root(root, wid) / f"{sid}.json"
+        self.events: list[dict[str, Any]] = []
+        self.seq = 0
+        self.done = False
+        self.summary = {"passed": 0, "failed": 0, "skipped": 0, "by_reason": {}}
+        self.variables: dict[str, Any] = {}
+        self.secret_values: list[str] = []
+        self._lock = threading.RLock()
+        self._thread: threading.Thread | None = None
+        for key, value in env.items():
+            if _SENSITIVE_KEY_RE.search(str(key)) and isinstance(value, str) and len(value) >= 4:
+                self.secret_values.append(value)
+
+    # ------------------------------------------------------------------ #
+    def _mask(self, payload: Any) -> Any:
+        masked = mask_obj(payload, list(self.secret_values))
+        from .api import mask_env_payload
+
+        return mask_env_payload(masked)
+
+    def emit(self, event: dict[str, Any]) -> int:
+        with self._lock:
+            self.seq += 1
+            item = self._mask({**event, "seq": self.seq, "at": time.time()})
+            self.events.append(item)
+            _append_jsonl(self.path, item)
+            return self.seq
+
+    def start(self) -> None:
+        self.emit(
+            {
+                "type": "start",
+                "session_id": self.sid,
+                "wid": self.wid,
+                "rev": self.rev,
+                "node_id": self.node_id,
+                "mode": self.mode,
+                "total": len(self.nodes),
+                "status": "running",
+            }
+        )
+        for node in self.nodes:
+            self.emit(
+                {
+                    "type": "node",
+                    "node_id": str(node.get("id") or ""),
+                    "atom": node.get("atom"),
+                    "name": node.get("name"),
+                    "status": "pending",
+                    "reason": "",
+                    "attempts": 0,
+                    "duration_ms": 0,
+                    "error": None,
+                }
+            )
+        self._thread = threading.Thread(target=self._run, name=f"studio-debug-{self.sid}", daemon=True)
+        self._thread.start()
+
+    # ------------------------------------------------------------------ #
+    def _run_node(self, node: Mapping[str, Any], ctx: RunContext, registry: Any) -> tuple[str, str, int, dict[str, Any], dict[str, Any]]:
+        atom_name = str(node.get("atom") or "")
+        atom = registry.get(atom_name)
+        step = _debug_node_step(node)
+
+        if step.when not in (None, ""):
+            try:
+                condition = ctx.resolve(step.when)
+            except PanguError as exc:
+                return "failed", _reason_for(exc, atom=atom, raw=step.when), 1, {}, {
+                    "type": type(exc).__name__,
+                    "kind": getattr(exc, "kind", "template"),
+                    "message": str(exc),
+                }
+            if not _truthy(condition):
+                return "skipped", "when_false", 0, {"condition": step.when}, {}
+
+        iterations: list[Any] = [None]
+        if step.foreach:
+            try:
+                items = ctx.resolve(step.foreach)
+            except PanguError as exc:
+                return "failed", _reason_for(exc, atom=atom, raw=step.foreach), 1, {}, {
+                    "type": type(exc).__name__,
+                    "kind": getattr(exc, "kind", "template"),
+                    "message": str(exc),
+                }
+            if isinstance(items, dict):
+                items = list(items.values())
+            if not isinstance(items, (list, tuple)):
+                return "failed", "assertion", 1, {"foreach": step.foreach}, {
+                    "type": "PlanError",
+                    "kind": "plan",
+                    "message": f"foreach 需要列表，实际 {type(items).__name__}",
+                }
+            if not items:
+                return "skipped", "foreach_empty", 0, {"foreach": step.foreach}, {}
+            iterations = list(items)
+
+        collected: list[dict[str, Any]] = []
+        attempts_total = 0
+        try:
+            inputs = ctx.resolve(step.with_)
+        except PanguError as exc:
+            return "failed", _reason_for(exc, atom=atom, raw=step.with_), 1, {}, {
+                "type": type(exc).__name__,
+                "kind": getattr(exc, "kind", "template"),
+                "message": str(exc),
+            }
+        missing = [name for name in atom.required if inputs.get(name) is None]
+        if missing:
+            return "failed", "assertion", 1, _compact(inputs), {
+                "type": "PlanError",
+                "kind": "plan",
+                "message": f"缺少必填输入: {', '.join(missing)}",
+            }
+
+        for index, item in enumerate(iterations):
+            loop_ctx = ctx
+            if step.foreach:
+                loop_ctx = ctx.child(
+                    **{
+                        step.as_: item,
+                        "index": index,
+                        "loop": {
+                            "index": index,
+                            "number": index + 1,
+                            "length": len(iterations),
+                            "first": index == 0,
+                            "last": index == len(iterations) - 1,
+                        },
+                    }
+                )
+            policy = step.retry
+            attempts = max(1, int(policy.attempts)) if policy else 1
+            attempts_total += attempts
+            while attempts > 0:
+                try:
+                    outputs = atom.invoke(loop_ctx, loop_ctx.resolve(step.with_))
+                    break
+                except Exception as exc:
+                    kind, failure_class, _message = _exception_fields(exc, atom)
+                    if (
+                        policy is not None
+                        and policy.should_retry(kind, failure_class)
+                        and getattr(loop_ctx, "_debug_attempt", False) is False
+                        and attempts > 1
+                    ):
+                        attempts -= 1
+                        time.sleep(policy.delay_for(attempts))
+                        continue
+                    raise
+            collected.append(dict(outputs or {}))
+            for secret_name, secret_value in atom.secrets_in_outputs(outputs):
+                if isinstance(secret_value, str) and len(secret_value) >= 4:
+                    self.secret_values.append(secret_value)
+                loop_ctx.add_secret(secret_name, secret_value)
+
+        merged = collected[-1] if collected else {}
+        if step.foreach:
+            merged = {
+                **merged,
+                "count": len(collected),
+                "items": collected,
+                "last": collected[-1] if collected else {},
+            }
+        ctx.vars[step.id] = merged
+        for name, raw_spec in (step.capture or {}).items():
+            if isinstance(raw_spec, Mapping):
+                path = str(raw_spec.get("path") or raw_spec.get("from") or name)
+                required = bool(raw_spec.get("required", True))
+                secret = bool(raw_spec.get("secret", False))
+            else:
+                path = str(raw_spec)
+                required = True
+                secret = False
+            value = walk_path(merged, split_path(path))
+            if value is MISSING:
+                if required:
+                    return "failed", "assertion", attempts_total, _compact(inputs), {
+                        "type": "StepError",
+                        "kind": "capture_missing",
+                        "message": f"capture 路径不存在: {path}",
+                    }
+                continue
+            ctx.set(str(name), value)
+            if secret:
+                ctx.add_secret(str(name), value)
+        return "passed", "", attempts_total, _compact(inputs), _compact(merged)
+
+    # ------------------------------------------------------------------ #
+    def _run(self) -> None:
+        from . import service
+
+        registry = service.registry()
+        ctx = RunContext(env=dict(self.env), run_id=self.sid)
+        passed = failed = skipped = 0
+        by_reason: dict[str, int] = {}
+        aborted = False
+        try:
+            for node in self.nodes:
+                node_id = str(node.get("id") or "")
+                if aborted:
+                    skipped += 1
+                    by_reason["upstream_failed"] = by_reason.get("upstream_failed", 0) + 1
+                    self.emit(
+                        {
+                            "type": "node",
+                            "node_id": node_id,
+                            "atom": node.get("atom"),
+                            "name": node.get("name"),
+                            "status": "skipped",
+                            "reason": "upstream_failed",
+                            "attempts": 0,
+                            "duration_ms": 0,
+                            "error": None,
+                        }
+                    )
+                    continue
+                self.emit(
+                    {
+                        "type": "node",
+                        "node_id": node_id,
+                        "atom": node.get("atom"),
+                        "name": node.get("name"),
+                        "status": "running",
+                        "reason": "",
+                        "attempts": 0,
+                        "duration_ms": 0,
+                        "error": None,
+                    }
+                )
+                started = time.perf_counter()
+                try:
+                    status, reason, attempts, inputs, outputs = self._run_node(node, ctx, registry)
+                    error = None
+                    if status == "failed":
+                        error = outputs if isinstance(outputs, dict) and outputs.get("message") else None
+                except Exception as exc:  # noqa: BLE001 - 任何失败都要落到节点状态
+                    status, reason = "failed", _reason_for(exc, raw=node.get("params"))
+                    attempts, inputs, outputs = 1, _compact(node.get("params") or {}), {}
+                    error = {
+                        "type": type(exc).__name__,
+                        "kind": _exception_fields(exc)[0],
+                        "message": str(exc),
+                    }
+                duration_ms = (time.perf_counter() - started) * 1000
+                if status == "failed" and (node.get("optional") or False):
+                    status, reason = "skipped", "optional"
+                if status == "passed":
+                    passed += 1
+                elif status == "skipped":
+                    skipped += 1
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+                else:
+                    failed += 1
+                    by_reason[reason] = by_reason.get(reason, 0) + 1
+                    if not (node.get("continue_on_failure") or False):
+                        aborted = True
+                self.emit(
+                    {
+                        "type": "node",
+                        "node_id": node_id,
+                        "atom": node.get("atom"),
+                        "name": node.get("name"),
+                        "status": status,
+                        "reason": reason,
+                        "attempts": attempts,
+                        "duration_ms": round(duration_ms, 2),
+                        "error": error,
+                        "inputs": inputs,
+                        "outputs": outputs if status == "passed" else {},
+                    }
+                )
+            snapshot = ctx.snapshot()
+            self.variables = {
+                "vars": _compact(snapshot.get("vars") or {}, limit=1000),
+                "env": _compact(snapshot.get("env") or {}, limit=500),
+            }
+        except Exception as exc:  # noqa: BLE001 - 会话线程不能静默死掉
+            failed += 1
+            by_reason["assertion"] = by_reason.get("assertion", 0) + 1
+            self.emit(
+                {
+                    "type": "node",
+                    "node_id": "",
+                    "status": "failed",
+                    "reason": "assertion",
+                    "attempts": 0,
+                    "duration_ms": 0,
+                    "error": {"type": type(exc).__name__, "kind": "engine", "message": str(exc)},
+                }
+            )
+        finally:
+            summary = {
+                "passed": passed,
+                "failed": failed,
+                "skipped": skipped,
+                "by_reason": dict(sorted(by_reason.items())),
+            }
+            self.summary = summary
+            self.done = True
+            end = {
+                "type": "end",
+                "session_id": self.sid,
+                "done": True,
+                "status": "ok" if failed == 0 else "failed",
+                "summary": summary,
+                "variables": self.variables,
+            }
+            seq = self.emit(end)
+            snapshot = {
+                "debug_id": self.sid,
+                "session_id": self.sid,
+                "wid": self.wid,
+                "rev": self.rev,
+                "workflow_ref": f"{self.wid}@{self.rev}",
+                "node_id": self.node_id,
+                "mode": self.mode,
+                "status": "ok" if failed == 0 else "failed",
+                "summary": summary,
+                "trace": [
+                    {
+                        "node_id": item.get("node_id"),
+                        "atom": item.get("atom"),
+                        "name": item.get("name"),
+                        "status": item.get("status"),
+                        "reason": item.get("reason"),
+                        "attempts": item.get("attempts"),
+                        "duration_ms": item.get("duration_ms"),
+                        "inputs": item.get("inputs"),
+                        "outputs": item.get("outputs"),
+                        "error": item.get("error"),
+                    }
+                    for item in self.events
+                    if item.get("type") == "node" and item.get("status") != "running"
+                ],
+                "variables": self.variables,
+                "cursor": seq,
+                "done": True,
+            }
+            _atomic_write_json(self.snapshot_path, self._mask(snapshot))
+            _append_audit(
+                _workflow_dir(self.root, self.wid),
+                {
+                    "action": "debug",
+                    "actor": self.actor,
+                    "wid": self.wid,
+                    "from": None,
+                    "to": self.sid,
+                    "rev": self.rev,
+                    "note": f"{self.node_id} ({self.mode})",
+                },
+            )
+
+
+def debug_workflow(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
+    """启动异步调试会话：立即返回 session_id，节点状态由 jsonl 增量读取。"""
     data = _as_dict(payload)
     mode = data.get("mode") or "only"
     if mode not in DEBUG_MODES:
@@ -1531,108 +2228,92 @@ def debug_workflow(root: Path, wid: str, payload: Any, *, actor: str = "local") 
     )
     revision = read_revision(root, wid, rev)
     nodes = list(revision.get("nodes") or [])
-    selected = _select_nodes(nodes, node_id, mode)
+    selected = _select_nodes_payload(nodes, node_id, mode)
     effective_env = _debug_env(root, data)
-
-    plan = plan_from_nodes(
-        selected,
-        source="studio-debug",
-        intent=f"调试 {node_id}",
-        planner="studio",
-    )
-    if not plan.cases:
+    if not selected:
         raise StudioError("bad_request", "调试没有选中任何可执行步骤")
 
-    debug_id = "dbg-" + uuid.uuid4().hex[:12]
-    axe = service.build_axe(root, enable_llm=False)
-    run = axe.executor.run(
-        plan,
+    sid = f"dbg-{wid}-{uuid.uuid4().hex[:8]}"
+    session = _DebugSession(
+        root=root,
+        wid=wid,
+        rev=rev,
+        sid=sid,
+        node_id=node_id,
+        mode=mode,
+        nodes=selected,
         env=effective_env,
-        run_id=debug_id,
-        meta={
-            "debug": True,
-            "trigger": "debug",
-            "workflow_ref": f"{wid}@{rev}",
-            "node_id": node_id,
-            "mode": mode,
-        },
+        actor=actor,
     )
-
-    capture_sources: dict[str, str] = {}
-    for node in nodes:
-        for name in (node.get("capture") or {}):
-            capture_sources[str(name)] = str(node.get("id"))
-    for node in nodes:
-        capture_sources.setdefault(str(node.get("id")), str(node.get("id")))
-
-    trace: list[dict[str, Any]] = []
-    variables: dict[str, Any] = {}
-    env_snapshot: dict[str, Any] = {}
-    secret_values: list[str] = []
-    for case in run.cases:
-        secret_values.extend(
-            value for value in (case.meta.get("secret_values") or []) if isinstance(value, str)
-        )
-        snapshot = case.variables or {}
-        for name, value in (snapshot.get("vars") or {}).items():
-            variables[name] = {
-                "value": value,
-                "source": capture_sources.get(str(name), "runtime"),
-                "from_snapshot": True,
-                "case_id": case.case_id,
-            }
-        if isinstance(snapshot.get("env"), dict):
-            env_snapshot.update(snapshot["env"])
-        for step in case.steps:
-            item = step.to_dict()
-            trace.append(
-                {
-                    "node_id": step.step_id,
-                    "case_id": case.case_id,
-                    "atom": step.atom,
-                    "name": step.name,
-                    "status": item.get("status"),
-                    "duration_ms": item.get("duration_ms"),
-                    "attempts": item.get("attempts"),
-                    "inputs": item.get("inputs"),
-                    "outputs": item.get("outputs"),
-                    "error": item.get("error"),
-                    "skipped_reason": step.skipped_reason,
-                }
-            )
-
-    result = {
-        "debug_id": debug_id,
+    with _DEBUG_LOCK:
+        _DEBUG_RUNS[sid] = session
+    session.start()
+    return {
+        "session_id": sid,
+        "debug_id": sid,
         "wid": wid,
         "rev": rev,
         "workflow_ref": f"{wid}@{rev}",
         "node_id": node_id,
         "mode": mode,
-        "status": "ok" if run.summary.get("success") else "failed",
-        "summary": run.summary,
-        "trace": trace,
-        "variables": {"vars": variables, "env": env_snapshot},
+        "status": "running",
+        "total": len(selected),
+        "cursor": session.seq,
+        "done": False,
+        "summary": {"passed": 0, "failed": 0, "skipped": 0, "by_reason": {}},
     }
-    # 双保险：先按已知密钥值/key 名打码，再走 HTTP 层同一套 env 打码
-    masked = mask_obj(result, secret_values)
-    from .api import mask_env_payload
 
-    masked = mask_env_payload(masked)
-    debug_dir = _workflow_dir(root, wid) / "debug"
-    _atomic_write_json(debug_dir / f"{debug_id}.json", masked)
-    _append_audit(
-        _workflow_dir(root, wid),
-        {
-            "action": "debug",
-            "actor": actor,
-            "wid": wid,
-            "from": None,
-            "to": debug_id,
-            "rev": rev,
-            "note": f"{node_id} ({mode})",
-        },
-    )
-    return masked
+
+def _session_events(root: Path, sid: str) -> list[dict[str, Any]]:
+    match = _DEBUG_SID_RE.match(sid or "")
+    if not match:
+        raise StudioError("bad_request", "session_id 非法")
+    wid = match.group(1)
+    with _DEBUG_LOCK:
+        session = _DEBUG_RUNS.get(sid)
+    if session is not None:
+        with session._lock:
+            return list(session.events)
+    path = _debug_root(root, wid) / f"{sid}.jsonl"
+    if not path.is_file():
+        raise StudioError("not_found", "调试会话不存在或已过期")
+    events: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            events.append(item)
+    return events
+
+
+def get_debug_session(root: Path, sid: str, *, cursor: int = 0) -> dict[str, Any]:
+    """按 cursor 增量返回节点状态与原因码（不进 /api/runs）。"""
+    events = _session_events(root, sid)
+    cursor = max(0, int(cursor or 0))
+    pending = [item for item in events if int(item.get("seq") or 0) > cursor]
+    nodes = [item for item in pending if item.get("type") == "node"]
+    end = next((item for item in reversed(events) if item.get("type") == "end"), None)
+    summary = (end or {}).get("summary") or {
+        "passed": 0,
+        "failed": 0,
+        "skipped": 0,
+        "by_reason": {},
+    }
+    return {
+        "session_id": sid,
+        "cursor": max([cursor, *[int(item.get("seq") or 0) for item in pending]]),
+        "done": end is not None,
+        "status": (end or {}).get("status")
+        or ("running" if events else "missing"),
+        "nodes": nodes,
+        "events": pending,
+        "summary": summary,
+        "variables": (end or {}).get("variables") or {},
+    }
 
 
 __all__ = [
@@ -1645,6 +2326,7 @@ __all__ = [
     "audit_tail",
     "create_draft",
     "debug_workflow",
+    "get_debug_session",
     "get_workflow",
     "list_drafts",
     "load_published",

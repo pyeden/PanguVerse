@@ -97,10 +97,10 @@ class TestAtomContract:
 class TestPackRegistry:
     def test_builtin_packs_and_domains(self):
         registry = builtin_pack_registry(reload=True)
-        assert sorted(pack_names()) == ["api_testing", "core", "local_fs"]
-        assert registry.domains() == ["api", "core", "filesystem"]
-        assert len(registry.atoms()) == 24
-        assert registry.capabilities() == ("network", "filesystem")
+        assert sorted(pack_names()) == ["api_testing", "core", "local_fs", "web_research"]
+        assert registry.domains() == ["api", "core", "filesystem", "web_research"]
+        assert len(registry.atoms()) == 28
+        assert registry.capabilities() == ("network", "filesystem", "needs_llm")
 
     def test_semantics_resolution_is_per_atom(self, registry):
         assert registry.semantics_for("http_request").name == "api_testing"
@@ -110,7 +110,7 @@ class TestPackRegistry:
 
     def test_manifest_is_reviewable(self):
         manifest = builtin_pack_registry(reload=True).manifest()
-        assert manifest["atom_count"] == 24
+        assert manifest["atom_count"] == 28
         assert {pack["name"] for pack in manifest["packs"]} == set(pack_names())
         for pack in manifest["packs"]:
             assert pack["version"] and pack["description"]
@@ -134,7 +134,7 @@ class TestPackRegistry:
         registry = builtin_pack_registry(reload=True).build_atom_registry()
         assert isinstance(registry, AtomRegistry)
         assert registry.get("http_request").domain == "api"
-        assert len(registry.packs()) == 3
+        assert len(registry.packs()) == 4
 
     def test_semantics_are_replaceable_without_touching_core(self):
         class MySemantics(ApiTestingSemantics):
@@ -546,7 +546,7 @@ class TestIntentTemplates:
 
         templates = RuleBasedPlanner(registry).templates()
         packs = {template.pack for template in templates}
-        assert packs == {"api_testing", "local_fs"}
+        assert packs == {"api_testing", "local_fs", "web_research"}
         assert {"health_check", "fs_config_backup"} <= {template.name for template in templates}
 
     def test_non_api_intent_plans_and_runs(self, registry, tmp_path):
@@ -580,6 +580,7 @@ class TestIntentTemplates:
         per_pack = {pack["name"]: pack["intent_templates"] for pack in manifest["packs"]}
         assert len(per_pack["api_testing"]) == 7
         assert len(per_pack["local_fs"]) == 3
+        assert len(per_pack["web_research"]) == 1
         assert per_pack["core"] == []
 
 

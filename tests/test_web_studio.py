@@ -324,28 +324,48 @@ def test_debug_is_isolated_and_url_override_rejected(api: WebAPI, tmp_path: Path
     wid = draft["wid"]
     node_id = draft["graph"]["nodes"][0]["id"]
 
-    status, debug = call(
+    status, started = call(
         api,
         "POST",
         f"/api/studio/{wid}/debug",
         {"rev": 0, "node_id": node_id, "mode": "only"},
     )
-    assert status == 200, debug
-    step_trace = debug["trace"][0]
-    assert step_trace["node_id"] == node_id
-    assert {"inputs", "outputs", "duration_ms", "status", "error"} <= set(step_trace)
-    assert step_trace["duration_ms"] >= 0
+    assert status == 202, started
+    assert started["session_id"].startswith("dbg-")
+
+    cursor = 0
+    debug = None
+    seen: list[dict[str, Any]] = []
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        status, debug = call(
+            api, "GET", f"/api/studio/debug/{started['session_id']}?cursor={cursor}"
+        )
+        assert status == 200, debug
+        seen.extend(debug.get("nodes") or [])
+        cursor = max(cursor, int(debug.get("cursor") or 0))
+        if debug.get("done"):
+            break
+        time.sleep(0.02)
+    assert debug and debug.get("done") is True
+    step_trace = [item for item in seen if item["node_id"] == node_id and item["status"] == "passed"]
+    assert step_trace
+    final = step_trace[-1]
+    assert {"inputs", "outputs", "duration_ms", "status", "error"} <= set(final)
+    assert final["duration_ms"] >= 0
     assert debug["variables"]["env"]["API_PASSWORD"] == "***"
     assert "super-secret-value" not in json.dumps(debug, ensure_ascii=False)
     assert debug["variables"]["env"]["FS_ROOT"] == str(fs_root.resolve())
     assert service.list_runs(api.root) == []  # 调试不进正式历史
 
-    debug_files = list((api.root / ".panguverse" / "studio" / wid / "debug").glob("*.json"))
+    debug_files = list((api.root / ".panguverse" / "studio" / wid / "debug").glob("*.jsonl"))
     assert debug_files
     assert mode_of(debug_files[0]) == 0o600
     disk_text = debug_files[0].read_text(encoding="utf-8")
     assert "super-secret-value" not in disk_text
     assert "***" in disk_text
+    snapshots = list((api.root / ".panguverse" / "studio" / wid / "debug").glob("*.json"))
+    assert snapshots and mode_of(snapshots[0]) == 0o600
 
     status, body = call(
         api,

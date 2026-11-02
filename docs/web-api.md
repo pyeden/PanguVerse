@@ -450,7 +450,7 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 - env 基线只在「成功运行」后更新；一次失败的运行不会污染下一次的默认目标。
 - `axe/llm.py` 的 LLM 请求回环地址（本机 ollama）已走 `ProxyHandler({})` 直连，与 `http/client.py` 规则一致；非回环地址仍尊重系统/环境代理。
 
-## 7. 工作台（Studio，契约 `tasks/workbench-mvp-spec.md` v5.0）
+## 7. 工作台（Studio，契约 `tasks/workbench-accuracy-spec.md` v6.0）
 
 工作台把 planner 的线性计划转成图，并提供「草案 → 人工裁决 → 隔离调试 → 审阅发布 → 绑定项目运行」的后端能力。
 实现：`panguverse/web/graph.py`（纯函数）、`panguverse/web/studio.py`（落盘/审计/调试）。
@@ -462,7 +462,8 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 <ws>/.panguverse/studio/<wid>/revisions/<rev>.json    # 不可变：nodes/edges/env_schema/message/created_by
 <ws>/.panguverse/studio/<wid>/audit.jsonl             # append-only：state/publish/diff/revision/debug
 <ws>/.panguverse/studio/<wid>/proposals/<rev>.json    # replan 提案（未应用）
-<ws>/.panguverse/studio/<wid>/debug/<id>.json         # 调试快照（不进 runs）
+<ws>/.panguverse/studio/<wid>/debug/<sid>.jsonl      # 异步调试会话增量（0600，不进 runs）
+<ws>/.panguverse/studio/<wid>/debug/<sid>.json       # 完成后的调试快照（0600）
 <ws>/.panguverse/studio/<wid>/ui.json                 # 画布坐标（不产生新 rev）
 <ws>/.panguverse/studio/<wid>/published/<rev>.json    # 发布记录（只写一次）
 <ws>/.panguverse/executions/<run_id>/execution.json   # trigger=task|studio|debug|manual
@@ -475,7 +476,7 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/api/studio/drafts` | `{intent, domain_pack?, exclude_atoms?}` → 201 `{wid, rev:0, state, graph, validation}` |
+| POST | `/api/studio/drafts` | `{intent, domain_pack?, exclude_atoms?, allow_llm?}` → 201 `{wid, rev:0, state, planner, plan_source, confidence, assumptions, capability_gaps, graph, validation}`；无法表达 → **422 `capability_gap`**（无 graph） |
 | GET | `/api/studio/drafts` | `?status=&domain_pack=` → `{drafts:[...]}` |
 | GET | `/api/studio/{wid}` | `?rev=` 取图 + 元信息 + `ui` |
 | PATCH | `/api/studio/{wid}/nodes/{nid}` | 改参数/改名/锁定/替换原子/`case_id` → 新 rev（`origin=human`） |
@@ -484,14 +485,43 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 | POST | `/api/studio/{wid}/edges` | `{from,to,via?,kind?}` → 新 rev（201） |
 | POST | `/api/studio/{wid}/replan` | `{instruction}` → `{diff, proposed_rev}`；不自动应用 |
 | POST | `/api/studio/{wid}/apply-diff` | `{proposed_rev, accepted:[change_id]}` → 新 rev |
-| POST | `/api/studio/{wid}/validate` | `{rev?}` → `{errors,warnings,risks,affected_nodes}` |
-| POST | `/api/studio/{wid}/debug` | `{rev?, node_id, mode, project_id?, env?}` → `{trace,variables}` |
+| POST | `/api/studio/{wid}/validate` | `{rev?, checks?:{intent?,env?,capability?}}` → `{errors,warnings,risks,affected_nodes,coverage,missing_env,capability_gaps}` |
+| POST | `/api/studio/{wid}/debug` | `{rev?, node_id, mode, project_id?, env?}` → **202** `{session_id,total,cursor,done:false}` |
+| GET | `/api/studio/debug/{session_id}` | `?cursor=` → `{session_id,cursor,done,nodes:[{node_id,status,reason,attempts,duration_ms,error,inputs,outputs}],summary}` |
 | POST | `/api/studio/{wid}/review` | `{base_rev?, rev}` → `{diff, risks, validation, audit_tail}` |
 | POST | `/api/studio/{wid}/state` | `{to:"review|approved|rejected", note?, risk_ack?, confirmed_risks?}` |
 | POST | `/api/studio/{wid}/publish` | `{rev, message}` → `{workflow_ref:"<wid>@<rev>"}` |
 
 节点坐标：`PATCH .../nodes/{nid}` 只带 `{"ui":{"x":..,"y":..}}` 时只更新 `ui.json`，**不产生新 rev**。
 其它字段变更一律产生新 rev，并把 `state` 重置为 `draft`（旧批准失效）。
+
+### 7.2a 规划来源与能力缺口（v6.0 §2）
+
+- 草稿响应显式标注 `planner` / `plan_source`（`llm|rules|template`）、`confidence`、`assumptions[]`、
+  `capability_gaps[]`；规则/模板来源固定低置信度（≤0.5），界面必须提示人工核对。
+- 规则/模板必须**领域 + 动作双重命中**；不命中不产出图，直接 422：
+  ```json
+  {"error":{"code":"capability_gap","message":"...","missing_atoms":["web_screenshot","ocr_image"],
+            "suggestions":["需要新增原子：..."],"intent":"..."}}
+  ```
+- LLM 规划（`allow_llm:true`）的提示词包含**原子清单 + 端口契约**；输出逐节点校验原子存在，
+  发明原子按 `capability_gap` 处理，**不静默丢节点**；LLM 失败不回退演示模板。
+- 领域包 `web_research` 提供 `http_get_page` / `html_extract_text` / `html_extract_structure` /
+  `llm_summarize`，全部只读；`llm_summarize` 无密钥 → `missing_llm` 硬失败，不产出占位。
+
+### 7.2b 语义校验与发布阻断（v6.0 §3）
+
+`validate` 在三类检查默认全开（可用 `checks:{intent:false,...}` 关闭）：
+
+| 检查 | 规则 | 错误码 |
+| --- | --- | --- |
+| 意图覆盖 | 非 helper 节点须映射到意图动作/实体词；`ratio < 0.6` → error | `intent_mismatch` |
+| 环境就绪 | `${env.X}` 必须在基线 env / 请求 env / assumptions 中 | `missing_env` |
+| 能力缺口 | 意图动作没有对应原子 | `capability_gap` |
+
+响应固定带 `coverage:{matched,total,ratio}`（含 `matched_nodes/unmatched_nodes`）、`missing_env[]`、
+`capability_gaps[]`。`publish` 遇到 `intent_mismatch` / `capability_gap` 返回 **409** 并回吐
+`details.validation` 与 `details.blocking[]`。
 
 ### 7.3 图语义（不伪造依赖）
 
@@ -528,9 +558,12 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 - 环境只能来自：工作区 `last_env` 基线，或 `project_id` 对应项目的 `env`（项目 env 优先）。
 - 请求体若出现 `base_url` / `url` / `target` / `endpoint` 等 URL 类字段，或 `env` 里出现 URL 类键
   （`BASE_URL`、`*_URL`、`HOST`…）→ **400**；`env` 里给出基线不存在的键、或值与基线不同，同样 400。
-- `trace[]` 含每步 `inputs/outputs/duration_ms/status/error`；`variables` 为 `{vars:{name:{value,source,from_snapshot}}, env:{...}}`。
-  inputs/outputs 先按执行期 `secret_values` 与敏感键名打码，再走与 HTTP 出口相同的 `mask_env_payload`；
-  磁盘调试快照同样只存打码后的副本。
+- **异步会话**：`POST /debug` 立即返回 202 `{session_id}`；后台线程逐节点执行并写
+  `debug/<sid>.jsonl`（0600）。`GET /api/studio/debug/{sid}?cursor=N` 增量返回
+  `nodes:[{node_id,status,reason,attempts,duration_ms,error,inputs,outputs}]` 与 `summary:{passed,failed,skipped,by_reason}`。
+- 节点状态：`pending|running|passed|failed|skipped`；`skipped/failed` 必带原因码：
+  `when_false|foreach_empty|upstream_failed|optional|assertion|network|missing_env|missing_llm|cancelled`。
+- 会话完成后额外写 `debug/<sid>.json` 快照（兼容旧读取）；两者都只存打码后的副本，**不进 `/api/runs`**。
 
 ### 7.7 审计
 

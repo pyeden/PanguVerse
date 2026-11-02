@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from typing import Any
 
 from ..core.errors import PlanError
@@ -51,9 +52,12 @@ SYSTEM_PROMPT = """你是 PanguVerse 的「盘古斧」规划器，负责把自�
   ]
 }
 通用约束：
-1. 只使用清单里存在的原子与它们的输入名；
-2. 会产生断言语义的步骤，紧跟对应的断言原子；
-3. 只输出 JSON，不要任何解释文字。
+1. 只使用清单里存在的原子与它们的输入名；**严禁发明原子**——不在清单里的原子会让整份计划被拒绝；
+2. 每个步骤的 with 只能使用该原子声明的输入端口（见下方端口契约），必填端口不能缺失；
+3. 会产生断言语义的步骤，紧跟对应的断言原子；
+4. 只输出 JSON，不要任何解释文字；
+5. 可选给出 "confidence"（0–1 自评）、"assumptions"（依赖但未提供的 env）、
+   "capability_gaps"（清单里没有的能力）；不要用无关模板凑数。
 各领域的写法约束见下（来自对应的领域包）："""
 
 
@@ -225,7 +229,29 @@ class LLMPlanner:
         raw_cases = data.get("cases")
         if not isinstance(raw_cases, list) or not raw_cases:
             raise PlanError(f"LLM 返回的 cases 非法: {str(data)[:200]}")
+        # 逐节点校验原子存在：发明原子视为能力缺口，绝不静默丢弃节点
+        unknown: list[str] = []
+        for raw_case in raw_cases:
+            if not isinstance(raw_case, Mapping):
+                continue
+            for raw_step in raw_case.get("steps") or []:
+                if not isinstance(raw_step, Mapping):
+                    continue
+                use = str(raw_step.get("use") or raw_step.get("atom") or "")
+                if use and not self.registry.has(use) and use not in unknown:
+                    unknown.append(use)
+        if unknown:
+            raise PlanError("原子不存在: " + ", ".join(unknown))
         cases = [Molecule.from_spec(spec, source="llm") for spec in raw_cases]
+        meta: dict[str, Any] = {"llm_used": True, "model": getattr(self.client, "model", "")}
+        if isinstance(data.get("confidence"), (int, float)) and not isinstance(data.get("confidence"), bool):
+            meta["confidence"] = max(0.0, min(1.0, float(data["confidence"])))
+        if isinstance(data.get("assumptions"), list):
+            meta["assumptions"] = [str(item) for item in data["assumptions"] if str(item).strip()]
+        if isinstance(data.get("capability_gaps"), list):
+            meta["capability_gaps"] = [
+                str(item) for item in data["capability_gaps"] if str(item).strip()
+            ]
         return TestPlan(
             cases=cases,
             source="llm",
@@ -233,17 +259,19 @@ class LLMPlanner:
             intent=request.intent,
             env=dict(request.env),
             notes=[f"AI 规划：{len(cases)} 个用例（模型 {getattr(self.client, 'model', '?')}）"],
-            meta={"llm_used": True, "model": getattr(self.client, "model", "")},
+            meta=meta,
         )
 
     def _build_prompt(self, request: PlanRequest, *, repair: list[str] | None = None) -> str:
         catalog = json.dumps(self.registry.catalog(), ensure_ascii=False, indent=1)
         env_keys = ", ".join(sorted(request.env)) or "（未提供；模板里可用 ${env.NAME} 引用）"
         hints = _domain_hints(self.registry)
+        ports = self._port_contract()
         parts = [
             f"自动化意图：{request.intent or '（未提供，按冒烟主线设计）'}",
             "环境变量（可在模板里引用 ${env.NAME}）：" + env_keys,
             "可用原子清单（JSON）：\n" + catalog,
+            "端口契约（with 只能用这些输入名；required 为必填）：\n" + ports,
         ]
         if hints:
             parts.append("领域写法约束：\n" + "\n".join(f"- {hint}" for hint in hints))
@@ -254,6 +282,17 @@ class LLMPlanner:
                 "上一轮输出存在以下问题，请修正后重新输出完整 JSON：\n- " + "\n- ".join(repair)
             )
         return "\n\n".join(parts)
+
+    def _port_contract(self) -> str:
+        """把每个原子的输入端口压成可读契约，避免 LLM 发明参数名。"""
+        lines: list[str] = []
+        for atom in self.registry.list():
+            inputs = ", ".join(
+                f"{port.name}:{port.type}{'' if port.required else '?'}"
+                for port in atom.input_ports()
+            ) or "（无输入）"
+            lines.append(f"- {atom.name}（{atom.pack or atom.domain}）: {inputs}")
+        return "\n".join(lines)
 
     def _degrade(self, request: PlanRequest, reason: str) -> TestPlan:
         if self.fallback is None:

@@ -472,6 +472,18 @@ class WebAPI:
             raise ApiError("not_found", "接口不存在")
         actor = self._actor(headers)
 
+        # GET /api/studio/debug/{session_id}?cursor= —— 增量读取异步调试会话
+        if rest[0] == "debug":
+            if len(rest) == 2 and method == "GET":
+                return json_response(
+                    studio.get_debug_session(
+                        self.root,
+                        rest[1],
+                        cursor=_cursor_query(query, "cursor", 0),
+                    )
+                )
+            raise ApiError("not_found", "接口不存在")
+
         if rest[0] == "drafts":
             if len(rest) != 1:
                 raise ApiError("not_found", "接口不存在")
@@ -516,7 +528,7 @@ class WebAPI:
                 return json_response(self._studio_validate(wid, body))
             if action == "debug" and method == "POST":
                 return json_response(
-                    studio.debug_workflow(self.root, wid, body, actor=actor)
+                    studio.debug_workflow(self.root, wid, body, actor=actor), status=202
                 )
             if action == "review" and method == "POST":
                 return json_response(studio.review(self.root, wid, body))
@@ -546,6 +558,9 @@ class WebAPI:
         current = int(workflow.get("current_rev") or 0)
         rev = _rev_query(data.get("rev"), current)
         revision = studio.read_revision(self.root, wid, rev)
+        request_env = data.get("env") if isinstance(data.get("env"), dict) else {}
+        baseline = service.load_last_env(self.root)
+        available_env = set(baseline) | {str(key) for key in request_env}
         return studio.validate_nodes(
             self.root,
             wid=wid,
@@ -554,6 +569,10 @@ class WebAPI:
             edges=revision.get("edges") or [],
             intent=str(workflow.get("intent") or ""),
             env_schema=revision.get("env_schema") or [],
+            assumptions=revision.get("assumptions") or workflow.get("assumptions") or [],
+            available_env=available_env,
+            checks=data.get("checks"),
+            domain_pack=str(workflow.get("domain_pack") or ""),
         )
 
     # ------------------------------------------------------------------ #
@@ -638,6 +657,17 @@ def _int_query(
     except ValueError as exc:
         raise ApiError("bad_request", f"{key} 必须是整数") from exc
     return max(1, min(maximum, value))
+
+
+def _cursor_query(query: dict[str, list[str]], key: str, default: int = 0) -> int:
+    raw = _first(query, key)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ApiError("bad_request", f"{key} 必须是整数") from exc
+    return max(0, value)
 
 
 def _offset_query(query: dict[str, list[str]], key: str, default: int) -> int:
