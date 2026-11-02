@@ -21,6 +21,8 @@ QUEUED = "queued"
 RUNNING = "running"
 DONE = "done"
 FAILED = "failed"
+CANCELLED = "cancelled"
+TERMINAL = (DONE, FAILED, CANCELLED)
 
 DEFAULT_TIMEOUT = 300.0
 MAX_JOBS = 200
@@ -63,6 +65,7 @@ class Job:
         self.summary: dict[str, Any] | None = None
         self.conclusion: dict[str, Any] | None = None
         self.error: str | None = None
+        self._cancel_requested = False
         #: 终态回调（如回写任务的 last_run_id）：在状态切到终态时同步执行，
         #: 保证「客户端看到 done/failed 时」旁路数据已经落盘
         self.on_finish: Callable[[Job], None] | None = None
@@ -75,6 +78,31 @@ class Job:
                 return
             self.status = RUNNING
             self.started_at = time.time()
+
+    @property
+    def cancel_requested(self) -> bool:
+        with self._lock:
+            return self._cancel_requested
+
+    def request_cancel(self) -> bool:
+        """请求取消：正在运行的 job 在当前步骤结束后停；已终态返回 False。"""
+        with self._lock:
+            if self.status in TERMINAL:
+                return False
+            self._cancel_requested = True
+            return True
+
+    def cancel(self, message: str = "用户取消") -> bool:
+        """立即把 queued job 标记为 cancelled；运行中的 job 由执行器协作退出。"""
+        with self._lock:
+            if self.status in TERMINAL:
+                return False
+            self._cancel_requested = True
+            self.status = CANCELLED
+            self.error = sanitize_message(message)
+            self.finished_at = time.time()
+            self._notify_finished()
+            return True
 
     def add_phase(self, name: str, status: str = "ok", detail: str = "") -> None:
         with self._lock:
@@ -93,7 +121,7 @@ class Job:
     ) -> bool:
         """标记完成；已进入终止态（超时/失败）时不再改写。"""
         with self._lock:
-            if self.status in (DONE, FAILED):
+            if self.status in TERMINAL:
                 return False
             if run_id:
                 self.run_id = run_id
@@ -109,7 +137,7 @@ class Job:
     def fail(self, message: Any) -> bool:
         """标记失败；已进入终止态时不再改写。"""
         with self._lock:
-            if self.status in (DONE, FAILED):
+            if self.status in TERMINAL:
                 return False
             self.status = FAILED
             self.error = sanitize_message(message)
@@ -207,6 +235,8 @@ class JobManager:
     # ------------------------------------------------------------------ #
     def _worker(self, job: Job, task: Callable[[Job], dict[str, Any] | None]) -> None:
         job.start()
+        if job.status == CANCELLED:
+            return
         watchdog: threading.Timer | None = None
         if self.timeout > 0:
             watchdog = threading.Timer(self.timeout, job.fail, args=("timeout",))
@@ -230,11 +260,12 @@ class JobManager:
             return
         ordered = sorted(self._jobs.values(), key=lambda item: item.created_at)
         for job in ordered[: len(self._jobs) - MAX_JOBS]:
-            if job.status in (DONE, FAILED):
+            if job.status in TERMINAL:
                 self._jobs.pop(job.job_id, None)
 
 
 __all__ = [
+    "CANCELLED",
     "DONE",
     "FAILED",
     "QUEUED",

@@ -563,3 +563,76 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 - 锁定冲突：`locked_nodes:["node_id"]`
 - 未确认风险：`risks:[{id,node_id,kind,level,message}]`
 - 悬空/非法变更：`edges:[...]`（如适用）
+
+## 8. W8 收口（契约 v5.1 §5.1）
+
+P0 补齐执行中心、软归档、报告签署/作废；原子启用/停用明确为 **P1，不在本轮实现**。
+统一审计落 `<ws>/.panguverse/web/audit.jsonl`（append-only、`0600`），每条含
+`actor/action/target/from/to/note` 与 `ts/at`。
+
+### 8.1 执行列表 / 详情
+
+`GET /api/executions?project=&status=&offset=&limit=`
+
+- 数据源：磁盘 `runs/` + 内存 job **合并**；同一 `run_id` 只保留一条（job 状态覆盖运行态）。
+- 字段：`eid/execution_id/run_id/job_id/batch_id/mode/trigger/project_id/suite_id/workflow_ref/status/run_status/passed/total/duration_ms/started_at/finished_at/error/conclusion/summary/phases/cancellable`。
+- `eid`：有 `run_id` 时等于 `run_id`，否则为 `job_id`；详情/取消都接受 `eid`、`job_id`、`run_id`。
+- `status` 过滤：`all|queued|running|done|failed|cancelled`，也兼容 `passed|failed|errored`（按报告结论）。
+- `project`：项目 id；`unclassified|none|_` 表示无项目归属。
+- `offset ≥ 0`，`limit` 1–500（默认 50）；返回 `{executions,total,offset,limit}`。
+
+`GET /api/executions/{eid}` → 单条执行详情（含 `phases`、`summary`、`conclusion`）。
+
+### 8.2 取消执行
+
+`POST /api/executions/{eid}/cancel` → `{eid, job_id?, batch_id?, status, cancelled_suites?}`
+
+- **job**：设置协作取消标记；执行器在**当前步骤结束后**停止，剩余步骤记 `skipped`；
+  `status="cancelling"`，job 终态变为 `cancelled`，已产生的报告保留。
+- **queued job**：立即 `cancelled`。
+- **batch**：`eid` 可以是 batch id，或属于该 batch 的 job/run id。已完成的 run 保留；
+  未开始的套件标记 `cancelled` 且不产生 run；正在运行的套件按 job 语义停。
+- **已结束**（done/failed/cancelled）或不存在 → **409**；非法 id → 400。
+- 审计 `action="execution.cancel"`，`target="execution:<eid>"` 或 `"batch:<batch_id>"`。
+
+### 8.3 任务 / 项目软归档
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/tasks/{task_id}/archive` | 写 `archived_at`，不删除配置 |
+| POST | `/api/tasks/{task_id}/unarchive` | 移除 `archived_at` |
+| POST | `/api/projects/{pid}/archive` | 写 `archived_at` |
+| POST | `/api/projects/{pid}/unarchive` | 移除 `archived_at` |
+
+- `GET /api/tasks`、`GET /api/projects` 默认排除已归档；`?include_archived=1` 可看全部。
+- 归档后详情仍可读；历史运行、报告、批次产物不受影响。
+- 列表里的 `archived_at` 只在归档对象上出现，未归档对象的既有字段集合不变。
+- 审计 `task.archive/task.unarchive/project.archive/project.unarchive`。
+
+### 8.4 报告列表 / 签署 / 作废
+
+`GET /api/reports?project=&status=&offset=&limit=`
+
+- 每条：`run_id/project_id/suite_id/suite_name/trigger/status/conclusion/summary/passed/total/duration_ms/workflow_ref/has_insight/insight_source/sign_state/signed/voided/verdict/note/signed_by/signed_at/void_reason/voided_by/voided_at/started_at/finished_at`。
+- `has_insight` = 是否存在有效的 AI 总结缓存（不触发生成）。
+- `status` 过滤：`all|unsigned|signed|voided`，也兼容运行状态 `passed|failed|errored|done`。
+- 返回 `{reports,total,offset,limit}`。
+
+`POST /api/reports/{run_id}/sign` `{verdict,note?,force?}`
+
+- `verdict` 必填；`note` 可选。首次签署成功。
+- 已签署再签 → **409**；带 `force:true` 可覆盖，历史签名保留在 `history` 且审计含 `from→to`。
+- 已作废 → **409**，不可再签。
+
+`POST /api/reports/{run_id}/void` `{reason}`
+
+- `reason` 必填；作废后 `voided=true`，**不可撤销**，重复作废 → 409。
+- 报告本体 `runs/<id>/report.json` 永不修改；人工结论落
+  `<ws>/.panguverse/web/reports/<run_id>.json`（`0600`）。
+- 审计 `report.sign/report.void`，`target="report:<run_id>"`。
+
+### 8.5 零回归
+
+- `/api/runs` 仍返回数组；`/api/runs/query` 分页不变；认证、studio、insight、错误体不变。
+- 新增字段只在归档/签署/工作流等对象上出现；未归档任务/项目的既有列表字段集合不变。
+- 新错误码沿用统一错误体：`{"error":{"code","message"}}`；取消已结束执行与重复签署返回 409。

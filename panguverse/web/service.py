@@ -36,7 +36,7 @@ from ..engine.result import RunResult
 from ..report import DEFAULT_FORMATS, write_all
 from ..report.json_report import conclusion as report_conclusion
 from ..spec.loader import TestSuite, load_suite
-from . import insight, projects, tasks_store
+from . import audit, insight, projects, tasks_store
 from .jobs import Job, JobManager, sanitize_message
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -708,6 +708,9 @@ def _execute(
     attribution: dict[str, str] | None = None,
     extra_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    from .executions import install_cancellation
+
+    install_cancellation(axe, job)
     job.add_phase("plan", "ok", f"{plan.size} 个用例来自 {plan.source}")
     if not plan.cases:
         job.add_phase("plan", "failed", "计划中没有任何用例")
@@ -730,6 +733,9 @@ def _execute(
 
     axe.validate(plan)
     job.add_phase("validate", "ok", "计划校验通过")
+    if job.cancel_requested:
+        job.cancel("用户取消")
+        return {"run_id": "", "summary": None, "conclusion": None, "cancelled": True}
 
     run_id = uuid.uuid4().hex[:12]
     job.set_run_id(run_id)
@@ -779,6 +785,9 @@ def _execute(
     )
     artifacts["plan"] = str(plan_path)
     job.add_phase("report", "ok", f"产物目录 {out_dir}")
+    cancelled = bool(job.cancel_requested)
+    if cancelled:
+        job.cancel("用户取消")
     _write_execution_record(
         root,
         run_id,
@@ -790,20 +799,20 @@ def _execute(
     )
 
     # 全部用例 errored（目标不可达等基础设施问题）不算「测试没通过」：判 failed 并给首个原因
-    if summary["passed"] == 0 and summary["errored"] == summary["total"]:
+    if not cancelled and summary["passed"] == 0 and summary["errored"] == summary["total"]:
         reason = _first_error_message(run) or "全部用例执行错误（目标服务不可达？）"
         job.fail(reason)
         raise RuntimeError(reason)
 
     # 只有成功的运行才更新 env 基线（失败运行可能带着错误的地址/凭据）
-    if summary["success"]:
+    if summary["success"] and not cancelled:
         save_last_env(
             root,
             persist_env if persist_env is not None else effective_env,
             persist_target,
         )
 
-    if evolve:
+    if evolve and not cancelled:
         evolved = axe.evolution.evolve(run, seal=True)
         job.add_phase(
             "evolve",
@@ -813,7 +822,7 @@ def _execute(
             f"回归库共 {evolved.get('regression_size', 0)} 条",
         )
 
-    if regression:
+    if regression and not cancelled:
         regression_plan = axe.regression_plan(env=effective_env)
         if regression_plan.cases:
             regression_run = axe.executor.run(
@@ -843,6 +852,7 @@ def _execute(
         "run_id": run_id,
         "summary": _job_summary(run),
         "conclusion": _job_conclusion(run),
+        "cancelled": cancelled,
     }
 
 
@@ -872,7 +882,9 @@ def _write_execution_record(
             "job_id": job.job_id,
             "trigger": str(config.get("trigger") or "task"),
             "mode": str(config.get("mode") or ""),
-            "status": "ok" if summary.get("success") else "failed",
+            "status": job.status
+            if job.status in ("done", "failed", "cancelled")
+            else ("ok" if summary.get("success") else "failed"),
             "summary": summary,
             "project_id": (attribution or {}).get("project_id"),
             "suite_id": (attribution or {}).get("suite_id"),
@@ -1237,11 +1249,40 @@ def task_summary(task: dict[str, Any]) -> dict[str, Any]:
     }
     if task.get("workflow_ref"):
         summary["workflow_ref"] = task["workflow_ref"]
+    if task.get("archived_at"):
+        summary["archived_at"] = task["archived_at"]
     return summary
 
 
-def list_tasks(root: Path) -> list[dict[str, Any]]:
-    return [task_summary(task) for task in tasks_store.list_tasks(root)]
+def list_tasks(root: Path, *, include_archived: bool = False) -> list[dict[str, Any]]:
+    tasks = tasks_store.list_tasks(root)
+    if not include_archived:
+        tasks = [task for task in tasks if not task.get("archived_at")]
+    return [task_summary(task) for task in tasks]
+
+
+def archive_task(
+    root: Path, task_id: str, *, archived: bool = True, actor: str = "local"
+) -> dict[str, Any]:
+    """软归档 / 取消归档；不删配置，历史运行与报告不受影响。"""
+    task = tasks_store.read_task(root, task_id)
+    old = bool(task.get("archived_at"))
+    if archived:
+        task["archived_at"] = time.time()
+    else:
+        task.pop("archived_at", None)
+    task["updated_at"] = time.time()
+    written = tasks_store.write_task(root, task)
+    audit.append(
+        root,
+        actor=actor,
+        action="task.archive" if archived else "task.unarchive",
+        target=f"task:{task_id}",
+        from_=old,
+        to=archived,
+        note="",
+    )
+    return written
 
 
 def get_task(root: Path, task_id: str) -> dict[str, Any]:
@@ -1850,22 +1891,57 @@ def _last_run(entries: list[dict[str, Any]]) -> dict[str, Any] | None:
     }
 
 
-def list_project_summaries(root: Path) -> list[dict[str, Any]]:
+def list_project_summaries(
+    root: Path, *, include_archived: bool = False
+) -> list[dict[str, Any]]:
     grouped = _group_project_runs(root)
     items: list[dict[str, Any]] = []
     for project in projects.list_projects(root):
+        if project.get("archived_at") and not include_archived:
+            continue
         entries = grouped.get(project["project_id"], [])
-        items.append(
-            {
-                "project_id": project["project_id"],
-                "name": project.get("name", ""),
-                "base_url": project.get("base_url", ""),
-                "suite_count": len(project.get("suites") or []),
-                "last_run": _last_run(entries),
-                "pass_rate": _pass_rate(entries),
-            }
-        )
+        item = {
+            "project_id": project["project_id"],
+            "name": project.get("name", ""),
+            "base_url": project.get("base_url", ""),
+            "suite_count": len(project.get("suites") or []),
+            "last_run": _last_run(entries),
+            "pass_rate": _pass_rate(entries),
+        }
+        if project.get("archived_at"):
+            item["archived_at"] = project["archived_at"]
+        items.append(item)
     return items
+
+
+def archive_project(
+    root: Path, project_id: str, *, archived: bool = True, actor: str = "local"
+) -> dict[str, Any]:
+    """软归档项目；只改项目定义，不动 runs/ 历史。"""
+    from . import projects as project_store
+
+    old = False
+
+    def mutate(project: dict[str, Any]) -> None:
+        nonlocal old
+        old = bool(project.get("archived_at"))
+        if archived:
+            project["archived_at"] = time.time()
+        else:
+            project.pop("archived_at", None)
+        project["updated_at"] = time.time()
+
+    written, _ = project_store.modify_project(root, project_id, mutate)
+    audit.append(
+        root,
+        actor=actor,
+        action="project.archive" if archived else "project.unarchive",
+        target=f"project:{project_id}",
+        from_=old,
+        to=archived,
+        note="",
+    )
+    return written
 
 
 def get_project_detail(root: Path, project_id: str) -> dict[str, Any]:

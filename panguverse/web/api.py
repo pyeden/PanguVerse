@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote
 
 from ..report import html_report, junit
-from . import service, studio
+from . import executions, reports, service, studio
 from .auth import AuthManager, build_cookie
 from .batches import BatchManager
 from .jobs import JobManager
@@ -118,10 +118,14 @@ class WebAPI:
         self.root = service.resolve_workspace(workspace)
         self.jobs = jobs or JobManager()
         #: 批量运行表（内存态）；聚合数字优先读磁盘报告，读不到再退回 job.summary
-        self.batches = batches or BatchManager(
-            self.jobs,
-            load_summary=lambda run_id: service.run_summary(self.root, run_id),
-        )
+        if batches is not None:
+            self.batches = batches
+        else:
+            # 批次默认支持取消（P0）：未开始套件标 cancelled，已完成的 run 保留
+            self.batches = executions.CancellableBatchManager(
+                self.jobs,
+                load_summary=lambda run_id: service.run_summary(self.root, run_id),
+            )
         #: ``None`` = 关闭认证（--no-auth / 单元测试直接嵌入）；``serve`` 默认构造 AuthManager
         self.auth = auth
         #: 注入用的 LLM client（A44 假 client）；``None`` = 按环境变量自动判定
@@ -223,7 +227,14 @@ class WebAPI:
                 return json_response(service.list_scenarios(self.root))
             if head == "tasks":
                 if not rest:
-                    return json_response({"tasks": service.list_tasks(self.root)})
+                    return json_response(
+                        {
+                            "tasks": service.list_tasks(
+                                self.root,
+                                include_archived=_flag_query(query, "include_archived"),
+                            )
+                        }
+                    )
                 if len(rest) == 1:
                     return json_response(service.get_task(self.root, rest[0]))
             if head == "jobs":
@@ -234,6 +245,33 @@ class WebAPI:
                     if job is None:
                         raise ApiError("not_found", "job 不存在")
                     return json_response(job.to_dict())
+            if head == "executions":
+                if not rest:
+                    return json_response(
+                        executions.list_executions(
+                            self.root,
+                            self.jobs,
+                            self.batches,
+                            project=_first(query, "project"),
+                            status=_first(query, "status"),
+                            offset=_offset_query(query, "offset", 0),
+                            limit=_int_query(query, "limit", 50, maximum=500),
+                        )
+                    )
+                if len(rest) == 1:
+                    return json_response(
+                        executions.get_execution(self.root, self.jobs, self.batches, rest[0])
+                    )
+            if head == "reports" and not rest:
+                return json_response(
+                    reports.list_reports(
+                        self.root,
+                        project=_first(query, "project"),
+                        status=_first(query, "status"),
+                        offset=_offset_query(query, "offset", 0),
+                        limit=_int_query(query, "limit", 50, maximum=500),
+                    )
+                )
             if head == "runs":
                 if rest == ["query"]:
                     # 必须在 run_id 分支之前：'query' 不是合法 run_id，但语义上是子资源
@@ -287,7 +325,12 @@ class WebAPI:
             if head == "projects":
                 if not rest:
                     return json_response(
-                        {"projects": service.list_project_summaries(self.root)}
+                        {
+                            "projects": service.list_project_summaries(
+                                self.root,
+                                include_archived=_flag_query(query, "include_archived"),
+                            )
+                        }
                     )
                 if len(rest) == 1:
                     return json_response(service.get_project_detail(self.root, rest[0]))
@@ -305,6 +348,47 @@ class WebAPI:
                     raise ApiError("not_found", "batch 不存在")
                 return json_response(batch.snapshot())
         elif method == "POST":
+            if head == "executions" and len(rest) == 2 and rest[1] == "cancel":
+                return json_response(
+                    executions.cancel_execution(
+                        self.root,
+                        self.jobs,
+                        self.batches,
+                        rest[0],
+                        actor=self._actor(request_headers),
+                    )
+                )
+            if head == "reports" and len(rest) == 2:
+                if rest[1] == "sign":
+                    return json_response(
+                        reports.sign_report(
+                            self.root, rest[0], body, actor=self._actor(request_headers)
+                        )
+                    )
+                if rest[1] == "void":
+                    return json_response(
+                        reports.void_report(
+                            self.root, rest[0], body, actor=self._actor(request_headers)
+                        )
+                    )
+            if head == "tasks" and len(rest) == 2 and rest[1] in ("archive", "unarchive"):
+                return json_response(
+                    service.archive_task(
+                        self.root,
+                        rest[0],
+                        archived=rest[1] == "archive",
+                        actor=self._actor(request_headers),
+                    )
+                )
+            if head == "projects" and len(rest) == 2 and rest[1] in ("archive", "unarchive"):
+                return json_response(
+                    service.archive_project(
+                        self.root,
+                        rest[0],
+                        archived=rest[1] == "archive",
+                        actor=self._actor(request_headers),
+                    )
+                )
             if head == "projects":
                 if not rest:
                     return json_response(service.create_project(self.root, body), status=201)
@@ -567,6 +651,11 @@ def _offset_query(query: dict[str, list[str]], key: str, default: int) -> int:
     if value < 0:
         raise ApiError("bad_request", f"{key} 不能为负数")
     return value
+
+
+def _flag_query(query: dict[str, list[str]], key: str) -> bool:
+    raw = _first(query, key)
+    return bool(raw and raw.strip().lower() in ("1", "true", "yes", "on"))
 
 
 def _rev_query(raw: Any, default: int) -> int:
