@@ -609,10 +609,21 @@ def android_keyevent(
     return {"ok": True, "serial": target}
 
 
-def _artifact_dir(ctx: RunContext, kind: str) -> tuple[Path, Path]:
+def _artifact_root(ctx: RunContext) -> Path:
+    """产物根目录固定为 ``<workspace>/.panguverse``。
+
+    ``RunContext.workspace`` 可能是 ``Workspace`` 对象（root 已是 ``.panguverse``），
+    也可能是用户直接传入的工作区路径（root 是工作区本身）。两种情况都必须落到
+    ``<workspace>/.panguverse/artifacts/...``，不能污染工作区根目录。
+    """
     workspace = getattr(ctx, "workspace", None)
     root_value = getattr(workspace, "root", workspace)
-    root = Path(root_value) if root_value else Path(".panguverse")
+    base = Path(root_value) if root_value else Path(".")
+    return base if base.name == ".panguverse" else base / ".panguverse"
+
+
+def _artifact_dir(ctx: RunContext, kind: str) -> tuple[Path, Path]:
+    root = _artifact_root(ctx)
     target = root / "artifacts" / kind
     target.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):

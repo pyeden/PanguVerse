@@ -262,11 +262,22 @@ def chrome_dump_dom(url: str, *, timeout: float, virtual_time_ms: int) -> str:
     return out
 
 
-def _artifact_dir(ctx: RunContext, kind: str) -> tuple[Path, Path]:
-    """创建 ``<workspace>/.panguverse/artifacts/<kind>``（0700），返回 (目录, 相对根)。"""
+def _artifact_root(ctx: RunContext) -> Path:
+    """产物根目录固定为 ``<workspace>/.panguverse``。
+
+    ``RunContext.workspace`` 可能是 ``Workspace`` 对象（root 已是 ``.panguverse``），
+    也可能是用户直接传入的工作区路径（root 是工作区本身）。两种情况都必须落到
+    ``<workspace>/.panguverse/artifacts/...``，不能污染工作区根目录。
+    """
     workspace = getattr(ctx, "workspace", None)
     root_value = getattr(workspace, "root", workspace)
-    root = Path(root_value) if root_value else Path(".panguverse")
+    base = Path(root_value) if root_value else Path(".")
+    return base if base.name == ".panguverse" else base / ".panguverse"
+
+
+def _artifact_dir(ctx: RunContext, kind: str) -> tuple[Path, Path]:
+    """创建 ``<workspace>/.panguverse/artifacts/<kind>``（0700），返回 (目录, 相对根)。"""
+    root = _artifact_root(ctx)
     target = root / "artifacts" / kind
     target.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
@@ -374,8 +385,8 @@ def web_open(
                 raise AtomFailure(
                     f"等待文本超时：{wanted!r} 在 {attempts} 次渲染内未出现",
                     kind="timeout",
-                    failure_class="transient",
-                    detail={"url": url, "text": wanted, "attempts": attempts},
+                    failure_class="expectation",
+                    detail={"url": url, "text": wanted, "attempts": attempts, "retryable": False},
                 )
             time.sleep(min(step, remaining))
             payload = _open_page(
@@ -612,8 +623,8 @@ def web_wait_for_text(
     raise AtomFailure(
         f"等待文本超时：{wanted!r} 在 {attempts} 次渲染内未出现（{elapsed}ms）",
         kind="timeout",
-        failure_class="transient",
-        detail=detail,
+        failure_class="expectation",
+        detail={**detail, "retryable": False},
     )
 
 

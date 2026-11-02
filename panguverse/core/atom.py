@@ -63,6 +63,9 @@ class Atom:
     #: 哪些**输入的名字**本身就是「新建的变量名」（例如 ``set_var.name`` / ``json_get.save_as``）。
     #: 静态校验据此知道某个步骤会产出哪些变量，从而避免把正常引用误判成拼写错误。
     declares_variables: tuple[str, ...] = ()
+    #: 原子依赖的本机工具（``chrome`` / ``adb`` / ``simctl``）；无工具依赖为空。
+    #: 序列化到 ``/api/atoms``，供 UI 与规划器直接读取，无需从 tags 猜。
+    needs_tool: str = ""
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -82,6 +85,7 @@ class Atom:
         self.secret_inputs = tuple(self.secret_inputs)
         self.secret_outputs = tuple(self.secret_outputs)
         self.declares_variables = tuple(self.declares_variables)
+        self.needs_tool = str(self.needs_tool or "")
 
     # ------------------------------------------------------------------ #
     # 契约视图
@@ -190,6 +194,7 @@ class Atom:
             "aliases": list(self.aliases),
             "version": self.version,
             "effects": list(self.effects),
+            "needs_tool": self.needs_tool or None,
         }
         if self.pack:
             data["pack"] = self.pack
@@ -224,6 +229,7 @@ def atom(
     secret_outputs: Iterable[str] = (),
     idempotent: bool | None = None,
     effect_resolver: Callable[[Mapping[str, Any]], Iterable[str]] | None = None,
+    needs_tool: str = "",
 ) -> Callable[[Callable[..., Any]], Atom]:
     """装饰器写法：``@atom("http_request", ...) def http_request(ctx, url): ...``"""
 
@@ -249,6 +255,7 @@ def atom(
             secret_outputs=tuple(secret_outputs),
             idempotent=idempotent,
             effect_resolver=effect_resolver,
+            needs_tool=needs_tool,
         )
 
     return decorate
