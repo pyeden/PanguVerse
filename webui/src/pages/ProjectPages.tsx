@@ -51,6 +51,7 @@ function ProjectHeader({ project, current, children }: { project: Project; curre
           <div className="project-title-row">
             <h1>{project.name}</h1>
             <StatusBadge status={project.last_run ? statusOf(project.last_run) : 'none'} />
+            {project.archived_at ? <Badge tone="warn">已归档</Badge> : null}
           </div>
           <div className="project-meta-line">
             <span className="mono">{project.base_url || '未配置站点地址'}</span>
@@ -652,7 +653,8 @@ export function ProjectSettingsPage() {
   const [suiteWorkflow, setSuiteWorkflow] = useState('')
   const [suiteTags, setSuiteTags] = useState('')
   const [suiteEnv, setSuiteEnv] = useState<AnyRecord>({})
-  const [deleteProjectOpen, setDeleteProjectOpen] = useState(false)
+  const [archiveProjectOpen, setArchiveProjectOpen] = useState(false)
+  const [archiveProjectNext, setArchiveProjectNext] = useState(true)
   const [deletingSuite, setDeletingSuite] = useState<Suite | null>(null)
 
   useEffect(() => {
@@ -698,12 +700,14 @@ export function ProjectSettingsPage() {
     onError: (error: Error) => push(error.message, 'error'),
   })
 
-  const deleteProjectMutation = useMutation({
-    mutationFn: () => api.deleteProject(pid),
-    onSuccess: () => {
+  const archiveProjectMutation = useMutation({
+    mutationFn: (archived: boolean) => api.archiveProject(pid, archived),
+    onSuccess: (next, archived) => {
       queryClient.invalidateQueries({ queryKey: ['projects'] })
-      push('项目已删除；历史运行仍保留', 'ok')
-      navigate('/projects', { replace: true })
+      queryClient.setQueryData(['project', pid], next)
+      setArchiveProjectOpen(false)
+      push(archived ? '项目已归档；历史运行与报告保留' : '项目已取消归档', 'ok')
+      if (archived) navigate('/projects?include_archived=1', { replace: true })
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
@@ -759,14 +763,14 @@ export function ProjectSettingsPage() {
         </section>
 
         <aside className="panel danger-panel">
-          <SectionHeader title="危险区" description="删除只移除项目定义，不删运行历史与报告。" icon="warning" />
+          <SectionHeader title="归档项目" description="只归档，不删历史运行、报告与套件配置。" icon="shield" />
           <div className="danger-row">
-            <div><strong>删除项目</strong><p>套件绑定与项目环境将一并移除；已有运行仍可按 ID 回溯。</p></div>
-            <Button variant="danger" size="sm" icon="trash" onClick={() => setDeleteProjectOpen(true)}>删除</Button>
+            <div><strong>{project.archived_at ? '项目已归档' : '归档项目'}</strong><p>{project.archived_at ? `归档于 ${formatTime(project.archived_at)}；取消归档后恢复默认列表可见。` : '归档后默认项目列表不再显示；直接 URL 仍可访问，历史全部保留。'}</p></div>
+            <Button variant={project.archived_at ? 'soft' : 'danger'} size="sm" icon={project.archived_at ? 'refresh' : 'archive'} onClick={() => { setArchiveProjectNext(!project.archived_at); setArchiveProjectOpen(true) }}>{project.archived_at ? '取消归档' : '归档'}</Button>
           </div>
           <div className="aside-note">
             <Icon name="shield" size={15} />
-            <div><strong>审计优先</strong><p>报告与执行记录不提供物理删除；归档或作废需要后端审计接口支持。</p></div>
+            <div><strong>审计优先</strong><p>归档与取消归档都会写审计；历史 run、report.json 与套件绑定不变。</p></div>
           </div>
         </aside>
       </div>
@@ -858,14 +862,14 @@ export function ProjectSettingsPage() {
         onConfirm={() => deletingSuite && deleteSuiteMutation.mutate(deletingSuite.suite_id)}
       />
       <ConfirmDialog
-        open={deleteProjectOpen}
-        title="删除项目"
-        message={<>确定删除项目「{project.name}」？<br />套件与环境配置会移除，历史报告仍可按 run_id 查看。</>}
-        confirmLabel="删除项目"
-        danger
-        busy={deleteProjectMutation.isPending}
-        onClose={() => setDeleteProjectOpen(false)}
-        onConfirm={() => deleteProjectMutation.mutate()}
+        open={archiveProjectOpen}
+        title={archiveProjectNext ? '归档项目' : '取消归档项目'}
+        message={archiveProjectNext ? <>确定归档项目「{project.name}」？<br />只归档，不删历史运行、报告与套件配置；默认列表将不再显示。</> : <>确定取消归档项目「{project.name}」？项目会重新出现在默认列表。</>}
+        confirmLabel={archiveProjectNext ? '归档项目' : '取消归档'}
+        danger={archiveProjectNext}
+        busy={archiveProjectMutation.isPending}
+        onClose={() => setArchiveProjectOpen(false)}
+        onConfirm={() => archiveProjectMutation.mutate(archiveProjectNext)}
       />
     </div>
   )

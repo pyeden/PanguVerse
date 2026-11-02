@@ -2,10 +2,14 @@ import type {
   AnyRecord,
   Atom,
   Batch,
+  Execution,
+  ExecutionPageData,
+  ExecutionCancelResult,
   Insight,
   Job,
   Pack,
   Project,
+  ReportPageData,
   RunDetail,
   RunSummary,
   Scenario,
@@ -107,8 +111,9 @@ export const api = {
   logout: () => request<{ ok: boolean }>('api/auth/logout', { method: 'POST' }),
   status: () => request<StatusPayload>('api/status'),
 
-  projects: async () => {
-    const payload = await request<{ projects?: Project[] }>('api/projects')
+  projects: async (includeArchived = false) => {
+    const suffix = includeArchived ? '?include_archived=1' : ''
+    const payload = await request<{ projects?: Project[] }>(`api/projects${suffix}`)
     return payload.projects || []
   },
   project: (pid: string) => request<Project>(`api/projects/${encodeURIComponent(pid)}`),
@@ -117,6 +122,8 @@ export const api = {
     request<Project>(`api/projects/${encodeURIComponent(pid)}`, { method: 'PATCH', body }),
   deleteProject: (pid: string) =>
     request<null>(`api/projects/${encodeURIComponent(pid)}`, { method: 'DELETE' }),
+  archiveProject: (pid: string, archived = true) =>
+    request<Project>(`api/projects/${encodeURIComponent(pid)}/${archived ? 'archive' : 'unarchive'}`, { method: 'POST', body: {} }),
   addSuite: (pid: string, body: AnyRecord) =>
     request<AnyRecord>(`api/projects/${encodeURIComponent(pid)}/suites`, { method: 'POST', body }),
   updateSuite: (pid: string, sid: string, body: AnyRecord) =>
@@ -163,8 +170,22 @@ export const api = {
   jobs: () => request<Job[]>('api/jobs'),
   job: (jobId: string) => request<Job>(`api/jobs/${encodeURIComponent(jobId)}`),
 
-  tasks: async () => {
-    const payload = await request<{ tasks?: Task[] }>('api/tasks')
+  executions: (params: URLSearchParams) =>
+    request<ExecutionPageData>(`api/executions?${params.toString()}`),
+  execution: (eid: string) => request<Execution>(`api/executions/${encodeURIComponent(eid)}`),
+  cancelExecution: (eid: string, note = '') =>
+    request<ExecutionCancelResult>(`api/executions/${encodeURIComponent(eid)}/cancel`, { method: 'POST', body: { note } }),
+
+  reports: (params: URLSearchParams) =>
+    request<ReportPageData>(`api/reports?${params.toString()}`),
+  signReport: (runId: string, body: { verdict: string; note?: string; force?: boolean }) =>
+    request<AnyRecord>(`api/reports/${encodeURIComponent(runId)}/sign`, { method: 'POST', body }),
+  voidReport: (runId: string, reason: string) =>
+    request<AnyRecord>(`api/reports/${encodeURIComponent(runId)}/void`, { method: 'POST', body: { reason } }),
+
+  tasks: async (includeArchived = false) => {
+    const suffix = includeArchived ? '?include_archived=1' : ''
+    const payload = await request<{ tasks?: Task[] }>(`api/tasks${suffix}`)
     return payload.tasks || []
   },
   task: (taskId: string) => request<Task>(`api/tasks/${encodeURIComponent(taskId)}`),
@@ -173,6 +194,8 @@ export const api = {
     request<Task>(`api/tasks/${encodeURIComponent(taskId)}`, { method: 'PATCH', body }),
   deleteTask: (taskId: string) =>
     request<null>(`api/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' }),
+  archiveTask: (taskId: string, archived = true) =>
+    request<Task>(`api/tasks/${encodeURIComponent(taskId)}/${archived ? 'archive' : 'unarchive'}`, { method: 'POST', body: {} }),
   runTask: (taskId: string, body: AnyRecord = {}) =>
     request<{ job_id: string; status: string }>(`api/tasks/${encodeURIComponent(taskId)}/run`, {
       method: 'POST',

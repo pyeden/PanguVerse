@@ -29,7 +29,7 @@ export function HistoryPage() {
   const focus = route.query.get('focus') || ''
   const limit = 20
   const offset = (page - 1) * limit
-  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: api.projects })
+  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: () => api.projects() })
   const projects = projectsQuery.data || []
   const selectedProject = projects.find((project) => project.project_id === projectFilter)
 

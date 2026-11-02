@@ -60,6 +60,7 @@ export interface Project {
   pass_rate?: PassRate | null
   created_at?: number
   updated_at?: number
+  archived_at?: number
 }
 
 export interface PassRate {
@@ -105,6 +106,7 @@ export interface Task {
   last_run_id?: string
   last_status?: string
   workflow_ref?: string
+  archived_at?: number
   meta?: AnyRecord
 }
 
@@ -170,6 +172,84 @@ export interface Insight {
   corrections?: AnyRecord[]
   generated_at?: string
   [key: string]: any
+}
+
+
+export interface Execution {
+  eid: string
+  execution_id: string
+  run_id: string
+  job_id: string
+  batch_id: string
+  mode: string
+  trigger: string
+  project_id: string
+  suite_id: string
+  workflow_ref: string
+  status: string
+  run_status: string
+  passed: number
+  total: number
+  duration_ms: number
+  started_at?: number
+  finished_at?: number
+  created_at?: number
+  error?: string
+  conclusion?: AnyRecord
+  summary?: AnyRecord
+  phases?: { name: string; status: string; detail?: string }[]
+  cancellable: boolean
+}
+
+export interface ExecutionPageData {
+  executions: Execution[]
+  total: number
+  offset: number
+  limit: number
+}
+
+export interface ExecutionCancelResult {
+  eid: string
+  job_id?: string
+  batch_id?: string
+  status: string
+  cancelled_suites?: string[]
+}
+
+export interface ReportSummary {
+  run_id: string
+  project_id?: string
+  suite_id?: string
+  suite_name?: string
+  trigger?: string
+  status?: string
+  conclusion?: AnyRecord
+  summary?: AnyRecord
+  passed?: number
+  total?: number
+  duration_ms?: number
+  workflow_ref?: string
+  has_insight?: boolean
+  insight_source?: string
+  sign_state?: 'unsigned' | 'signed' | 'voided' | string
+  signed?: boolean
+  voided?: boolean
+  verdict?: string
+  note?: string
+  signed_by?: string
+  signed_at?: number
+  void_reason?: string
+  voided_by?: string
+  voided_at?: number
+  started_at?: number
+  finished_at?: number
+}
+
+export interface ReportPageData {
+  reports: ReportSummary[]
+  total: number
+  offset: number
+  limit: number
 }
 
 export interface StudioNode {

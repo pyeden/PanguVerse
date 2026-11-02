@@ -35,7 +35,8 @@ export function TasksPage() {
   const route = useRoute()
   const queryClient = useQueryClient()
   const { push } = useToast()
-  const tasksQuery = useQuery({ queryKey: ['tasks'], queryFn: api.tasks })
+  const includeArchived = route.query.get('include_archived') === '1'
+  const tasksQuery = useQuery({ queryKey: ['tasks', includeArchived], queryFn: () => api.tasks(includeArchived) })
   const scenariosQuery = useQuery({ queryKey: ['scenarios'], queryFn: api.scenarios, staleTime: 60_000 })
   const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: studioApi.listDrafts, staleTime: 15_000 })
   const [search, setSearch] = useState('')
@@ -43,13 +44,15 @@ export function TasksPage() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<Task | null>(null)
   const [detail, setDetail] = useState<Task | null>(null)
-  const [deleteTarget, setDeleteTarget] = useState<Task | null>(null)
+  const [archiveTarget, setArchiveTarget] = useState<Task | null>(null)
+  const [archiveNext, setArchiveNext] = useState(true)
   const [activeJob, setActiveJob] = useState<string>(route.query.get('job') || '')
   const [publishedHandled, setPublishedHandled] = useState(false)
   const [form, setForm] = useState({ name: '', mode: 'scenario', scenario: '', intent: '', workflow_ref: '', regression: false, no_llm: false })
   const [env, setEnv] = useState<AnyRecord>({})
 
   const tasks = tasksQuery.data || []
+  const archivedCount = tasks.filter((task) => !!task.archived_at).length
   const scenarios = scenariosQuery.data || []
   const publishedWorkflows = (draftsQuery.data || []).filter((workflow) => !!workflow.published_ref)
   const published = route.query.get('published') || ''
@@ -134,13 +137,13 @@ export function TasksPage() {
     onError: (error: Error) => push(error.message, 'error'),
   })
 
-  const remove = useMutation({
-    mutationFn: (taskId: string) => api.deleteTask(taskId),
-    onSuccess: () => {
+  const archiveMutation = useMutation({
+    mutationFn: ({ task, archived }: { task: Task; archived: boolean }) => api.archiveTask(task.task_id, archived),
+    onSuccess: (next, variables) => {
       queryClient.invalidateQueries({ queryKey: ['tasks'] })
-      setDeleteTarget(null)
-      setDetail(null)
-      push('任务定义已删除；历史运行保留', 'ok')
+      setArchiveTarget(null)
+      setDetail((current) => current?.task_id === variables.task.task_id ? { ...current, ...next } : current)
+      push(variables.archived ? '任务已归档；配置保留，历史运行与报告不变' : '任务已取消归档', 'ok')
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
@@ -182,6 +185,7 @@ export function TasksPage() {
         <div><span>最近运行失败</span><strong className={tasks.some((task) => task.last_status === 'failed') ? 'bad' : 'ok'}>{tasks.filter((task) => task.last_status === 'failed').length}</strong><small>失败定义不等于报告失败</small></div>
         <div><span>固定场景</span><strong>{tasks.filter((task) => task.mode === 'scenario').length}</strong><small>可绑定项目 / 套件</small></div>
         <div><span>流程任务</span><strong>{tasks.filter((task) => task.mode === 'workflow').length}</strong><small>绑定 wid@rev</small></div>
+        {includeArchived ? <div><span>已归档</span><strong>{archivedCount}</strong><small>仅显示，不参与运行</small></div> : null}
       </div>
 
       <div className="catalog-toolbar panel">
@@ -194,6 +198,15 @@ export function TasksPage() {
           <option value="regression">回归</option>
         </Select>
         <span className="toolbar-spacer" />
+        <button type="button" className={`archive-toggle ${includeArchived ? 'is-on' : ''}`} onClick={() => {
+          const next = new URLSearchParams(route.query)
+          if (includeArchived) next.delete('include_archived')
+          else next.set('include_archived', '1')
+          navigate(withQuery('/tasks', next), { replace: true })
+        }} aria-pressed={includeArchived}>
+          <span className="toggle-track"><span /></span>
+          显示已归档
+        </button>
         <span className="toolbar-count">{filtered.length} / {tasks.length}</span>
       </div>
 
@@ -212,13 +225,14 @@ export function TasksPage() {
             const meta = modeMeta[task.mode] || { label: task.mode, tone: 'neutral' as const, hint: '' }
             const lastStatus = task.last_status ? statusOf({ run_id: task.last_run_id || '', summary: { total: 1, failed: task.last_status === 'failed' ? 1 : 0, passed: task.last_status === 'passed' ? 1 : 0 } }) : 'none'
             return (
-              <article className="task-card" key={task.task_id}>
+              <article className={`task-card ${task.archived_at ? 'is-archived' : ''}`} key={task.task_id}>
                 <div className="task-card-main">
                   <span className={`task-icon tone-${meta.tone}`}><Icon name={task.mode === 'intent' ? 'spark' : task.mode === 'regression' ? 'history' : 'file'} size={18} /></span>
                   <div className="task-copy">
                     <div className="task-title-row">
                       <strong>{task.name}</strong>
                       <Badge tone={meta.tone}>{meta.label}</Badge>
+                      {task.archived_at ? <Badge tone="warn">已归档</Badge> : null}
                       {task.workflow_ref ? <Badge tone="ai"><Icon name="git" size={11} />{task.workflow_ref}</Badge> : null}
                     </div>
                     <p className="task-target mono">{task.mode === 'scenario' ? task.scenario : task.mode === 'intent' ? task.intent : task.mode === 'workflow' ? task.workflow_ref : meta.hint || '—'}</p>
@@ -241,8 +255,15 @@ export function TasksPage() {
                 </div>
                 <div className="task-actions">
                   <Button size="sm" variant="ghost" icon="eye" onClick={() => setDetail(task)}>详情</Button>
-                  <Button size="sm" variant="ghost" icon="edit" onClick={() => openEdit(task)}>编辑</Button>
-                  <Button size="sm" variant="primary" icon="play" loading={runTask.isPending && runTask.variables === task.task_id} onClick={() => runTask.mutate(task.task_id)}>运行</Button>
+                  {task.archived_at ? (
+                    <Button size="sm" variant="ghost" icon="refresh" onClick={() => { setArchiveTarget(task); setArchiveNext(false) }}>取消归档</Button>
+                  ) : (
+                    <>
+                      <Button size="sm" variant="ghost" icon="edit" onClick={() => openEdit(task)}>编辑</Button>
+                      <Button size="sm" variant="primary" icon="play" loading={runTask.isPending && runTask.variables === task.task_id} onClick={() => runTask.mutate(task.task_id)}>运行</Button>
+                      <Button size="sm" variant="ghost" icon="archive" onClick={() => { setArchiveTarget(task); setArchiveNext(true) }}>归档</Button>
+                    </>
+                  )}
                 </div>
               </article>
             )
@@ -336,26 +357,26 @@ export function TasksPage() {
         title={detail?.name}
         subtitle={detail ? `${detail.task_id} · ${modeMeta[detail.mode]?.label || detail.mode}` : ''}
         size="lg"
-        footer={<><Button variant="ghost" onClick={() => setDetail(null)}>关闭</Button><Button variant="ghost" icon="edit" onClick={() => detail && openEdit(detail)}>编辑</Button><Button variant="primary" icon="play" loading={runTask.isPending} onClick={() => detail && runTask.mutate(detail.task_id)}>运行任务</Button></>}
+        footer={<><Button variant="ghost" onClick={() => setDetail(null)}>关闭</Button>{detail?.archived_at ? <Button variant="soft" icon="refresh" onClick={() => { setArchiveTarget(detail); setArchiveNext(false) }}>取消归档</Button> : <><Button variant="ghost" icon="archive" onClick={() => { setArchiveTarget(detail); setArchiveNext(true) }}>归档</Button><Button variant="ghost" icon="edit" onClick={() => detail && openEdit(detail)}>编辑</Button><Button variant="primary" icon="play" loading={runTask.isPending} onClick={() => detail && runTask.mutate(detail.task_id)}>运行任务</Button></>}</>}
       >
-        {detail ? <TaskDetail task={detail} onDelete={() => setDeleteTarget(detail)} /> : null}
+        {detail ? <TaskDetail task={detail} onArchive={(archived) => { setArchiveTarget(detail); setArchiveNext(archived) }} /> : null}
       </Modal>
 
       <ConfirmDialog
-        open={!!deleteTarget}
-        title="删除任务"
-        message={<>确定删除任务「{deleteTarget?.name}」？<br />只删除任务定义，历史运行与报告保留。</>}
-        confirmLabel="删除任务"
-        danger
-        busy={remove.isPending}
-        onClose={() => setDeleteTarget(null)}
-        onConfirm={() => deleteTarget && remove.mutate(deleteTarget.task_id)}
+        open={!!archiveTarget}
+        title={archiveNext ? '归档任务' : '取消归档任务'}
+        message={archiveNext ? <>确定归档任务「{archiveTarget?.name}」？<br />只归档，不删除配置与历史运行；归档后默认列表不再显示。</> : <>确定取消归档任务「{archiveTarget?.name}」？取消后任务会重新出现在默认列表。</>}
+        confirmLabel={archiveNext ? '归档任务' : '取消归档'}
+        danger={archiveNext}
+        busy={archiveMutation.isPending}
+        onClose={() => setArchiveTarget(null)}
+        onConfirm={() => archiveTarget && archiveMutation.mutate({ task: archiveTarget, archived: archiveNext })}
       />
     </div>
   )
 }
 
-function TaskDetail({ task, onDelete }: { task: Task; onDelete: () => void }) {
+function TaskDetail({ task, onArchive }: { task: Task; onArchive: (archived: boolean) => void }) {
   const status = task.last_status || 'none'
   return (
     <div className="stack-lg">
@@ -363,6 +384,7 @@ function TaskDetail({ task, onDelete }: { task: Task; onDelete: () => void }) {
         <StatusBadge status={status} />
         <Badge tone={modeMeta[task.mode]?.tone || 'neutral'}>{modeMeta[task.mode]?.label || task.mode}</Badge>
         {task.workflow_ref ? <Badge tone="ai"><Icon name="git" size={11} />{task.workflow_ref}</Badge> : null}
+        {task.archived_at ? <Badge tone="warn">已归档 · {formatTime(task.archived_at)}</Badge> : null}
       </div>
       <dl className="fact-list two-col">
         <div><dt>任务 ID</dt><dd className="mono">{task.task_id}</dd></div>
@@ -379,8 +401,8 @@ function TaskDetail({ task, onDelete }: { task: Task; onDelete: () => void }) {
         </div>
       ) : null}
       <div className="detail-danger">
-        <div><strong>删除任务定义</strong><span>不影响历史执行；不可恢复。</span></div>
-        <Button size="sm" variant="danger" icon="trash" onClick={onDelete}>删除</Button>
+        <div><strong>{task.archived_at ? '取消归档' : '归档任务'}</strong><span>{task.archived_at ? '恢复后任务重新出现在默认列表。' : '只归档，不删除历史运行与报告。'}</span></div>
+        <Button size="sm" variant={task.archived_at ? 'soft' : 'danger'} icon={task.archived_at ? 'refresh' : 'archive'} onClick={() => onArchive(!task.archived_at)}>{task.archived_at ? '取消归档' : '归档'}</Button>
       </div>
     </div>
   )

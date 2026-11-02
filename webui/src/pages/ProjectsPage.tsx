@@ -1,13 +1,14 @@
 import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../shared/api'
-import { navigate } from '../shared/router'
+import { navigate, useRoute, withQuery } from '../shared/router'
 import { formatTime, rateOf, relativeTime, statusOf, statusLabel, classForStatus } from '../shared/utils'
 import type { AnyRecord, Project } from '../shared/types'
 import { Icon } from '../components/Icon'
 import {
   Badge,
   Button,
+  ConfirmDialog,
   EmptyState,
   EnvEditor,
   ErrorState,
@@ -22,14 +23,18 @@ import {
 } from '../components/ui'
 
 export function ProjectsPage() {
+  const route = useRoute()
   const queryClient = useQueryClient()
   const { push } = useToast()
+  const includeArchived = route.query.get('include_archived') === '1'
+  const [archiveTarget, setArchiveTarget] = useState<Project | null>(null)
+  const [archiveNext, setArchiveNext] = useState(true)
   const [search, setSearch] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [env, setEnv] = useState<AnyRecord>({})
-  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: api.projects })
+  const projectsQuery = useQuery({ queryKey: ['projects', includeArchived], queryFn: () => api.projects(includeArchived) })
   const projects = projectsQuery.data || []
 
   const filtered = useMemo(() => {
@@ -52,6 +57,16 @@ export function ProjectsPage() {
     onError: (error: Error) => push(error.message, 'error'),
   })
 
+  const archiveMutation = useMutation({
+    mutationFn: ({ project, archived }: { project: Project; archived: boolean }) => api.archiveProject(project.project_id, archived),
+    onSuccess: (_, variables) => {
+      queryClient.invalidateQueries({ queryKey: ['projects'] })
+      setArchiveTarget(null)
+      push(variables.archived ? '项目已归档；历史运行与报告保留' : '项目已取消归档', 'ok')
+    },
+    onError: (error: Error) => push(error.message, 'error'),
+  })
+
   const totalRuns = projects.reduce((sum, project) => sum + (project.last_run ? 1 : 0), 0)
   const aggregate = projects.reduce(
     (acc, project) => {
@@ -64,6 +79,7 @@ export function ProjectsPage() {
     { passed: 0, total: 0 },
   )
   const aggregateRate = rateOf(aggregate.passed, aggregate.total)
+  const archivedCount = projects.filter((project) => !!project.archived_at).length
 
   return (
     <div className="page projects-page">
@@ -89,8 +105,14 @@ export function ProjectsPage() {
       <div className="toolbar-row">
         <SearchInput value={search} onChange={setSearch} placeholder="搜索项目名称、站点或 ID" />
         <div className="toolbar-meta">
+          <button type="button" className={`archive-toggle ${includeArchived ? 'is-on' : ''}`} onClick={() => {
+            const next = new URLSearchParams(route.query)
+            if (includeArchived) next.delete('include_archived')
+            else next.set('include_archived', '1')
+            navigate(withQuery('/projects', next), { replace: true })
+          }} aria-pressed={includeArchived}><span className="toggle-track"><span /></span>显示已归档</button>
           <Badge tone="neutral">{filtered.length} / {projects.length} 个项目</Badge>
-          <span className="muted">按最近更新排序</span>
+          {includeArchived ? <span className="muted">{archivedCount} 个已归档</span> : <span className="muted">按最近更新排序</span>}
         </div>
       </div>
 
@@ -109,7 +131,7 @@ export function ProjectsPage() {
 
       {filtered.length ? (
         <div className="project-grid">
-          {filtered.map((project) => <ProjectCard key={project.project_id} project={project} />)}
+          {filtered.map((project) => <ProjectCard key={project.project_id} project={project} onArchive={(archived) => { setArchiveTarget(project); setArchiveNext(archived) }} />)}
         </div>
       ) : projects.length ? (
         <EmptyState icon="search" title="没有匹配的项目" actions={<Button size="sm" onClick={() => setSearch('')}>清空搜索</Button>}>
@@ -171,48 +193,68 @@ export function ProjectsPage() {
           <EnvEditor value={env} onChange={setEnv} />
         </Field>
       </Modal>
+
+      <ConfirmDialog
+        open={!!archiveTarget}
+        title={archiveNext ? '归档项目' : '取消归档项目'}
+        message={archiveNext ? <>确定归档项目「{archiveTarget?.name}」？<br />只归档，不删历史运行、报告与套件配置；归档后默认列表不显示。</> : <>确定取消归档项目「{archiveTarget?.name}」？取消后会重新出现在默认列表。</>}
+        confirmLabel={archiveNext ? '归档项目' : '取消归档'}
+        danger={archiveNext}
+        busy={archiveMutation.isPending}
+        onClose={() => setArchiveTarget(null)}
+        onConfirm={() => archiveTarget && archiveMutation.mutate({ project: archiveTarget, archived: archiveNext })}
+      />
     </div>
   )
 }
 
-function ProjectCard({ project }: { project: Project }) {
+function ProjectCard({ project, onArchive }: { project: Project; onArchive: (archived: boolean) => void }) {
   const status = project.last_run ? statusOf(project.last_run) : 'none'
   const rate = project.pass_rate ? rateOf(project.pass_rate.passed, project.pass_rate.total) : null
   const lastAt = project.last_run?.at || project.last_run?.finished_at || project.last_run?.started_at
   const suites = project.suite_count ?? project.suites?.length ?? 0
   return (
-    <a className="project-card" href={`#/p/${project.project_id}/overview`}>
-      <div className="project-card-top">
-        <div className={`project-sigil tone-${classForStatus(status)}`}>
-          <Icon name="projects" size={20} />
+    <article className={`project-card ${project.archived_at ? 'is-archived' : ''}`}>
+      <a className="project-card-link" href={`#/p/${project.project_id}/overview`}>
+        <div className="project-card-top">
+          <div className={`project-sigil tone-${classForStatus(status)}`}>
+            <Icon name="projects" size={20} />
+          </div>
+          <div className="project-card-title">
+            <strong>{project.name}</strong>
+            <span className="mono">{project.base_url || '未配置站点地址'}</span>
+          </div>
+          <div className="project-card-statuses">
+            {project.archived_at ? <Badge tone="warn">已归档</Badge> : null}
+            <StatusBadge status={status} />
+          </div>
         </div>
-        <div className="project-card-title">
-          <strong>{project.name}</strong>
-          <span className="mono">{project.base_url || '未配置站点地址'}</span>
-        </div>
-        <StatusBadge status={status} />
-      </div>
 
-      <div className="project-card-stats">
-        <div><strong>{rate === null ? '—' : `${rate}%`}</strong><span>累计通过率</span></div>
-        <div><strong>{suites}</strong><span>套件</span></div>
-        <div><strong>{project.last_run ? relativeTime(lastAt) : '—'}</strong><span>上次运行</span></div>
-      </div>
-
-      <div className="project-health">
-        <div className="project-health-head">
-          <span>健康度</span>
-          <span>{project.last_run ? statusLabel(status) : '等待首次运行'}</span>
+        <div className="project-card-stats">
+          <div><strong>{rate === null ? '—' : `${rate}%`}</strong><span>累计通过率</span></div>
+          <div><strong>{suites}</strong><span>套件</span></div>
+          <div><strong>{project.last_run ? relativeTime(lastAt) : '—'}</strong><span>上次运行</span></div>
         </div>
-        <div className={`progress ${rate !== null && rate < 80 ? 'bad' : 'ok'}`}>
-          <span style={{ width: `${rate ?? 0}%` }} />
-        </div>
-      </div>
 
-      <div className="project-card-foot">
-        <span className="project-card-id mono">{project.project_id}</span>
-        <span className="project-card-open">打开概览 <Icon name="arrow" size={14} /></span>
+        <div className="project-health">
+          <div className="project-health-head">
+            <span>健康度</span>
+            <span>{project.last_run ? statusLabel(status) : '等待首次运行'}</span>
+          </div>
+          <div className={`progress ${rate !== null && rate < 80 ? 'bad' : 'ok'}`}>
+            <span style={{ width: `${rate ?? 0}%` }} />
+          </div>
+        </div>
+
+        <div className="project-card-foot">
+          <span className="project-card-id mono">{project.project_id}</span>
+          <span className="project-card-open">打开概览 <Icon name="arrow" size={14} /></span>
+        </div>
+      </a>
+      <div className="project-card-admin">
+        <span>{project.archived_at ? `归档于 ${relativeTime(project.archived_at)}` : '归档只影响列表，不删历史'}</span>
+        <Button size="sm" variant="ghost" icon={project.archived_at ? 'refresh' : 'archive'} onClick={() => onArchive(!project.archived_at)}>{project.archived_at ? '取消归档' : '归档'}</Button>
       </div>
-    </a>
+    </article>
   )
 }

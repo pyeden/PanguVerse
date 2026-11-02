@@ -1477,3 +1477,78 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .recent-debug-io summary { color: var(--dim); font-size: 8px; cursor: pointer; }
 .recent-debug-io .debug-io { margin-top: 5px; }
 .recent-debug-io .json-block { max-height: 130px; font-size: 8px; }
+
+/* W8 P0 — archive, execution center, report signatures */
+.archive-toggle { display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--line); border-radius: 999px; background: rgba(151,174,212,.03); color: var(--muted); font-size: 9px; padding: 4px 8px; cursor: pointer; white-space: nowrap; }
+.archive-toggle:hover { color: var(--text-soft); border-color: var(--line-strong); }
+.archive-toggle .toggle-track { width: 22px; height: 12px; border-radius: 99px; background: rgba(151,174,212,.15); padding: 2px; display: flex; align-items: center; transition: background .15s ease; }
+.archive-toggle .toggle-track > span { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); transition: transform .15s ease, background .15s ease; }
+.archive-toggle.is-on { color: var(--cyan); border-color: rgba(94,234,212,.25); background: rgba(94,234,212,.04); }
+.archive-toggle.is-on .toggle-track { background: rgba(94,234,212,.25); }
+.archive-toggle.is-on .toggle-track > span { transform: translateX(10px); background: var(--cyan); }
+
+.project-card { position: relative; }
+.project-card-link { display: flex; flex-direction: column; gap: 13px; min-width: 0; flex: 1; }
+.project-card-statuses { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: 0 0 auto; }
+.project-card.is-archived { opacity: .82; border-style: dashed; }
+.project-card.is-archived:hover { opacity: 1; }
+.project-card-admin { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--dim); font-size: 8.5px; }
+.project-card-admin .btn { color: var(--muted); }
+.project-card-admin .btn:hover { color: var(--amber); }
+
+.task-card.is-archived { opacity: .68; border-style: dashed; }
+.task-card.is-archived:hover { opacity: .9; }
+
+.execution-list-panel { padding: 4px 0 0; overflow: hidden; }
+.execution-table-wrap { overflow-x: auto; }
+.execution-table { width: 100%; min-width: 920px; border-collapse: collapse; font-size: 10px; }
+.execution-table th { padding: 10px 10px 8px; text-align: left; color: var(--dim); font-size: 8px; text-transform: uppercase; letter-spacing: .06em; border-bottom: 1px solid var(--line); white-space: nowrap; }
+.execution-table th:first-child, .execution-table td:first-child { padding-left: 15px; }
+.execution-table th:last-child, .execution-table td:last-child { padding-right: 15px; }
+.execution-table td { padding: 9px 10px; border-bottom: 1px solid rgba(154,177,214,.075); vertical-align: middle; }
+.execution-table tr:last-child td { border-bottom: 0; }
+.execution-table tbody tr:hover { background: rgba(151,174,212,.025); }
+.execution-link { display: flex; flex-direction: column; gap: 1px; border: 0; background: transparent; color: inherit; padding: 0; text-align: left; cursor: pointer; }
+.execution-link strong { color: var(--text-soft); font-size: 9.5px; }
+.execution-link span { color: var(--dim); font-size: 8px; }
+.cancellable-mark { display: block; margin-top: 3px; color: var(--amber); font-size: 7.5px; }
+.execution-actions-col { width: 1%; }
+.execution-actions-col .row-actions { display: flex; justify-content: flex-end; gap: 2px; flex-wrap: nowrap; }
+.workflow-mini { margin-top: 3px; font-size: 7.5px !important; max-width: 185px; overflow: hidden; text-overflow: ellipsis; }
+
+.signature-block { border: 1px solid var(--line); border-radius: 10px; padding: 11px 12px; background: rgba(151,174,212,.025); display: flex; flex-direction: column; gap: 5px; }
+.signature-block.is-signed { border-color: rgba(69,224,161,.17); background: rgba(69,224,161,.035); }
+.signature-block.is-voided { border-color: rgba(255,113,133,.18); background: rgba(255,113,133,.035); }
+.signature-head { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.signature-head strong { font-size: 10.5px; }
+.signature-head > span:last-child { color: var(--dim); font-size: 8.5px; }
+.signature-lock { display: inline-flex; align-items: center; gap: 3px; color: var(--green) !important; font-size: 8px !important; }
+.signature-block p { color: var(--muted); font-size: 10px; line-height: 1.55; }
+.signature-block small { color: var(--dim); font-size: 8px; }
+.sign-current { border: 1px dashed var(--line); border-radius: 8px; padding: 9px; display: flex; flex-direction: column; gap: 4px; }
+.sign-current > span { color: var(--dim); font-size: 8px; text-transform: uppercase; letter-spacing: .06em; }
+.sign-current p { color: var(--muted); font-size: 10px; }
+.sign-current small { color: var(--dim); font-size: 8px; }
+.verdict-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; }
+.verdict-option { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; padding: 9px; border: 1px solid var(--line); border-radius: 8px; background: rgba(151,174,212,.02); color: var(--muted); cursor: pointer; text-align: left; }
+.verdict-option strong { font-size: 10px; color: var(--text-soft); }
+.verdict-option span { font-size: 8px; color: var(--dim); }
+.verdict-option:hover { border-color: var(--line-strong); }
+.verdict-option.is-active { border-color: rgba(94,234,212,.32); background: rgba(94,234,212,.055); }
+.verdict-option.is-active strong { color: var(--cyan); }
+.force-check { display: flex; align-items: flex-start; gap: 8px; padding: 9px; border: 1px solid rgba(247,187,99,.16); border-radius: 8px; background: rgba(247,187,99,.035); cursor: pointer; }
+.force-check span { display: flex; flex-direction: column; gap: 1px; }
+.force-check strong { font-size: 9.5px; color: #ffd08c; }
+.force-check small { font-size: 8px; color: var(--dim); }
+.report-card-flags { display: flex; gap: 4px; flex-wrap: wrap; margin-top: 2px; }
+.report-card.is-voided { opacity: .7; border-style: dashed; }
+.report-card.is-voided:hover { opacity: .95; }
+.report-card.is-signed { border-color: rgba(69,224,161,.13); }
+.report-card-foot .row-actions { display: flex; gap: 2px; align-items: center; }
+
+@media (max-width: 640px) {
+  .verdict-grid { grid-template-columns: 1fr; }
+  .project-card-statuses { flex-direction: row; align-items: center; }
+  .execution-actions-col .row-actions { flex-wrap: wrap; justify-content: flex-start; }
+  .project-card-admin { flex-wrap: wrap; }
+}

@@ -44,6 +44,7 @@ export type IconName =
   | 'server'
   | 'file'
   | 'sort'
+  | 'archive'
 
 const paths: Record<IconName, ReactElement> = {
   spark: <><path d="M12 3l1.35 5.05L18 9.5l-4.65 1.45L12 16l-1.35-5.05L6 9.5l4.65-1.45L12 3Z" /><path d="M18.5 15l.65 2.35L21.5 18l-2.35.65L18.5 21l-.65-2.35L15.5 18l2.35-.65L18.5 15Z" /></>,
@@ -89,6 +90,7 @@ const paths: Record<IconName, ReactElement> = {
   server: <><rect x="3" y="4" width="18" height="6" rx="2" /><rect x="3" y="14" width="18" height="6" rx="2" /><path d="M7 7h.01M7 17h.01M11 7h6M11 17h6" /></>,
   file: <><path d="M6 3.5h8l4 4v13H6v-17Z" /><path d="M14 3.5v4h4" /></>,
   sort: <path d="M8 5v14M5 8l3-3 3 3M16 19V5M13 16l3 3 3-3" />,
+  archive: <><rect x="3" y="4" width="18" height="4" rx="1.5" /><path d="M5 8v11.5h14V8M10 12h4" /></>,
 }
 
 export function Icon({ name, size = 18, ...props }: { name: IconName; size?: number } & SVGProps<SVGSVGElement>) {

@@ -67,7 +67,7 @@ export function Shell({
   const [mobileOpen, setMobileOpen] = useState(false)
   const [mock, setMock] = useState(isStudioMock())
   const active = navActive(route)
-  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: api.projects, staleTime: 20_000 })
+  const projectsQuery = useQuery({ queryKey: ['projects'], queryFn: () => api.projects(), staleTime: 20_000 })
   const projects = projectsQuery.data || []
   const breadcrumb = useMemo(() => crumbs(route, projects), [route, projects])
   const currentProjectId = route.parts[0] === 'p' ? route.parts[1] : ''
