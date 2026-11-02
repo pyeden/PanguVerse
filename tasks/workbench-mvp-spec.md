@@ -1,4 +1,4 @@
-# 工作台 MVP · 实现契约 v5.0
+# 工作台 MVP · 实现契约 v5.1
 
 > 依据 `docs/workbench-prototype.md`（四阶段闭环 + 六模块）。
 > **已拍板**：画布 = React Flow（MIT）；调试 = 只允许项目已配置环境；P0 发布形态 = **只发布为「流程」**，
@@ -125,6 +125,25 @@ panguverse/web/static/     # 构建产物，提交进仓库（保证 pip 用户�
 | `panguverse/web/graph.py`、`studio.py`、`api.py`、`service.py`、`jobs.py` | `webui/**`（全部源码与配置） |
 | `tests/test_web_studio.py`、`docs/web-api.md` | `panguverse/web/static/**`（构建产物） |
 | `pyproject.toml`（仅当需要，保持 `dependencies=[]`） | `README` 构建说明（可选） |
+
+## 5.1 W8 收口（v5.1，QA 缺口裁决）
+
+QA 判定 W8 未达成。裁决如下（**P0 本轮补齐**，P1 明确延后并写入非目标）：
+
+| 模块 | 缺口 | 裁决 | 端点 |
+| --- | --- | --- | --- |
+| 执行 | 列表/详情无接口（页面是空壳） | **P0** | `GET /api/executions?project=&status=&offset=&limit=`、`GET /api/executions/{eid}` |
+| 执行 | 无法取消（长任务/批量失控） | **P0** | `POST /api/executions/{eid}/cancel`（job 级；batch 取消剩余套件；语义写入文档） |
+| 任务 | 硬删除会丢配置，契约要求"删=归档" | **P0** | `POST /api/tasks/{id}/archive`、`/unarchive`；列表默认排除已归档 |
+| 项目 | 同上 | **P0** | `POST /api/projects/{pid}/archive`、`/unarchive` |
+| 报告 | 无列表；无人工签署/作废（AI+人工确认的终点） | **P0** | `GET /api/reports?...`、`POST /api/reports/{run_id}/sign {verdict,note}`、`POST /api/reports/{run_id}/void {reason}` |
+| 原子 | 启用/停用 | **P1（明确不做）** | 原子由代码/领域包定义，工作区级开关会造成"同包不同行为"，改由包级治理；UI 只读并注明 |
+
+约束：
+- 归档是软删：`archived_at` 字段；已归档对象默认不出现在列表，但历史运行/报告保留。
+- 签署后报告锁定：再签需 `force`（并在审计里留痕）；作废需理由且不可撤销。
+- 取消语义：job 在当前步骤结束后停止；batch 取消后**已完成的 run 保留**，未开始的套件标记 `cancelled`。
+- 所有操作写审计（`actor/action/target/from/to/note`）。
 
 ## 6. 里程碑（同一轮内）
 
