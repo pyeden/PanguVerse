@@ -1730,6 +1730,7 @@ DEBUG_REASONS = (
     "network",
     "missing_env",
     "missing_llm",
+    "missing_input",
     "cancelled",
 )
 _DEBUG_RUNS: dict[str, _DebugSession] = {}
@@ -1865,6 +1866,12 @@ class _DebugSession:
         self.summary = {"passed": 0, "failed": 0, "skipped": 0, "by_reason": {}}
         self.variables: dict[str, Any] = {}
         self.secret_values: list[str] = []
+        self.node_status: dict[str, str] = {}
+        self.capture_owner: dict[str, str] = {}
+        for item in nodes:
+            owner = str(item.get("id") or "")
+            for name in (item.get("capture") or {}):
+                self.capture_owner[str(name)] = owner
         self._lock = threading.RLock()
         self._thread: threading.Thread | None = None
         for key, value in env.items():
@@ -1917,6 +1924,30 @@ class _DebugSession:
         self._thread.start()
 
     # ------------------------------------------------------------------ #
+    def _input_gap_reason(self, step: Step) -> str:
+        """必填输入缺失时区分「上游被跳过/失败」与真正的断言/计划问题。"""
+        special = {
+            "env",
+            "secrets",
+            "meta",
+            "vars",
+            "case_id",
+            "run_id",
+            "item",
+            "index",
+            "loop",
+            "result",
+            "status",
+            "last_response",
+        }
+        for root in template_roots(step.with_):
+            if root in special:
+                continue
+            owner = self.capture_owner.get(root, root)
+            if self.node_status.get(owner) in {"skipped", "failed"}:
+                return "missing_input"
+        return ""
+
     def _run_node(self, node: Mapping[str, Any], ctx: RunContext, registry: Any) -> tuple[str, str, int, dict[str, Any], dict[str, Any]]:
         atom_name = str(node.get("atom") or "")
         atom = registry.get(atom_name)
@@ -1961,14 +1992,16 @@ class _DebugSession:
         try:
             inputs = ctx.resolve(step.with_)
         except PanguError as exc:
-            return "failed", _reason_for(exc, atom=atom, raw=step.with_), 1, {}, {
+            reason = self._input_gap_reason(step) or _reason_for(exc, atom=atom, raw=step.with_)
+            return "failed", reason, 1, {}, {
                 "type": type(exc).__name__,
                 "kind": getattr(exc, "kind", "template"),
                 "message": str(exc),
             }
         missing = [name for name in atom.required if inputs.get(name) is None]
         if missing:
-            return "failed", "assertion", 1, _compact(inputs), {
+            reason = self._input_gap_reason(step) or "assertion"
+            return "failed", reason, 1, _compact(inputs), {
                 "type": "PlanError",
                 "kind": "plan",
                 "message": f"缺少必填输入: {', '.join(missing)}",
@@ -2061,6 +2094,7 @@ class _DebugSession:
                 node_id = str(node.get("id") or "")
                 if aborted:
                     skipped += 1
+                    self.node_status[node_id] = "skipped"
                     by_reason["upstream_failed"] = by_reason.get("upstream_failed", 0) + 1
                     self.emit(
                         {
@@ -2106,6 +2140,7 @@ class _DebugSession:
                 duration_ms = (time.perf_counter() - started) * 1000
                 if status == "failed" and (node.get("optional") or False):
                     status, reason = "skipped", "optional"
+                self.node_status[node_id] = status
                 if status == "passed":
                     passed += 1
                 elif status == "skipped":

@@ -276,6 +276,87 @@ def test_t5_skipped_nodes_have_reason_codes(api: WebAPI) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# T5 原因码：when_false / missing_input / upstream_failed
+# --------------------------------------------------------------------------- #
+def _final_by_node(nodes: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    for item in nodes:
+        out[str(item.get("node_id") or "")] = item
+    return out
+
+
+def test_debug_when_false_reason_code(api: WebAPI, page_url: str) -> None:
+    status, draft = call(
+        api, "POST", "/api/studio/drafts", {"intent": f"打开 {page_url} 首页取文本并给布局报告"}
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    status, _ = call(api, "PATCH", f"/api/studio/{wid}/nodes/extract_text", {"when": "false"})
+    assert status == 200
+    status, started = call(
+        api, "POST", f"/api/studio/{wid}/debug", {"node_id": "extract_text", "mode": "from_start"}
+    )
+    assert status == 202
+    result = wait_debug(api, started["session_id"])
+    final = _final_by_node(result["all_nodes"])
+    assert final["extract_text"]["status"] == "skipped"
+    assert final["extract_text"]["reason"] == "when_false"
+    assert result["summary"]["by_reason"]["when_false"] == 1
+
+
+def test_debug_missing_input_reason_code(api: WebAPI, page_url: str) -> None:
+    status, draft = call(
+        api, "POST", "/api/studio/drafts", {"intent": f"打开 {page_url} 首页取文本并给布局报告"}
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    status, _ = call(api, "PATCH", f"/api/studio/{wid}/nodes/extract_text", {"when": "false"})
+    assert status == 200
+    status, started = call(
+        api, "POST", f"/api/studio/{wid}/debug", {"node_id": "summarize", "mode": "from_start"}
+    )
+    assert status == 202
+    result = wait_debug(api, started["session_id"])
+    final = _final_by_node(result["all_nodes"])
+    assert final["extract_text"]["status"] == "skipped"
+    assert final["extract_text"]["reason"] == "when_false"
+    assert final["summarize"]["status"] == "failed"
+    assert final["summarize"]["reason"] == "missing_input"
+    assert final["summarize"]["error"]["kind"] == "template"
+    assert result["summary"]["by_reason"]["missing_input"] == 1
+
+
+def test_debug_upstream_failed_reason_code(api: WebAPI) -> None:
+    import socket
+
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": f"打开 http://127.0.0.1:{port}/ 首页取文本并给布局报告"},
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    status, started = call(
+        api, "POST", f"/api/studio/{wid}/debug", {"node_id": "summarize", "mode": "from_start"}
+    )
+    assert status == 202
+    result = wait_debug(api, started["session_id"])
+    final = _final_by_node(result["all_nodes"])
+    assert final["fetch_page"]["status"] == "failed"
+    assert final["fetch_page"]["reason"] == "network"
+    assert final["extract_text"]["status"] == "skipped"
+    assert final["extract_text"]["reason"] == "upstream_failed"
+    assert final["summarize"]["status"] == "skipped"
+    assert final["summarize"]["reason"] == "upstream_failed"
+    assert result["summary"]["by_reason"]["upstream_failed"] >= 2
+
+
+# --------------------------------------------------------------------------- #
 # T6：无密钥硬失败（不产出占位）
 # --------------------------------------------------------------------------- #
 def test_t6_llm_summarize_fails_with_missing_llm(

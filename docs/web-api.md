@@ -562,7 +562,9 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
   `debug/<sid>.jsonl`（0600）。`GET /api/studio/debug/{sid}?cursor=N` 增量返回
   `nodes:[{node_id,status,reason,attempts,duration_ms,error,inputs,outputs}]` 与 `summary:{passed,failed,skipped,by_reason}`。
 - 节点状态：`pending|running|passed|failed|skipped`；`skipped/failed` 必带原因码：
-  `when_false|foreach_empty|upstream_failed|optional|assertion|network|missing_env|missing_llm|cancelled`。
+  `when_false|foreach_empty|upstream_failed|optional|assertion|network|missing_env|missing_llm|missing_input|cancelled`。
+- **`nodes` 是事件流，不是节点清单**：同一 `node_id` 会依次出现 `pending → running → passed/failed/skipped`
+  多条记录（`cursor` 随事件递增）。消费方必须按 `node_id` 取**最新一条**作为当前状态，不要把它当成重复节点。
 - 会话完成后额外写 `debug/<sid>.json` 快照（兼容旧读取）；两者都只存打码后的副本，**不进 `/api/runs`**。
 
 ### 7.7 审计
