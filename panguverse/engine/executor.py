@@ -46,6 +46,7 @@ from .result import (
     HealEvent,
     RunResult,
     StepResult,
+    brief_mapping,
 )
 
 
@@ -689,11 +690,8 @@ def _stamp_retryable(data: dict[str, Any]) -> dict[str, Any]:
 
 
 def _brief(inputs: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for key, value in inputs.items():
-        text = repr(value)
-        out[key] = value if len(text) <= 1500 else text[:1500] + "..."
-    return out
+    """报告层输入限长：与输出同一口径，保留 list/dict 结构。"""
+    return brief_mapping(inputs, limit=1500)
 
 
 def _truthy(value: Any) -> bool:

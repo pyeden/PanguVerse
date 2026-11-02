@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import stat
 import threading
@@ -23,6 +24,7 @@ from panguverse.core.context import RunContext
 from panguverse.core.errors import AtomFailure
 from panguverse.core.pack import builtin_pack_registry
 from panguverse.core.registry import default_registry
+from panguverse.engine.result import StepResult, brief_mapping
 from panguverse.packs import android_adb, ios_sim, web_browser
 from panguverse.packs.android_adb import (
     android_devices,
@@ -592,6 +594,95 @@ def test_ios_list_marks_booted_per_device(fake_sim_env, ctx: RunContext) -> None
     shutdown = next(item for item in out["devices"] if item["udid"] == "AAAA-1111-2222")
     assert shutdown["state"] == "Shutdown"
     assert shutdown["booted"] is False
+
+
+def _sample_device(index: int) -> dict[str, object]:
+    return {
+        "name": f"iPhone {index}",
+        "udid": f"UDID-{index:04d}",
+        "state": "Shutdown",
+        "booted": False,
+        "runtime": "iOS-18-6",
+        "runtime_id": "com.apple.CoreSimulator.SimRuntime.iOS-18-6",
+    }
+
+
+def test_ios_list_report_output_keeps_devices_as_list(fake_sim_env, ctx: RunContext) -> None:
+    """报告层的 ``outputs.devices`` 必须是 JSON 数组，而不是 repr 字符串。"""
+    out = ios_sim_list.invoke(ctx, {})
+    assert type(out["devices"]) is list
+    assert all(type(item) is dict for item in out["devices"])
+
+    payload = StepResult(step_id="list", atom="ios_sim_list", outputs=out).to_dict()["outputs"]
+    assert type(payload["devices"]) is list
+    assert payload["devices"]
+    assert all(isinstance(item, dict) for item in payload["devices"])
+    assert payload["devices"][0]["udid"]
+
+
+def test_ios_list_caps_at_200_and_keeps_list(
+    monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    devices = [_sample_device(index) for index in range(205)]
+    monkeypatch.setattr(ios_sim, "list_simulators", lambda: devices)
+
+    out = ios_sim_list.invoke(ctx, {})
+    assert type(out["devices"]) is list
+    assert len(out["devices"]) == ios_sim.MAX_LISTED_DEVICES == 200
+    assert out["count"] == 200
+    assert out["total"] == 205
+    assert out["truncated"] is True
+    assert all(isinstance(item, dict) for item in out["devices"])
+
+    payload = StepResult(step_id="list", atom="ios_sim_list", outputs=out).to_dict()["outputs"]
+    assert type(payload["devices"]) is list
+    assert all(isinstance(item, dict) for item in payload["devices"])
+
+
+def test_ios_list_report_does_not_stringify_normal_device_list(
+    fake_sim_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """12 台真机规模的列表（repr 超过旧 2000 预算）也必须保持数组。"""
+    devices = [_sample_device(index) for index in range(12)]
+    monkeypatch.setattr(ios_sim, "list_simulators", lambda: devices)
+    out = ios_sim_list.invoke(ctx, {})
+
+    payload = StepResult(step_id="list", atom="ios_sim_list", outputs=out).to_dict()["outputs"]
+    assert type(payload["devices"]) is list
+    assert len(payload["devices"]) == 12
+    assert all(isinstance(item, dict) for item in payload["devices"])
+
+
+def test_android_ui_dump_nodes_stay_structured_in_report(
+    fake_adb_env, ctx: RunContext
+) -> None:
+    out = android_ui_dump.invoke(ctx, {})
+    assert type(out["nodes"]) is list
+    nodes = [dict(item) for item in out["nodes"] * 200]
+    assert len(json.dumps(nodes, ensure_ascii=False)) > 8000
+
+    payload = StepResult(
+        step_id="dump",
+        atom="android_ui_dump",
+        outputs={**out, "nodes": nodes, "count": len(nodes)},
+    ).to_dict()["outputs"]
+    assert type(payload["nodes"]) is list
+    assert payload["nodes"]
+    assert all(isinstance(item, dict) for item in payload["nodes"])
+    assert payload["nodes_total"] == len(nodes)
+
+
+def test_brief_mapping_preserves_arrays_of_dicts() -> None:
+    links = [
+        {"href": f"https://example.com/{index}", "text": f"link-{index}", "internal": True}
+        for index in range(500)
+    ]
+    out = brief_mapping({"links": links, "count": len(links)})
+    assert type(out["links"]) is list
+    assert all(isinstance(item, dict) for item in out["links"])
+    assert out["links_truncated"] is True
+    assert out["links_total"] == 500
+    assert out["count"] == 500
 
 
 def test_ios_launch_without_booted_device_is_missing_device(

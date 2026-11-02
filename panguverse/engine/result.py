@@ -5,7 +5,9 @@
 
 from __future__ import annotations
 
+import json
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -240,9 +242,101 @@ def _collect_secrets(cases: list[CaseResult]) -> list[str]:
     return values
 
 
-def _brief_outputs(outputs: dict[str, Any], limit: int = 2000) -> dict[str, Any]:
+#: 报告里单个输出值的字符预算；超限时压缩内容，但绝不改变容器类型。
+REPORT_VALUE_LIMIT = 16000
+#: 压缩时单个字符串的字符上限（保留可读前缀，便于人工排查）。
+REPORT_TEXT_LIMIT = 240
+_TRUNC_MARK = "…（已截断）"
+
+
+def _clip_text(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    if limit <= len(_TRUNC_MARK):
+        return text[:limit]
+    return text[: limit - len(_TRUNC_MARK)] + _TRUNC_MARK
+
+
+def _json_size(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        return len(repr(value))
+
+
+def _compact(value: Any, text_limit: int) -> Any:
+    """递归压缩字符串，保留 list/dict 结构与元素类型。"""
+    if isinstance(value, str):
+        return _clip_text(value, text_limit)
+    if isinstance(value, Mapping):
+        return {str(key): _compact(item, text_limit) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_compact(item, text_limit) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return _clip_text(str(value), text_limit)
+
+
+def _fit_sequence(items: list[Any], limit: int) -> list[Any]:
+    """保留能塞进预算的最长前缀（至少 1 个元素）；返回的仍是 list。"""
+    if not items:
+        return []
+    low, high, best = 1, len(items), 1
+    while low <= high:
+        middle = (low + high) // 2
+        if _json_size(items[:middle]) <= limit:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return items[:best]
+
+
+def brief_value(value: Any, limit: int = REPORT_VALUE_LIMIT) -> tuple[Any, bool]:
+    """把输出值压到 ``limit`` 字符内，返回 ``(值, 是否截断)``。
+
+    关键约束：**容器类型不变**。列表仍是 ``list``、对象仍是 ``dict``，
+    不会像旧实现那样退化成 ``repr()`` 字符串，下游才能继续结构化消费。
+    """
+    if isinstance(value, str):
+        clipped = _clip_text(value, limit)
+        return clipped, clipped != value
+    if not isinstance(value, (Mapping, list, tuple)):
+        if _json_size(value) <= limit:
+            return value, False
+        return _clip_text(str(value), limit), True
+    if _json_size(value) <= limit:
+        return value, False
+
+    compact = _compact(value, REPORT_TEXT_LIMIT)
+    if _json_size(compact) <= limit:
+        return compact, True
+
+    if isinstance(compact, list):
+        return _fit_sequence(compact, limit), True
+    kept: dict[str, Any] = {}
+    for key, item in compact.items():
+        candidate = {**kept, key: item}
+        if _json_size(candidate) > limit and kept:
+            break
+        kept[key] = item
+    return kept, True
+
+
+def brief_mapping(
+    values: Mapping[str, Any] | None, limit: int = REPORT_VALUE_LIMIT
+) -> dict[str, Any]:
+    """报告层统一出口：逐字段限长，保留结构并显式标注截断。"""
     out: dict[str, Any] = {}
-    for key, value in outputs.items():
-        text = repr(value)
-        out[key] = value if len(text) <= limit else text[:limit] + "..."
+    for key, value in (values or {}).items():
+        bounded, cut = brief_value(value, limit)
+        out[key] = bounded
+        if cut:
+            out.setdefault(f"{key}_truncated", True)
+            if isinstance(bounded, list):
+                out.setdefault(f"{key}_total", len(value))
     return out
+
+
+def _brief_outputs(outputs: dict[str, Any], limit: int = REPORT_VALUE_LIMIT) -> dict[str, Any]:
+    return brief_mapping(outputs, limit)

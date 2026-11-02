@@ -45,6 +45,8 @@ from ..core.errors import AtomFailure, PanguError
 from .core import GenericSemantics
 
 MAX_OUTPUT_CHARS = 4000
+#: ``ios_sim_list`` 最多返回的模拟器数量；超出时截断并标注 total/truncated。
+MAX_LISTED_DEVICES = 200
 DEFAULT_TIMEOUT = 30.0
 _TOOL_ENV = "PANGUVERSE_SIMCTL"
 _XCRUN_CANDIDATES = ("xcrun", "/usr/bin/xcrun")
@@ -367,19 +369,35 @@ def _relative(path: Path, root: Path) -> str:
     category="device",
     tags=("device", "ios", "simctl", "read", "tool:simctl"),
     inputs={},
-    outputs={"devices": "array", "count": "integer", "booted_count": "integer"},
+    outputs={
+        "devices": "array",
+        "count": "integer",
+        "booted_count": "integer",
+        "total": "integer",
+        "truncated": "boolean",
+    },
     required=(),
     effects=("read",),
     capabilities=("device",),
     domain="ios_sim",
 )
 def ios_sim_list(ctx: RunContext) -> dict[str, Any]:
-    """列出全部可用模拟器；``booted``/``booted_count`` 供调用方自行判断可用性。"""
+    """列出可用模拟器；``devices`` 恒为 ``list[dict]``。
+
+    单次最多返回 :data:`MAX_LISTED_DEVICES` 台（按 runtime/name/udid 排序后取前缀），
+    超出时 ``truncated=true`` 且 ``total`` 给出真实总数。``booted``/``booted_count``
+    只统计返回列表内的设备，供调用方自行判断可用性。
+    """
     devices = list_simulators()
+    total = len(devices)
+    truncated = total > MAX_LISTED_DEVICES
+    listed = devices[:MAX_LISTED_DEVICES] if truncated else devices
     return {
-        "devices": devices,
-        "count": len(devices),
-        "booted_count": sum(1 for item in devices if item.get("booted")),
+        "devices": listed,
+        "count": len(listed),
+        "booted_count": sum(1 for item in listed if item.get("booted")),
+        "total": total,
+        "truncated": truncated,
     }
 
 
