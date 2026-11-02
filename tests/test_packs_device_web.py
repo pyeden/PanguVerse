@@ -393,6 +393,30 @@ def test_android_ui_dump_parses_xml_and_find_text(fake_adb_env, ctx: RunContext)
     assert missing["node"] == {}
 
 
+def test_android_ui_dump_parses_xml_longer_than_clip_limit(
+    fake_adb_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """回归：uiautomator XML > MAX_OUTPUT_CHARS 时不得先截断再解析。"""
+    large = FIXTURES / "android_ui_dump_large.xml"
+    assert len(large.read_text(encoding="utf-8")) > 8000
+    monkeypatch.setenv("FAKE_ADB_XML", str(large))
+
+    out = android_ui_dump.invoke(ctx, {})
+    assert out["count"] == 70
+    assert out["xml_chars"] > 8000
+    # 回显仍限长，但总长度单独保留
+    assert len(out["xml"]) <= 4000
+    assert "已截断" in out["xml"]
+
+    deep = next(node for node in out["nodes"] if node["text"] == "深层节点")
+    assert deep["bounds"] == "[0,690][1080,699]"
+    assert deep["center"] == {"x": 540, "y": 694}
+    found = android_find_text.invoke(
+        ctx, {"text": "深层节点", "nodes": out["nodes"], "match": "exact"}
+    )
+    assert found["found"] is True
+
+
 def test_android_ui_dump_retries_once(fake_adb_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext) -> None:
     monkeypatch.setenv("FAKE_ADB_MODE", "dump_fail_once")
     out = android_ui_dump.invoke(ctx, {})
@@ -436,6 +460,44 @@ def test_android_launch_and_output_truncation(fake_adb_env, monkeypatch: pytest.
     long_out = android_launch_app.invoke(ctx, {"package": "com.example", "activity": ".MainActivity"})
     assert len(long_out["output"]) <= 4000
     assert "已截断" in long_out["output"]
+
+
+def test_android_launch_monkey_nonzero_with_events_is_ok(
+    fake_adb_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """回归：monkey 退出码非零但已注入事件时不得误判失败。"""
+    monkeypatch.setenv("FAKE_ADB_MODE", "monkey_nonzero_events")
+    out = android_launch_app.invoke(ctx, {"package": "com.example"})
+    assert out["ok"] is True
+    assert out["verified"] is True
+    assert out["focused"] == "com.example/.MainActivity"
+    assert "已确认前台组件" in out["message"]
+    log = Path(fake_adb_env["FAKE_ADB_LOG"]).read_text(encoding="utf-8")
+    assert "monkey -p com.example" in log
+
+
+def test_android_launch_monkey_unverified_returns_ok_false_verified(
+    fake_adb_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    monkeypatch.setenv("FAKE_ADB_MODE", "monkey_nonzero_noevents")
+    monkeypatch.setenv("FAKE_ADB_FOCUS_PKG", "com.other.app")
+    out = android_launch_app.invoke(ctx, {"package": "com.example"})
+    assert out["ok"] is True
+    assert out["verified"] is False
+    assert "com.other.app" in out["focused"]
+    assert "不可验证" in out["message"]
+
+
+def test_android_launch_am_failure_when_focus_other_raises(
+    fake_adb_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    monkeypatch.setenv("FAKE_ADB_MODE", "am_exit1_nofocus")
+    with pytest.raises(AtomFailure) as excinfo:
+        android_launch_app.invoke(
+            ctx, {"package": "com.example", "activity": ".MainActivity"}
+        )
+    assert excinfo.value.kind == "device_command_failed"
+    assert "启动应用失败" in str(excinfo.value)
 
 
 def test_android_input_text_escapes_spaces(fake_adb_env, ctx: RunContext) -> None:
@@ -487,6 +549,24 @@ def test_ios_list_parses_json(fake_sim_env, ctx: RunContext) -> None:
     first = out["devices"][0]
     assert first["runtime"] == "iOS-17-5"
     assert first["state"] in {"Shutdown", "Booted"}
+
+
+def test_ios_list_parses_json_longer_than_clip_limit(
+    fake_sim_env, monkeypatch: pytest.MonkeyPatch, ctx: RunContext
+) -> None:
+    """回归：simctl list -j 输出 > MAX_OUTPUT_CHARS（真机 6612）时不得先截断。"""
+    large = FIXTURES / "simctl_devices_large.json"
+    assert len(large.read_text(encoding="utf-8")) > 4000
+    monkeypatch.setenv("FAKE_SIM_JSON", str(large))
+
+    out = ios_sim_list.invoke(ctx, {})
+    assert out["count"] == 26  # 27 台里 1 台 isAvailable=false 被过滤
+    names = {item["name"] for item in out["devices"]}
+    assert "pv_iphone" in names
+    booted = next(item for item in out["devices"] if item["name"] == "pv_iphone")
+    assert booted["state"] == "Booted"
+    assert booted["udid"] == "UDID-0-0-ABCD-EFGH-IJKL-MNOPQRSTUVWX"
+    assert booted["runtime"] == "iOS-18-6"
 
 
 def test_ios_launch_parses_pid(fake_sim_env, ctx: RunContext) -> None:

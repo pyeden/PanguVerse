@@ -61,6 +61,20 @@ _ADB_CANDIDATES = (
 )
 _REMOTE_DUMP = "/sdcard/window_dump.xml"
 _BOUNDS_RE = re.compile(r"\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]")
+_LAUNCH_INJECTED_RE = re.compile(r"Events injected:\s*[1-9]\d*", re.IGNORECASE)
+_LAUNCH_STARTED_RE = re.compile(
+    r"Status:\s*ok|Warning:\s*Activity not started", re.IGNORECASE
+)
+_LAUNCH_MISSING_RE = re.compile(
+    r"No activities found|monkey aborted|does not exist|Unable to resolve Intent",
+    re.IGNORECASE,
+)
+_LAUNCH_ERROR_RE = re.compile(r"(^|\n)\s*(Error|Exception|Failure)\b", re.IGNORECASE)
+_FOCUS_PATTERNS = (
+    re.compile(r"mCurrentFocus=.*?([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)"),
+    re.compile(r"mFocusedApp=.*?([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)"),
+)
+_RESUMED_PATTERN = re.compile(r"mResumedActivity:.*?([A-Za-z0-9_.]+/[A-Za-z0-9_.$]+)")
 
 
 # --------------------------------------------------------------------------- #
@@ -159,7 +173,8 @@ def _run(
 
 
 def _text(data: bytes) -> str:
-    return clip_output(data.decode("utf-8", errors="replace"))
+    """解码命令输出，**不截断**；调用方在返回/报错时再 ``clip_output``。"""
+    return data.decode("utf-8", errors="replace")
 
 
 def _device_args(serial: str) -> list[str]:
@@ -390,6 +405,67 @@ def _find_node(nodes: list[dict[str, Any]], wanted: str, match: str = "contains"
     return {}
 
 
+def _focus_matches(component: str, package: str) -> bool:
+    value = str(component or "").strip()
+    return value == package or value.startswith(f"{package}/")
+
+
+def _focused_component(serial: str, *, timeout: float) -> str:
+    """从 dumpsys 读取当前前台组件；读不到返回空串，不视为启动失败。"""
+    probes = (
+        (["shell", "dumpsys", "window"], _FOCUS_PATTERNS),
+        (["shell", "dumpsys", "activity", "activities"], (_RESUMED_PATTERN,)),
+    )
+    for args, patterns in probes:
+        code, out, err = _run_adb(serial, args, timeout=timeout)
+        if code != 0:
+            continue
+        text = f"{out}\n{err}"
+        for pattern in patterns:
+            match = pattern.search(text)
+            if match:
+                return match.group(1)
+    return ""
+
+
+def _wait_for_focus(
+    serial: str, package: str, *, timeout: float, attempts: int = 3
+) -> str:
+    focused = ""
+    for attempt in range(attempts):
+        focused = _focused_component(serial, timeout=timeout)
+        if _focus_matches(focused, package):
+            return focused
+        if attempt + 1 < attempts:
+            time.sleep(0.2)
+    return focused
+
+
+def _resolve_launcher_activity(serial: str, package: str, *, timeout: float) -> str:
+    """解析 package 的 LAUNCHER 组件，供 monkey 不可用时回退 am start。"""
+    code, out, err = _run_adb(
+        serial,
+        [
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-c",
+            "android.intent.category.LAUNCHER",
+            package,
+        ],
+        timeout=timeout,
+    )
+    if code != 0:
+        return ""
+    for line in reversed(f"{out}\n{err}".splitlines()):
+        candidate = line.strip()
+        if re.fullmatch(r"[A-Za-z0-9_.]+/[A-Za-z0-9_.$]+", candidate):
+            return candidate
+    return ""
+
+
 # --------------------------------------------------------------------------- #
 # 原子
 # --------------------------------------------------------------------------- #
@@ -416,7 +492,14 @@ def android_devices(ctx: RunContext) -> dict[str, Any]:
     category="device",
     tags=("device", "android", "adb", "mutate", "tool:adb"),
     inputs={"package": "string", "activity?": "string", "serial?": "string", "timeout?": "number"},
-    outputs={"ok": "boolean", "output": "string", "serial": "string"},
+    outputs={
+        "ok": "boolean",
+        "output": "string",
+        "focused": "string",
+        "verified": "boolean",
+        "message": "string",
+        "serial": "string",
+    },
     required=("package",),
     effects=("mutate",),
     capabilities=("device", "process"),
@@ -437,20 +520,72 @@ def android_launch_app(
     if activity:
         act = str(activity).strip()
         component = act if "/" in act else f"{pkg}/{act}"
-        args = ["shell", "am", "start", "-n", component]
+        args = ["shell", "am", "start", "-W", "-n", component]
     else:
         args = ["shell", "monkey", "-p", pkg, "-c", "android.intent.category.LAUNCHER", "1"]
+
     code, out, err = _run_adb(target, args, timeout=limit)
-    output = _assert_ok(code, out, err, action="启动应用")
-    missing = re.search(r"No activities found|monkey aborted|does not exist", output, re.IGNORECASE)
-    if missing:
+    raw = f"{out}\n{err}"
+    if _LAUNCH_MISSING_RE.search(raw):
         raise AtomFailure(
-            f"启动应用失败：{clip_output(output)}",
+            f"启动应用失败：{clip_output(raw)}",
             kind="device_command_failed",
             failure_class="internal",
-            detail={"package": pkg, "serial": target, "output": clip_output(output)},
+            detail={"package": pkg, "serial": target, "output": clip_output(raw)},
         )
-    return {"ok": True, "output": output, "serial": target}
+
+    # monkey / am start 都可能出现「实际已拉起但退出码非零」。以输出标记 +
+    # dumpsys 前台组件作为权威判定，退出码只用于无法验证时兜底报错。
+    success = bool(_LAUNCH_INJECTED_RE.search(raw) or _LAUNCH_STARTED_RE.search(raw))
+    probe_timeout = min(5.0, max(1.0, limit))
+    focused = _wait_for_focus(target, pkg, timeout=probe_timeout)
+    verified = _focus_matches(focused, pkg)
+    message = ""
+
+    # monkey 在部分模拟器上会因 SYS_KEYS 警告直接退出（如 251），此时用
+    # resolve-activity 回退到 am start -W，避免把已可启动的应用误判为失败。
+    if not activity and not success and not verified:
+        resolved = _resolve_launcher_activity(target, pkg, timeout=probe_timeout)
+        if resolved:
+            code2, out2, err2 = _run_adb(
+                target, ["shell", "am", "start", "-W", "-n", resolved], timeout=limit
+            )
+            raw2 = f"{out2}\n{err2}"
+            if not _LAUNCH_MISSING_RE.search(raw2):
+                raw = f"{raw}\n[fallback am start -W -n {resolved}]\n{raw2}"
+                code, out, err = code2, out2, err2
+                success = bool(_LAUNCH_STARTED_RE.search(raw2))
+                focused = _wait_for_focus(target, pkg, timeout=probe_timeout)
+                verified = _focus_matches(focused, pkg)
+                message = f"monkey 未确认启动，已回退 am start -W -n {resolved}"
+
+    if not verified and activity and not success and (
+        code != 0 or _LAUNCH_ERROR_RE.search(raw)
+    ):
+        raise _command_failed(code, out, err, action="启动应用")
+
+    if verified:
+        confirmed = f"已确认前台组件：{focused}"
+        message = f"{message}；{confirmed}" if message else confirmed
+    elif success:
+        message = (
+            f"{message}；启动命令报告成功，但 dumpsys 未确认前台组件"
+            f"（focused={focused or '<未知>'}）"
+        )
+    else:
+        message = (
+            f"{message}；启动命令未报告明确成功，dumpsys 也未确认前台组件"
+            "；按不可验证处理（ok=true, verified=false）"
+        )
+
+    return {
+        "ok": True,
+        "output": clip_output(raw),
+        "focused": focused,
+        "verified": verified,
+        "message": message,
+        "serial": target,
+    }
 
 
 @atom(
@@ -682,7 +817,13 @@ def android_screencap(
     category="device",
     tags=("device", "android", "adb", "read", "tool:adb"),
     inputs={"serial?": "string", "timeout?": "number"},
-    outputs={"xml": "string", "nodes": "array", "count": "integer", "serial": "string"},
+    outputs={
+        "xml": "string",
+        "xml_chars": "integer",
+        "nodes": "array",
+        "count": "integer",
+        "serial": "string",
+    },
     required=(),
     effects=("read",),
     capabilities=("device",),
@@ -696,7 +837,10 @@ def android_ui_dump(
     target = resolve_serial(serial)
     xml, nodes = _dump_with_retry(target, timeout=timeout or DEFAULT_TIMEOUT)
     return {
+        # XML 回显可以截断（完整内容可能远大于 MAX_OUTPUT_CHARS），但必须
+        # 保留原始总长度，且解析始终基于截断前的完整 XML。
         "xml": clip_output(xml),
+        "xml_chars": len(xml),
         "nodes": nodes,
         "count": len(nodes),
         "serial": target,

@@ -59,9 +59,13 @@ case "$1" in
         echo "ok"
         exit 0
         ;;
-      am|monkey)
+      am)
         if [ "$mode" = "fail" ]; then
           echo "Error: Activity class does not exist." >&2
+          exit 1
+        fi
+        if [ "$mode" = "am_exit1_nofocus" ]; then
+          echo "Error: failed to start activity" >&2
           exit 1
         fi
         if [ "$mode" = "long" ]; then
@@ -69,7 +73,47 @@ case "$1" in
           exit 0
         fi
         echo "Starting: Intent { cmp=com.example/.MainActivity }"
+        echo "Status: ok"
         echo "Events injected: 1"
+        exit 0
+        ;;
+      monkey)
+        case "$mode" in
+          monkey_nonzero_events)
+            echo "Events injected: 3"
+            echo "** SYS_KEYS has no physical keys but with factor 2.0%." >&2
+            exit 251
+            ;;
+          monkey_nonzero_noevents)
+            echo "** SYS_KEYS has no physical keys but with factor 2.0%." >&2
+            exit 251
+            ;;
+          *)
+            echo "Events injected: 1"
+            exit 0
+            ;;
+        esac
+        ;;
+      dumpsys)
+        shift
+        case "$1" in
+          window)
+            case "$mode" in
+              am_exit1_nofocus|unfocused)
+                echo "  mCurrentFocus=Window{abc u0 com.other.app/com.other.app.Main}"
+                ;;
+              no_focus)
+                echo "  mCurrentFocus=null"
+                ;;
+              *)
+                echo "  mCurrentFocus=Window{abc u0 ${FAKE_ADB_FOCUS_PKG:-com.example}/.MainActivity}"
+                ;;
+            esac
+            ;;
+          activity)
+            echo "  mResumedActivity: ActivityRecord{abc u0 ${FAKE_ADB_FOCUS_PKG:-com.example}/.MainActivity t1}"
+            ;;
+        esac
         exit 0
         ;;
       *)

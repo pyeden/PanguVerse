@@ -145,10 +145,12 @@ def _run_simctl(args: list[str], *, timeout: float = DEFAULT_TIMEOUT) -> tuple[i
     finally:
         if proc.poll() is None:
             _kill_group(proc)
+    # 结构化输出（如 ``list -j``）必须拿完整 stdout 再解析；截断只发生在
+    # 展示字段与错误消息层（``_assert_ok`` / ``_command_failed`` / ``clip_output``）。
     return (
         int(proc.returncode or 0),
-        clip_output(out.decode("utf-8", errors="replace")),
-        clip_output(err.decode("utf-8", errors="replace")),
+        out.decode("utf-8", errors="replace"),
+        err.decode("utf-8", errors="replace"),
     )
 
 
@@ -191,10 +193,10 @@ def parse_simctl_devices(payload: str) -> list[dict[str, Any]]:
         data = json.loads(text)
     except ValueError as exc:
         raise AtomFailure(
-            f"simctl 设备列表不是合法 JSON: {exc}",
+            f"simctl 设备列表不是合法 JSON（{len(text)} 字符）: {exc}",
             kind="parse",
             failure_class="invalid_input",
-            detail={"sample": clip_output(text, 500)},
+            detail={"chars": len(text), "sample": clip_output(text, 500)},
         ) from exc
     raw = data.get("devices") if isinstance(data, Mapping) else None
     if not isinstance(raw, Mapping):

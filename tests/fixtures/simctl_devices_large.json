@@ -1,0 +1,307 @@
+{
+  "devices": {
+    "com.apple.CoreSimulator.SimRuntime.iOS-18-6": [
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-0/data",
+        "dataPathSize": 123456789,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-0",
+        "udid": "UDID-0-0-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Booted",
+        "name": "pv_iphone"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-1/data",
+        "dataPathSize": 123456790,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-1",
+        "udid": "UDID-0-1-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 14 Pro Max Ultra Expanded Device Name For Truncation Regression 0-1"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-2/data",
+        "dataPathSize": 123456791,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-2",
+        "udid": "UDID-0-2-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 15 Pro Max Ultra Expanded Device Name For Truncation Regression 0-2"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-3/data",
+        "dataPathSize": 123456792,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-3",
+        "udid": "UDID-0-3-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 16 Pro Max Ultra Expanded Device Name For Truncation Regression 0-3"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-4/data",
+        "dataPathSize": 123456793,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-4",
+        "udid": "UDID-0-4-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 17 Pro Max Ultra Expanded Device Name For Truncation Regression 0-4"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-5/data",
+        "dataPathSize": 123456794,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-5",
+        "udid": "UDID-0-5-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 18 Pro Max Ultra Expanded Device Name For Truncation Regression 0-5"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-6/data",
+        "dataPathSize": 123456795,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-6",
+        "udid": "UDID-0-6-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 19 Pro Max Ultra Expanded Device Name For Truncation Regression 0-6"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-7/data",
+        "dataPathSize": 123456796,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-7",
+        "udid": "UDID-0-7-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 20 Pro Max Ultra Expanded Device Name For Truncation Regression 0-7"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-0-8/data",
+        "dataPathSize": 123456797,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-0-8",
+        "udid": "UDID-0-8-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 21 Pro Max Ultra Expanded Device Name For Truncation Regression 0-8"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-17-5": [
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-0/data",
+        "dataPathSize": 123456789,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-0",
+        "udid": "UDID-1-0-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 13 Pro Max Ultra Expanded Device Name For Truncation Regression 1-0"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-1/data",
+        "dataPathSize": 123456790,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-1",
+        "udid": "UDID-1-1-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 14 Pro Max Ultra Expanded Device Name For Truncation Regression 1-1"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-2/data",
+        "dataPathSize": 123456791,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-2",
+        "udid": "UDID-1-2-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 15 Pro Max Ultra Expanded Device Name For Truncation Regression 1-2"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-3/data",
+        "dataPathSize": 123456792,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-3",
+        "udid": "UDID-1-3-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 16 Pro Max Ultra Expanded Device Name For Truncation Regression 1-3"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-4/data",
+        "dataPathSize": 123456793,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-4",
+        "udid": "UDID-1-4-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 17 Pro Max Ultra Expanded Device Name For Truncation Regression 1-4"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-5/data",
+        "dataPathSize": 123456794,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-5",
+        "udid": "UDID-1-5-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 18 Pro Max Ultra Expanded Device Name For Truncation Regression 1-5"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-6/data",
+        "dataPathSize": 123456795,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-6",
+        "udid": "UDID-1-6-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 19 Pro Max Ultra Expanded Device Name For Truncation Regression 1-6"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-7/data",
+        "dataPathSize": 123456796,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-7",
+        "udid": "UDID-1-7-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 20 Pro Max Ultra Expanded Device Name For Truncation Regression 1-7"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-1-8/data",
+        "dataPathSize": 123456797,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-1-8",
+        "udid": "UDID-1-8-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 21 Pro Max Ultra Expanded Device Name For Truncation Regression 1-8"
+      }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.iOS-16-4": [
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-0/data",
+        "dataPathSize": 123456789,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-0",
+        "udid": "UDID-2-0-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 13 Pro Max Ultra Expanded Device Name For Truncation Regression 2-0"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-1/data",
+        "dataPathSize": 123456790,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-1",
+        "udid": "UDID-2-1-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 14 Pro Max Ultra Expanded Device Name For Truncation Regression 2-1"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-2/data",
+        "dataPathSize": 123456791,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-2",
+        "udid": "UDID-2-2-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 15 Pro Max Ultra Expanded Device Name For Truncation Regression 2-2"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-3/data",
+        "dataPathSize": 123456792,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-3",
+        "udid": "UDID-2-3-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 16 Pro Max Ultra Expanded Device Name For Truncation Regression 2-3"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-4/data",
+        "dataPathSize": 123456793,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-4",
+        "udid": "UDID-2-4-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 17 Pro Max Ultra Expanded Device Name For Truncation Regression 2-4"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-5/data",
+        "dataPathSize": 123456794,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-5",
+        "udid": "UDID-2-5-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 18 Pro Max Ultra Expanded Device Name For Truncation Regression 2-5"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-6/data",
+        "dataPathSize": 123456795,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-6",
+        "udid": "UDID-2-6-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 19 Pro Max Ultra Expanded Device Name For Truncation Regression 2-6"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-7/data",
+        "dataPathSize": 123456796,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-7",
+        "udid": "UDID-2-7-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": true,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 20 Pro Max Ultra Expanded Device Name For Truncation Regression 2-7"
+      },
+      {
+        "lastBootedAt": "2026-11-02T10:00:00Z",
+        "dataPath": "/Users/futuredeng/Library/Developer/CoreSimulator/Devices/UDID-2-8/data",
+        "dataPathSize": 123456797,
+        "logPath": "/Users/futuredeng/Library/Logs/CoreSimulator/UDID-2-8",
+        "udid": "UDID-2-8-ABCD-EFGH-IJKL-MNOPQRSTUVWX",
+        "isAvailable": false,
+        "deviceTypeIdentifier": "com.apple.CoreSimulator.SimDeviceType.iPhone-15-Pro",
+        "state": "Shutdown",
+        "name": "iPhone 21 Pro Max Ultra Expanded Device Name For Truncation Regression 2-8"
+      }
+    ]
+  }
+}
