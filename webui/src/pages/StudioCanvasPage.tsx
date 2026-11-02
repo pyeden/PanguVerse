@@ -266,6 +266,8 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [debugError, setDebugError] = useState('')
   const [debugTotal, setDebugTotal] = useState(0)
   const [debugSyncing, setDebugSyncing] = useState(false)
+  const [debugTab, setDebugTab] = useState<'timeline' | 'output' | 'vars'>('timeline')
+  const [debugDetailOpen, setDebugDetailOpen] = useState(false)
   const [debugStep, setDebugStep] = useState<DebugNodeState | null>(null)
   const [followDebug, setFollowDebug] = useState(true)
   const cursorRef = useRef<number>(0)
@@ -282,6 +284,8 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const toastDoneRef = useRef(false)
   const drainRef = useRef<() => void>(() => {})
   const flowWrapRef = useRef<HTMLDivElement | null>(null)
+  const debugTabPanelRef = useRef<HTMLDivElement | null>(null)
+  const debugListScrollRef = useRef(0)
   const debugWidthRef = useRef(debugWidth)
   debugWidthRef.current = debugWidth
   const storedProvenance = useMemo(() => readStudioProvenance(wid), [wid])
@@ -493,6 +497,8 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     onSuccess: (result) => {
       setDebugError('')
       setDebugStep(null)
+      setDebugTab('timeline')
+      setDebugDetailOpen(false)
       const allNodes = workflow?.graph?.nodes || []
       const targetIndex = Math.max(0, allNodes.findIndex((node) => node.node_id === (debugNodeId || selectedId)))
       const previewNodes = debugMode === 'only'
@@ -667,6 +673,20 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     }
     return blocked
   }, [debugStatusMap, workflow?.graph?.edges])
+
+  const openDebugDetail = useCallback((step: DebugNodeState) => {
+    debugListScrollRef.current = debugTabPanelRef.current?.scrollTop || 0
+    setDebugStep(step)
+    setDebugDetailOpen(true)
+    setFollowDebug(false)
+  }, [])
+
+  const closeDebugDetail = useCallback(() => {
+    setDebugDetailOpen(false)
+    window.setTimeout(() => {
+      if (debugTabPanelRef.current) debugTabPanelRef.current.scrollTop = debugListScrollRef.current
+    }, 0)
+  }, [])
 
   useEffect(() => {
     setNodes((current) => {
@@ -1014,105 +1034,42 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               {debugError ? (
                 <div className="debug-error-banner"><Icon name="warning" size={13} /><span>{debugError}</span></div>
               ) : null}
-              <div
-                className="debug-progress"
-                data-testid="debug-progress"
-                data-done={debugSession?.done ? 'true' : 'false'}
-                data-total={totalCount}
-                data-finished={finishedCount}
-              >
-                <div className="debug-progress-head">
-                  <span className="mono debug-progress-count">{finishedCount}/{totalCount}</span>
-                  <span className="debug-progress-label">
-                    {debugSyncing ? <>状态同步中 <strong>{finishedCount}/{totalCount}</strong></> : runningDebug ? <>正在跑 <strong>{nodeLabel(runningDebug.node_id)}</strong></> : debugSession?.done ? '调试完成' : debugSessionId ? '等待首个节点…' : '尚未开始'}
-                  </span>
-                  {debugSyncing ? <span className="sync-hint">逐节点回放</span> : null}
-                  <span className="debug-counts">
-                    <span className="count passed">通过 {debugSummary.passed}</span>
-                    <span className="count failed">失败 {debugSummary.failed}</span>
-                    <span className="count skipped">跳过 {debugSummary.skipped}</span>
-                  </span>
-                </div>
-                <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={totalCount} aria-valuenow={finishedCount}>
-                  <span className={`progress-fill ${debugSummary.failed ? 'has-fail' : ''}`} style={{ width: `${progressPct}%` }} />
-                  {totalCount ? <span className="progress-ticks">{Array.from({ length: Math.min(totalCount, 12) }).map((_, index) => <i key={index} />)}</span> : null}
-                </div>
-                {skipGroups.length ? (
-                  <div className="skip-groups">
-                    <span className="skip-groups-label">跳过原因</span>
-                    {skipGroups.map((group) => (
-                      <details className="skip-group" key={group.reason} data-testid={`debug-skip-group-${group.reason}`} data-reason={group.reason} data-count={group.count} open={skipGroups.length <= 2}>
-                        <summary>
-                          <code className="skip-reason-code">{group.reason}</code>
-                          <span>{debugReasonLabel(group.reason)}</span>
-                          <Badge tone="neutral">{group.count}</Badge>
-                        </summary>
-                        <div className="skip-group-nodes">
-                          {group.ids.map((nodeId) => (
-                            <button
-                              type="button"
-                              key={nodeId}
-                              onClick={() => {
-                                const state = debugStatusMap.get(nodeId)
-                                if (state) setDebugStep(state)
-                                setFollowDebug(false)
-                                centerNode(nodeId)
-                              }}
-                            >
-                              {nodeLabel(nodeId)} <code>{nodeId}</code>
-                            </button>
-                          ))}
-                        </div>
-                      </details>
-                    ))}
+              <div className="debug-sticky-head">
+                <div
+                  className="debug-progress"
+                  data-testid="debug-progress"
+                  data-done={debugSession?.done ? 'true' : 'false'}
+                  data-total={totalCount}
+                  data-finished={finishedCount}
+                >
+                  <div className="debug-progress-head">
+                    <span className="mono debug-progress-count">{finishedCount}/{totalCount}</span>
+                    <span className="debug-progress-label">
+                      {debugSyncing ? <>状态同步中 <strong>{finishedCount}/{totalCount}</strong></> : runningDebug ? <>正在跑 <strong>{nodeLabel(runningDebug.node_id)}</strong></> : debugSession?.done ? '调试完成' : debugSessionId ? '等待首个节点…' : '尚未开始'}
+                    </span>
+                    {debugSyncing ? <span className="sync-hint">逐节点回放</span> : null}
+                    <span className="debug-counts">
+                      <span className="count passed">通过 {debugSummary.passed}</span>
+                      <span className="count failed">失败 {debugSummary.failed}</span>
+                      <span className="count skipped">跳过 {debugSummary.skipped}</span>
+                    </span>
                   </div>
-                ) : null}
-              </div>
-              <div className="debug-body">
-                <div className="debug-trace" data-testid="debug-trace">
-                  <div className="debug-trace-head"><span>节点</span><span>状态</span><span>耗时</span><span>原因 / 错误</span></div>
-                  {debugNodes.length ? debugNodes.map((step) => (
-                    <button
-                      type="button"
-                      key={step.node_id}
-                      ref={(element) => {
-                        if (element) rowRefs.current.set(step.node_id, element)
-                        else rowRefs.current.delete(step.node_id)
-                      }}
-                      className={`debug-row is-${step.status} ${debugStep?.node_id === step.node_id ? 'is-active' : ''} ${debugStatusMap.get(step.node_id)?.status === 'running' ? 'is-current' : ''}`}
-                      data-testid={`debug-node-${step.node_id}`}
-                      data-node-id={step.node_id}
-                      data-status={step.status}
-                      data-debug-status={step.status}
-                      data-reason={step.reason || ''}
-                      data-debug-reason={step.reason || undefined}
-                      onClick={() => {
-                        setDebugStep(step)
-                        setFollowDebug(false)
-                        centerNode(step.node_id)
-                      }}
-                    >
-                      <span><strong>{nodeLabel(step.node_id)}</strong><small className="mono">{step.node_id} · {step.atom || workflow.graph?.nodes.find((node) => node.node_id === step.node_id)?.atom}</small></span>
-                      <span className={`debug-status ${step.status}`}>{step.status === 'running' ? <span className="mini-pulse" /> : null}{statusLabel(step.status)}</span>
-                      <span className="mono">{step.status === 'pending' || step.status === 'running' ? '—' : formatDuration(step.duration_ms)}</span>
-                      <span className="debug-error" title={step.reason ? `${debugReasonLabel(step.reason)}：${debugReasonDetail(step.reason)}` : step.status === 'failed' && upstreamBlockedFor(step.node_id).length ? `上游节点被跳过或输入为空：${upstreamBlockedFor(step.node_id).map(nodeLabel).join('、')}` : errorText(step.error)}>
-                        {step.reason
-                          ? `${debugReasonLabel(step.reason)} · ${debugReasonDetail(step.reason) || step.reason}`
-                          : step.status === 'failed' && upstreamBlockedFor(step.node_id).length
-                            ? `上游节点被跳过或输入为空（${upstreamBlockedFor(step.node_id).map(nodeLabel).join('、')}）`
-                            : errorText(step.error) || '—'}
-                      </span>
-                    </button>
-                  )) : (
-                    <div className="debug-empty">
-                      <Icon name="terminal" size={20} />
-                      <span>选择节点和模式后运行。调试只使用项目已配置环境，不写入执行历史。</span>
-                    </div>
-                  )}
+                  <div className="progress-track" role="progressbar" aria-valuemin={0} aria-valuemax={totalCount} aria-valuenow={finishedCount}>
+                    <span className={`progress-fill ${debugSummary.failed ? 'has-fail' : ''}`} style={{ width: `${progressPct}%` }} />
+                    {totalCount ? <span className="progress-ticks">{Array.from({ length: Math.min(totalCount, 12) }).map((_, index) => <i key={index} />)}</span> : null}
+                  </div>
                 </div>
-                <div className="debug-detail">
-                  {debugStep ? (
-                    <>
+              </div>
+              <div className="debug-tabs" role="tablist" aria-label="调试视图">
+                <button type="button" role="tab" data-testid="debug-tab-timeline" aria-selected={debugTab === 'timeline'} className={debugTab === 'timeline' ? 'is-active' : ''} onClick={() => { setDebugTab('timeline'); setDebugDetailOpen(false) }}>时间线</button>
+                <button type="button" role="tab" data-testid="debug-tab-output" aria-selected={debugTab === 'output'} className={debugTab === 'output' ? 'is-active' : ''} onClick={() => setDebugTab('output')}>输出</button>
+                <button type="button" role="tab" data-testid="debug-tab-vars" aria-selected={debugTab === 'vars'} className={debugTab === 'vars' ? 'is-active' : ''} onClick={() => setDebugTab('vars')}>变量</button>
+              </div>
+              <div className="debug-tabpanel" ref={debugTabPanelRef} data-testid="debug-tabpanel" data-tab={debugTab} role="tabpanel">
+                {debugTab === 'timeline' ? (
+                  debugDetailOpen && debugStep ? (
+                    <div className="debug-node-detail" data-testid="debug-detail">
+                      <button type="button" className="debug-back" data-testid="debug-back" onClick={closeDebugDetail}>← 返回节点列表</button>
                       <div className="debug-detail-head">
                         <strong>{nodeLabel(debugStep.node_id)}</strong>
                         <span className="mono">{debugStep.node_id}</span>
@@ -1139,43 +1096,112 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                           <span>{debugStep.reason ? '后端原始信息：' : ''}{errorText(debugStep.error)}</span>
                         </div>
                       ) : null}
-                      <div className="debug-io">
-                        <div><span className="io-label">inputs</span><JsonTree data={debugStep.inputs || {}} /></div>
-                        <div><span className="io-label">outputs</span><JsonTree data={debugStep.outputs || {}} /></div>
+                      <button type="button" className="debug-jump-output" onClick={() => setDebugTab('output')}>查看输入 / 输出 →</button>
+                    </div>
+                  ) : (
+                    <div className="debug-list-wrap">
+                      {skipGroups.length ? (
+                        <div className="skip-groups">
+                          <span className="skip-groups-label">跳过原因</span>
+                          {skipGroups.map((group) => (
+                            <details className="skip-group" key={group.reason} data-testid={`debug-skip-group-${group.reason}`} data-reason={group.reason} data-count={group.count} open={skipGroups.length <= 2}>
+                              <summary>
+                                <code className="skip-reason-code">{group.reason}</code>
+                                <span>{debugReasonLabel(group.reason)}</span>
+                                <Badge tone="neutral">{group.count}</Badge>
+                              </summary>
+                              <div className="skip-group-nodes">
+                                {group.ids.map((nodeId) => (
+                                  <button
+                                    type="button"
+                                    key={nodeId}
+                                    onClick={() => {
+                                      const state = debugStatusMap.get(nodeId)
+                                      if (state) openDebugDetail(state)
+                                      centerNode(nodeId)
+                                    }}
+                                  >
+                                    {nodeLabel(nodeId)} <code>{nodeId}</code>
+                                  </button>
+                                ))}
+                              </div>
+                            </details>
+                          ))}
+                        </div>
+                      ) : null}
+                      <div className="debug-trace" data-testid="debug-trace">
+                        {debugNodes.length ? debugNodes.map((step) => (
+                          <button
+                            type="button"
+                            key={step.node_id}
+                            ref={(element) => {
+                              if (element) rowRefs.current.set(step.node_id, element)
+                              else rowRefs.current.delete(step.node_id)
+                            }}
+                            className={`debug-row is-${step.status} ${debugStep?.node_id === step.node_id ? 'is-active' : ''} ${debugStatusMap.get(step.node_id)?.status === 'running' ? 'is-current' : ''}`}
+                            data-testid={`debug-node-${step.node_id}`}
+                            data-node-id={step.node_id}
+                            data-status={step.status}
+                            data-debug-status={step.status}
+                            data-reason={step.reason || ''}
+                            data-debug-reason={step.reason || undefined}
+                            onClick={() => {
+                              openDebugDetail(step)
+                              centerNode(step.node_id)
+                            }}
+                          >
+                            <span><strong>{nodeLabel(step.node_id)}</strong><small className="mono">{step.node_id} · {step.atom || workflow.graph?.nodes.find((node) => node.node_id === step.node_id)?.atom}</small></span>
+                            <span className={`debug-status ${step.status}`}>{step.status === 'running' ? <span className="mini-pulse" /> : null}{statusLabel(step.status)}</span>
+                            <span className="mono">{step.status === 'pending' || step.status === 'running' ? '—' : formatDuration(step.duration_ms)}</span>
+                            <span className="debug-error" title={step.reason ? `${debugReasonLabel(step.reason)}：${debugReasonDetail(step.reason)}` : step.status === 'failed' && upstreamBlockedFor(step.node_id).length ? `上游节点被跳过或输入为空：${upstreamBlockedFor(step.node_id).map(nodeLabel).join('、')}` : errorText(step.error)}>
+                              {step.reason
+                                ? `${debugReasonLabel(step.reason)} · ${debugReasonDetail(step.reason) || step.reason}`
+                                : step.status === 'failed' && upstreamBlockedFor(step.node_id).length
+                                  ? `上游节点被跳过或输入为空（${upstreamBlockedFor(step.node_id).map(nodeLabel).join('、')}）`
+                                  : errorText(step.error) || '—'}
+                            </span>
+                          </button>
+                        )) : (
+                          <div className="debug-empty">
+                            <Icon name="terminal" size={20} />
+                            <span>选择节点和模式后运行。调试只使用项目已配置环境，不写入执行历史。</span>
+                          </div>
+                        )}
                       </div>
-                    </>
-                  ) : <div className="debug-empty"><Icon name="code" size={20} /><span>点开一条节点查看 reason 与 inputs/outputs。</span></div>}
-                  <div className="variable-box">
-                    <div className="variable-head"><strong>变量快照</strong><Badge tone="neutral">snapshot</Badge></div>
+                    </div>
+                  )
+                ) : null}
+                {debugTab === 'output' ? (
+                  <div className="debug-output-pane">
+                    {debugStep ? (
+                      <>
+                        <div className="debug-detail-head">
+                          <strong>{nodeLabel(debugStep.node_id)}</strong>
+                          <span className="mono">{debugStep.node_id}</span>
+                          <StatusBadge status={debugStep.status} />
+                        </div>
+                        <div className="debug-io">
+                          <div><span className="io-label">inputs</span><JsonTree data={debugStep.inputs || {}} /></div>
+                          <div><span className="io-label">outputs</span><JsonTree data={debugStep.outputs || {}} /></div>
+                        </div>
+                      </>
+                    ) : <div className="debug-empty"><Icon name="code" size={20} /><span>先在时间线选择一个节点。</span></div>}
+                  </div>
+                ) : null}
+                {debugTab === 'vars' ? (
+                  <div className="debug-vars-pane">
                     {(() => {
                       const bag = debugSession?.variables || {}
                       const vars = (bag.vars && typeof bag.vars === 'object') ? bag.vars as AnyRecord : bag
                       const env = (bag.env && typeof bag.env === 'object') ? bag.env as AnyRecord : null
-                      const entries = Object.entries(vars).filter(([key]) => key !== 'vars' && key !== 'env')
-                      return entries.length ? (
-                        <div className="variable-list">
-                          {entries.map(([key, value]) => {
-                            const record = value && typeof value === 'object' ? value as AnyRecord : { value }
-                            const shown = record.value !== undefined ? record.value : value
-                            return (
-                              <div className="variable-row" key={key}>
-                                <code>{key}</code>
-                                <span>{typeof shown === 'object' ? pretty(shown) : String(shown ?? '')}</span>
-                                <small>来自 {record.source || record.from || 'runtime'} {record.from_snapshot || record.snapshot ? '· 快照' : ''}</small>
-                              </div>
-                            )
-                          })}
-                          {env && Object.keys(env).length ? (
-                            <details className="variable-env">
-                              <summary>env 快照 · {Object.keys(env).length} 个键</summary>
-                              <JsonTree data={env} />
-                            </details>
-                          ) : null}
-                        </div>
-                      ) : <p className="muted">暂无变量快照。</p>
+                      const clean = Object.fromEntries(Object.entries(vars).filter(([key]) => key !== 'vars' && key !== 'env'))
+                      const tree = env && Object.keys(env).length ? { ...clean, env } : clean
+                      return Object.keys(tree).length
+                        ? <JsonTree data={tree} name="variables" depth={1} />
+                        : <p className="muted">暂无变量快照。</p>
                     })()}
                   </div>
-                </div>
+                ) : null}
               </div>
             </div>
             </section>
