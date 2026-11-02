@@ -21,7 +21,14 @@ from typing import Any
 
 from ..core.atom import Atom
 from ..core.context import MISSING, RunContext, split_path, walk_path
-from ..core.contract import NEUTRAL_SEMANTICS, AtomSemantics, FailureClass, neutral_failure_class, neutral_failure_kind
+from ..core.contract import (
+    NEUTRAL_SEMANTICS,
+    AtomSemantics,
+    FailureClass,
+    failure_is_retryable,
+    neutral_failure_class,
+    neutral_failure_kind,
+)
 from ..core.errors import (
     PanguError,
     PlanError,
@@ -255,7 +262,7 @@ class Executor:
                 condition = ctx.resolve(step.when)
             except PanguError as exc:
                 step_result.status = ERROR
-                step_result.error = exc.to_dict()
+                step_result.error = _stamp_retryable(exc.to_dict())
                 step_result.duration_ms = (time.perf_counter() - started) * 1000
                 return step_result, 0
             if not _truthy(condition):
@@ -269,7 +276,7 @@ class Executor:
             target = self.registry.get(step.use)
         except PanguError as exc:
             step_result.status = ERROR
-            step_result.error = exc.to_dict()
+            step_result.error = _stamp_retryable(exc.to_dict())
             step_result.duration_ms = (time.perf_counter() - started) * 1000
             return step_result, 0
 
@@ -280,7 +287,7 @@ class Executor:
                 items = ctx.resolve(step.foreach)
             except PanguError as exc:
                 step_result.status = ERROR
-                step_result.error = exc.to_dict()
+                step_result.error = _stamp_retryable(exc.to_dict())
                 step_result.duration_ms = (time.perf_counter() - started) * 1000
                 return step_result, 0
             if isinstance(items, dict):
@@ -291,6 +298,7 @@ class Executor:
                     "type": "PlanError",
                     "kind": "plan",
                     "message": f"foreach 需要列表，实际 {type(items).__name__}",
+                    "retryable": False,
                 }
                 step_result.duration_ms = (time.perf_counter() - started) * 1000
                 return step_result, 0
@@ -318,8 +326,16 @@ class Executor:
                 outputs = self._attempt(step, target, loop_ctx, step_result)
             except Exception as exc:  # noqa: BLE001 - 失败分类与自愈都在下面处理
                 kind, failure_class = self.classify(target, None, exc)
+                semantics = self.semantics_for(target)
                 step_result.status = FAILED if isinstance(exc, StepFailure) else ERROR
-                step_result.error = _error_dict(exc, kind=kind, failure_class=failure_class)
+                step_result.error = _error_dict(
+                    exc,
+                    kind=kind,
+                    failure_class=failure_class,
+                    retryable=semantics.is_retryable(
+                        target, None, kind=kind, failure_class=failure_class
+                    ),
+                )
                 step_result.message = str(exc)
                 step_result.duration_ms = (time.perf_counter() - started) * 1000
                 if step.foreach:
@@ -638,6 +654,7 @@ def _error_dict(
     *,
     kind: str | None = None,
     failure_class: FailureClass | None = None,
+    retryable: bool | None = None,
 ) -> dict[str, Any]:
     """统一错误结构。
 
@@ -651,6 +668,23 @@ def _error_dict(
         data = {"type": type(exc).__name__, "kind": "atom_error", "message": str(exc)}
     data["failure_kind"] = kind or neutral_failure_kind(exc)
     data["failure_class"] = (failure_class or neutral_failure_class(exc)).value
+    data["retryable"] = (
+        bool(retryable)
+        if retryable is not None
+        else failure_is_retryable(data["failure_kind"], data["failure_class"])
+    )
+    return data
+
+
+def _stamp_retryable(data: dict[str, Any]) -> dict[str, Any]:
+    """给 ``PanguError.to_dict()`` 补统一口径的 ``retryable``。"""
+    data.setdefault(
+        "retryable",
+        failure_is_retryable(
+            str(data.get("failure_kind") or data.get("kind") or ""),
+            data.get("failure_class"),
+        ),
+    )
     return data
 
 

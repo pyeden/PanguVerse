@@ -32,6 +32,7 @@ from typing import Any
 from ..axe.plan import PlanRequest
 from ..axe.planner import RuleBasedPlanner
 from ..core.context import MISSING, RunContext, split_path, walk_path
+from ..core.contract import failure_is_retryable
 from ..core.errors import AtomFailure, PanguError, StepFailure
 from ..core.molecule import Step
 from ..core.redact import mask_obj
@@ -761,6 +762,8 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "wid": wid,
         "rev": 0,
         "state": "draft",
+        # 成功响应必须回显实际路由到的领域包（模板路径取 analysis.domain）
+        "domain_pack": workflow["domain_pack"],
         "planner": bundle.planner,
         "plan_source": bundle.plan_source,
         "confidence": bundle.confidence,
@@ -1773,6 +1776,11 @@ def _exception_fields(exc: BaseException, atom: Any = None) -> tuple[str, str, s
     return "assertion", "internal", f"{type(exc).__name__}: {exc}"
 
 
+def _retryable_for(kind: str, failure_class: str) -> bool:
+    """调试报告与运行报告使用同一套重试口径。"""
+    return failure_is_retryable(kind, failure_class)
+
+
 def _reason_for(exc: BaseException, *, atom: Any = None, raw: Any = None) -> str:
     kind, _failure_class, message = _exception_fields(exc, atom)
     if kind in DEBUG_REASONS:
@@ -2004,7 +2012,9 @@ class _DebugSession:
             return "failed", reason, 1, _compact(inputs), {
                 "type": "PlanError",
                 "kind": "plan",
+                "failure_class": "invalid_input",
                 "message": f"缺少必填输入: {', '.join(missing)}",
+                "retryable": False,
             }
 
         for index, item in enumerate(iterations):
@@ -2072,7 +2082,9 @@ class _DebugSession:
                     return "failed", "assertion", attempts_total, _compact(inputs), {
                         "type": "StepError",
                         "kind": "capture_missing",
+                        "failure_class": "expectation",
                         "message": f"capture 路径不存在: {path}",
+                        "retryable": False,
                     }
                 continue
             ctx.set(str(name), value)
@@ -2132,10 +2144,13 @@ class _DebugSession:
                 except Exception as exc:  # noqa: BLE001 - 任何失败都要落到节点状态
                     status, reason = "failed", _reason_for(exc, raw=node.get("params"))
                     attempts, inputs, outputs = 1, _compact(node.get("params") or {}), {}
+                    kind, failure_class, _message = _exception_fields(exc)
                     error = {
                         "type": type(exc).__name__,
-                        "kind": _exception_fields(exc)[0],
+                        "kind": kind,
+                        "failure_class": failure_class,
                         "message": str(exc),
+                        "retryable": _retryable_for(kind, failure_class),
                     }
                 duration_ms = (time.perf_counter() - started) * 1000
                 if status == "failed" and (node.get("optional") or False):
@@ -2182,7 +2197,13 @@ class _DebugSession:
                     "reason": "assertion",
                     "attempts": 0,
                     "duration_ms": 0,
-                    "error": {"type": type(exc).__name__, "kind": "engine", "message": str(exc)},
+                    "error": {
+                        "type": type(exc).__name__,
+                        "kind": "engine",
+                        "failure_class": "internal",
+                        "message": str(exc),
+                        "retryable": False,
+                    },
                 }
             )
         finally:

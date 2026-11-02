@@ -227,6 +227,38 @@ class FailureClass(str, Enum):
 #: 默认「值得重试」的中立类别（领域标签由包决定，见 :class:`AtomSemantics`）
 DEFAULT_RETRY_ON = (FailureClass.TRANSIENT.value, "timeout", "network")
 
+#: 结构性问题：即使 failure_class 是 transient，重试也不会改变结果。
+#: 报告统一用 :func:`failure_is_retryable` 输出 ``retryable``，避免各层口径不一。
+NON_RETRYABLE_KINDS = frozenset(
+    {
+        "timeout",  # 等待类超时（网页/设备文本未出现）
+        "missing_tool",
+        "missing_device",
+        "ambiguous_device",
+        "unsupported_input",
+        "invalid_input",
+        "invalid_url",
+        "parse",
+    }
+)
+
+
+def failure_is_retryable(kind: str, failure_class: FailureClass | str | None) -> bool:
+    """报告/错误体的统一重试口径。
+
+    优先按领域标签判「结构性不可重试」，其余回落到中立类别：
+    只有 ``transient`` 值得重试。领域包自定义的语义仍以
+    :meth:`AtomSemantics.is_retryable` 为准（执行器直接用它）。
+    """
+    if str(kind or "") in NON_RETRYABLE_KINDS:
+        return False
+    if isinstance(failure_class, FailureClass):
+        return failure_class is FailureClass.TRANSIENT
+    try:
+        return FailureClass(str(failure_class or "")) is FailureClass.TRANSIENT
+    except ValueError:
+        return False
+
 
 # --------------------------------------------------------------------------- #
 # 恢复策略：领域包声明「这类失败可以怎么救」

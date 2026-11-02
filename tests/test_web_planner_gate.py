@@ -112,11 +112,39 @@ def test_t1_homepage_intent_produces_web_research_graph(api: WebAPI) -> None:
     assert body["validation"]["ok"] is True
     assert body["validation"]["coverage"]["ratio"] >= 0.6
 
+    assert body["domain_pack"] == "web_research"
+
     status, full = call(api, "GET", f"/api/studio/{body['wid']}")
     assert status == 200
     assert full["planner"] == body["planner"]
     assert full["plan_source"] == body["plan_source"]
     assert full["confidence"] == body["confidence"]
+    assert full["domain_pack"] == "web_research"
+
+
+@pytest.mark.parametrize(
+    ("intent", "expected"),
+    [
+        (
+            "打开 https://seres-ai.com 首页取文本并给布局报告",
+            "web_research",
+        ),
+        ("启动安卓 app 并截图", "android_adb"),
+        ("列出 iOS 模拟器设备列表", "ios_sim"),
+    ],
+)
+def test_draft_response_echoes_routed_domain_pack(
+    api: WebAPI, intent: str, expected: str
+) -> None:
+    """F2 回归：三条意图（web/安卓/iOS）的 201 响应都必须回显实际路由包名。"""
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": intent})
+    assert status == 201, body
+    assert body["domain_pack"] == expected
+    assert body["domain_pack"] not in (None, "")
+
+    status, full = call(api, "GET", f"/api/studio/{body['wid']}")
+    assert status == 200
+    assert full["domain_pack"] == expected
 
 
 def test_explicit_web_domain_injects_url(api: WebAPI) -> None:

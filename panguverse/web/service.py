@@ -1478,6 +1478,7 @@ def _first_failure(report: dict[str, Any]) -> dict[str, Any] | None:
                     "message": _safe_text(error.get("message") or step.get("message")),
                     "expected": error.get("expected"),
                     "actual": error.get("actual"),
+                    "retryable": bool(error.get("retryable", False)),
                 }
         if case.get("status") in ("failed", "error"):
             error = case.get("error")
@@ -1489,6 +1490,7 @@ def _first_failure(report: dict[str, Any]) -> dict[str, Any] | None:
                     "message": _safe_text(error.get("message")),
                     "expected": error.get("expected"),
                     "actual": error.get("actual"),
+                    "retryable": bool(error.get("retryable", False)),
                 }
     return None
 

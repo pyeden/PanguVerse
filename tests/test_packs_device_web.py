@@ -503,8 +503,54 @@ def test_android_launch_am_failure_when_focus_other_raises(
 def test_android_input_text_escapes_spaces(fake_adb_env, ctx: RunContext) -> None:
     out = android_input_text.invoke(ctx, {"text": "hello world"})
     assert out["ok"] is True
+    assert out["sent"] == "hello%sworld"
+    assert out["escaped"] is True
     log = Path(fake_adb_env["FAKE_ADB_LOG"]).read_text(encoding="utf-8")
     assert "input text hello%sworld" in log
+
+
+def test_android_input_text_plain_text_not_escaped(fake_adb_env, ctx: RunContext) -> None:
+    out = android_input_text.invoke(ctx, {"text": "qatest"})
+    assert out["ok"] is True
+    assert out["sent"] == "qatest"
+    assert out["escaped"] is False
+
+
+def test_android_input_text_rejects_non_ascii_before_adb(
+    fake_adb_env, ctx: RunContext
+) -> None:
+    """回归：中文曾让远端 ``input text`` 抛 Binder NPE；现在必须显式 unsupported_input。"""
+    with pytest.raises(AtomFailure) as excinfo:
+        android_input_text.invoke(ctx, {"text": "qa test 中文"})
+    failure = excinfo.value
+    assert failure.kind == "unsupported_input"
+    assert failure.failure_class == "invalid_input"
+    assert "ADBKeyboard" in str(failure)
+    assert "剪贴板" in str(failure)
+    assert failure.detail["retryable"] is False
+    # 连 adb devices 都不应调用（必须在设备解析前拒绝）
+    log = Path(fake_adb_env["FAKE_ADB_LOG"])
+    assert not log.exists() or log.read_text(encoding="utf-8") == ""
+    assert android_adb.AndroidSemantics().is_retryable(
+        android_input_text,
+        {},
+        kind="unsupported_input",
+        failure_class=android_adb.FailureClass.INVALID_INPUT,
+    ) is False
+
+
+def test_android_input_text_rejects_dangerous_chars(fake_adb_env, ctx: RunContext) -> None:
+    with pytest.raises(AtomFailure) as excinfo:
+        android_input_text.invoke(ctx, {"text": "qa;reboot"})
+    assert excinfo.value.kind == "invalid_input"
+    assert "危险字符" in str(excinfo.value)
+
+
+def test_android_input_text_rejects_too_long(fake_adb_env, ctx: RunContext) -> None:
+    with pytest.raises(AtomFailure) as excinfo:
+        android_input_text.invoke(ctx, {"text": "a" * (android_adb.MAX_INPUT_TEXT_CHARS + 1)})
+    assert excinfo.value.kind == "invalid_input"
+    assert "文本过长" in str(excinfo.value)
 
 
 # --------------------------------------------------------------------------- #
@@ -704,6 +750,43 @@ def test_live_d4_web_wait_for_text_example(ctx: RunContext) -> None:
     )
     assert positive["found"] is True
     assert positive["attempts"] >= 1
+
+
+def test_web_wait_for_text_report_step_is_not_retryable(
+    fake_chrome_env, page_server: str, registry
+) -> None:
+    """报告步骤的 error 体必须显式带 retryable=false（等待超时）。"""
+    from panguverse.axe.plan import TestPlan
+    from panguverse.core.molecule import Molecule
+    from panguverse.engine.executor import Executor
+
+    molecule = Molecule.from_spec(
+        {
+            "id": "wait",
+            "name": "等待不存在的文本",
+            "steps": [
+                {
+                    "id": "wait",
+                    "use": "web_wait_for_text",
+                    "with": {
+                        "url": page_server,
+                        "text": "__PANGUVERSE_NOT_THERE__",
+                        "timeout": 0.8,
+                        "interval": 0.1,
+                    },
+                }
+            ],
+        }
+    )
+    result = Executor(registry).run(TestPlan(cases=[molecule], source="rules"))
+    step = result.cases[0].steps[0]
+    assert step.status in {"failed", "error"}
+    assert step.error is not None
+    assert step.error["failure_kind"] == "timeout"
+    assert step.error["retryable"] is False
+    # 报告序列化（API /api/runs 的 steps[].error）同样带字段
+    payload = result.to_dict()["cases"][0]["steps"][0]
+    assert payload["error"]["retryable"] is False
 
 
 @pytest.mark.skipif(not LIVE, reason="设置 PANGUVERSE_LIVE=1 才跑真实 Chrome/网络验收")

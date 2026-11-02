@@ -52,6 +52,10 @@ from .core import GenericSemantics
 MAX_OUTPUT_CHARS = 4000
 DEFAULT_TIMEOUT = 30.0
 DEFAULT_INTERVAL = 0.5
+#: ``input text`` 单次可安全发送的字符上限（超出容易触发 Binder/输入法异常）
+MAX_INPUT_TEXT_CHARS = 500
+#: 远端 ``input text`` 会经过设备 shell；这些字符不参数化传参就可能被执行/改写
+_SHELL_METACHARS = frozenset(";&|<>$`\\\"'")
 _TOOL_ENV = "PANGUVERSE_ADB"
 _ADB_CANDIDATES = (
     "adb",
@@ -691,7 +695,7 @@ def android_swipe(
     category="device",
     tags=("device", "android", "adb", "mutate", "tool:adb"),
     inputs={"text": "string", "serial?": "string", "timeout?": "number"},
-    outputs={"ok": "boolean", "serial": "string"},
+    outputs={"ok": "boolean", "serial": "string", "sent": "string", "escaped": "boolean"},
     required=("text",),
     effects=("mutate",),
     capabilities=("device",),
@@ -706,13 +710,58 @@ def android_input_text(
     value = str(text if text is not None else "")
     if not value:
         raise AtomFailure("android_input_text 需要非空 text", kind="invalid_input", failure_class="invalid_input")
+    if len(value) > MAX_INPUT_TEXT_CHARS:
+        raise AtomFailure(
+            f"android_input_text 文本过长：{len(value)} 字符，上限 {MAX_INPUT_TEXT_CHARS}",
+            kind="invalid_input",
+            failure_class="invalid_input",
+            detail={"length": len(value), "limit": MAX_INPUT_TEXT_CHARS},
+        )
+    control = [char for char in value if ord(char) < 0x20 or ord(char) == 0x7F]
+    if control:
+        raise AtomFailure(
+            "android_input_text 不支持控制字符（换行/制表等）；请把文本拆成多次输入",
+            kind="invalid_input",
+            failure_class="invalid_input",
+            detail={"control_chars": sorted({f"U+{ord(char):04X}" for char in control})},
+        )
+    danger = sorted({char for char in value if char in _SHELL_METACHARS})
+    if danger:
+        raise AtomFailure(
+            f"android_input_text 文本含 shell 危险字符：{''.join(danger)}；"
+            "为避免在设备端执行任意命令，已拒绝发送",
+            kind="invalid_input",
+            failure_class="invalid_input",
+            detail={"dangerous_chars": danger},
+        )
+    # ``adb shell input text`` 不支持非 ASCII（中文会触发设备侧 Binder NPE）。
+    # 必须在解析设备、调用 adb 之前显式失败，绝不把这类文本发下去。
+    if not value.isascii():
+        raise AtomFailure(
+            "android_input_text 不支持中文/非 ASCII 文本；"
+            "请安装并切换到 ADBKeyboard 等输入法后用广播输入，或改用剪贴板粘贴",
+            kind="unsupported_input",
+            failure_class="invalid_input",
+            detail={
+                "text": value,
+                "non_ascii_chars": sum(1 for char in value if not char.isascii()),
+                "hint": "ADBKeyboard / 剪贴板粘贴",
+                "retryable": False,
+            },
+        )
     target = resolve_serial(serial)
-    escaped = value.replace(" ", "%s")
+    # 经典转义：设备端 shell 把 %s 还原为空格（必须作为单个 argv 传入，不拼命令字符串）
+    sent = value.replace(" ", "%s")
     code, out, err = _run_adb(
-        target, ["shell", "input", "text", escaped], timeout=timeout or DEFAULT_TIMEOUT
+        target, ["shell", "input", "text", sent], timeout=timeout or DEFAULT_TIMEOUT
     )
     _assert_ok(code, out, err, action="输入文本")
-    return {"ok": True, "serial": target}
+    return {
+        "ok": True,
+        "serial": target,
+        "sent": sent,
+        "escaped": sent != value,
+    }
 
 
 @atom(
@@ -999,6 +1048,10 @@ class AndroidSemantics(GenericSemantics):
             "timeout": "adb 命令超时：确认设备有响应，必要时放宽 timeout",
             "parse": "UI XML 无法解析：确认 uiautomator dump 正常产出 XML",
             "invalid_input": "参数不合法：检查文本、坐标、包名与匹配模式",
+            "unsupported_input": (
+                "不支持中文/非 ASCII 文本：安装 ADBKeyboard 等输入法并用广播输入，"
+                "或改用剪贴板粘贴"
+            ),
         }
         return texts.get(kind) or super().advice(kind=kind, failure_class=failure_class)
 

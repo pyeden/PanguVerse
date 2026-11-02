@@ -124,6 +124,7 @@ def test_create_draft_graph_and_permissions(api: WebAPI) -> None:
     )
     assert status == 201, body
     assert body["rev"] == 0
+    assert body["domain_pack"] == "local_fs"
     graph = body["graph"]
     assert len(graph["nodes"]) >= 3
     for node in graph["nodes"]:

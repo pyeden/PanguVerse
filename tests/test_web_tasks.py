@@ -378,8 +378,9 @@ def test_a22_config_reports_first_failed_step(web: Client) -> None:
     assert config["scenario"] == "scenarios/api_smoke.yaml"
     error = config["error"]
     assert isinstance(error, dict)
-    assert set(error) == {"case", "step", "message", "expected", "actual"}
+    assert set(error) == {"case", "step", "message", "expected", "actual", "retryable"}
     assert error["message"]
+    assert error["retryable"] is True  # 连接被拒是瞬态错误
 
     status, detail = web.json("GET", f"/api/runs/{run_id}")
     report = detail["report"]
