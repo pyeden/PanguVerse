@@ -633,6 +633,8 @@ export function debugReasonLabel(reason?: string | null): string {
     when_false: '条件为假',
     foreach_empty: '循环为空',
     upstream_failed: '上游失败',
+    upstream_skipped: '上游被跳过',
+    missing_input: '输入为空',
     optional: '可选节点',
     assertion: '断言失败',
     network: '网络错误',
@@ -641,6 +643,23 @@ export function debugReasonLabel(reason?: string | null): string {
     cancelled: '已取消',
   }
   return reason ? map[reason] || reason : ''
+}
+
+export function debugReasonDetail(reason?: string | null): string {
+  const map: Record<string, string> = {
+    when_false: '条件为假，按 when 规则跳过该节点。',
+    foreach_empty: '循环集合为空，节点没有可执行项。',
+    upstream_failed: '上游节点失败，当前节点依赖未满足。',
+    upstream_skipped: '上游节点被跳过，当前节点没有可用输入。',
+    missing_input: '上游节点被跳过或输入为空，当前节点无法执行。',
+    optional: '节点标记为可选，未满足条件时跳过。',
+    assertion: '断言未通过，请查看 outputs 与断言参数。',
+    network: '网络请求失败，请确认目标可达。',
+    missing_env: '缺少项目环境变量，节点无法执行。',
+    missing_llm: '未配置 LLM，无法执行该节点。',
+    cancelled: '调试被取消。',
+  }
+  return reason ? map[reason] || '' : ''
 }
 
 export function normalizeDebugSession(payload: AnyRecord, fallbackDone = false): DebugSession {

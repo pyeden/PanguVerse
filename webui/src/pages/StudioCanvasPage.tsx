@@ -21,7 +21,7 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { api, debugReasonLabel, isStudioMock, onStudioMockChange, readStudioProvenance, studioApi } from '../shared/api'
+import { api, debugReasonDetail, debugReasonLabel, isStudioMock, onStudioMockChange, readStudioProvenance, studioApi } from '../shared/api'
 import { navigate, href, useRoute } from '../shared/router'
 import { errorText, formatDuration, pretty, statusLabel } from '../shared/utils'
 import type {
@@ -162,8 +162,10 @@ const AtomNode = memo(function AtomNode({ data, selected }: NodeProps<AtomFlowNo
         ))}
         {!Object.keys(node.with || {}).length ? <span className="muted">无参数</span> : null}
       </div>
-      {debugStatus === 'skipped' && reasonLabel ? (
-        <div className="flow-debug-reason">跳过 · {reasonLabel} <code>{debugReason}</code></div>
+      {(debugStatus === 'skipped' || debugStatus === 'failed') && reasonLabel ? (
+        <div className="flow-debug-reason" data-debug-reason-text={debugReason}>
+          {debugStatus === 'skipped' ? '跳过' : '失败'} · {reasonLabel} <code>{debugReason}</code>
+        </div>
       ) : null}
       <div className="flow-node-foot">
         <div className="flow-effects">
@@ -515,6 +517,22 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   )
   debugStatusRef.current = debugStatusMap
 
+  const upstreamBlockedFor = useCallback((nodeId: string): string[] => {
+    const edges = workflow?.graph?.edges || []
+    const blocked: string[] = []
+    const visited = new Set<string>()
+    const stack = edges.filter((edge) => edge.to === nodeId).map((edge) => edge.from)
+    while (stack.length) {
+      const id = stack.pop()!
+      if (!id || visited.has(id)) continue
+      visited.add(id)
+      const state = debugStatusMap.get(id)
+      if (state && (state.status === 'skipped' || state.status === 'failed')) blocked.push(id)
+      edges.filter((edge) => edge.to === id).forEach((edge) => stack.push(edge.from))
+    }
+    return blocked
+  }, [debugStatusMap, workflow?.graph?.edges])
+
   useEffect(() => {
     setNodes((current) => {
       let changed = false
@@ -725,6 +743,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const capabilityGaps = gapItems(workflow.capability_gaps || storedProvenance?.capability_gaps || validation.capability_gaps || [])
   const coverage = validation.coverage || null
   const missingEnv = validation.missing_env || []
+  const selectedUpstreamBlocked = debugStep && debugStep.status === 'failed' ? upstreamBlockedFor(debugStep.node_id) : []
 
   return (
     <div className="studio-page studio-canvas-page">
@@ -869,6 +888,8 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   <button
                     type="button"
                     className={`follow-toggle ${followDebug ? 'is-on' : ''}`}
+                    data-testid="debug-follow-toggle"
+                    data-following={followDebug ? 'true' : 'false'}
                     onClick={() => setFollowDebug((value) => !value)}
                     title={followDebug ? '暂停自动跟随当前节点' : '恢复自动跟随当前节点'}
                   >
@@ -893,7 +914,13 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               {debugError ? (
                 <div className="debug-error-banner"><Icon name="warning" size={13} /><span>{debugError}</span></div>
               ) : null}
-              <div className="debug-progress" data-testid="debug-progress">
+              <div
+                className="debug-progress"
+                data-testid="debug-progress"
+                data-done={debugSession?.done ? 'true' : 'false'}
+                data-total={totalCount}
+                data-finished={finishedCount}
+              >
                 <div className="debug-progress-head">
                   <span className="mono debug-progress-count">{finishedCount}/{totalCount}</span>
                   <span className="debug-progress-label">
@@ -914,7 +941,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   <div className="skip-groups">
                     <span className="skip-groups-label">跳过原因</span>
                     {skipGroups.map((group) => (
-                      <details className="skip-group" key={group.reason} open={skipGroups.length <= 2}>
+                      <details className="skip-group" key={group.reason} data-testid={`debug-skip-group-${group.reason}`} data-reason={group.reason} data-count={group.count} open={skipGroups.length <= 2}>
                         <summary>
                           <code className="skip-reason-code">{group.reason}</code>
                           <span>{debugReasonLabel(group.reason)}</span>
@@ -953,8 +980,11 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                         else rowRefs.current.delete(step.node_id)
                       }}
                       className={`debug-row is-${step.status} ${debugStep?.node_id === step.node_id ? 'is-active' : ''} ${debugStatusMap.get(step.node_id)?.status === 'running' ? 'is-current' : ''}`}
+                      data-testid={`debug-node-${step.node_id}`}
                       data-node-id={step.node_id}
+                      data-status={step.status}
                       data-debug-status={step.status}
+                      data-reason={step.reason || ''}
                       data-debug-reason={step.reason || undefined}
                       onClick={() => {
                         setDebugStep(step)
@@ -965,7 +995,13 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                       <span><strong>{nodeLabel(step.node_id)}</strong><small className="mono">{step.node_id} · {step.atom || workflow.graph?.nodes.find((node) => node.node_id === step.node_id)?.atom}</small></span>
                       <span className={`debug-status ${step.status}`}>{step.status === 'running' ? <span className="mini-pulse" /> : null}{statusLabel(step.status)}</span>
                       <span className="mono">{step.status === 'pending' || step.status === 'running' ? '—' : formatDuration(step.duration_ms)}</span>
-                      <span className="debug-error">{step.reason ? `${debugReasonLabel(step.reason)} · ${step.reason}` : errorText(step.error) || '—'}</span>
+                      <span className="debug-error" title={step.reason ? `${debugReasonLabel(step.reason)}：${debugReasonDetail(step.reason)}` : step.status === 'failed' && upstreamBlockedFor(step.node_id).length ? `上游节点被跳过或输入为空：${upstreamBlockedFor(step.node_id).map(nodeLabel).join('、')}` : errorText(step.error)}>
+                        {step.reason
+                          ? `${debugReasonLabel(step.reason)} · ${debugReasonDetail(step.reason) || step.reason}`
+                          : step.status === 'failed' && upstreamBlockedFor(step.node_id).length
+                            ? `上游节点被跳过或输入为空（${upstreamBlockedFor(step.node_id).map(nodeLabel).join('、')}）`
+                            : errorText(step.error) || '—'}
+                      </span>
                     </button>
                   )) : (
                     <div className="debug-empty">
@@ -985,11 +1021,24 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                       {debugStep.reason ? (
                         <div className="debug-reason" data-testid="debug-reason">
                           <Icon name="warning" size={13} />
-                          <span>{debugStep.status === 'skipped' ? '跳过原因' : '原因'}：{debugReasonLabel(debugStep.reason)}</span>
+                          <span>{debugStep.status === 'skipped' ? '跳过原因' : debugStep.status === 'failed' ? '失败原因' : '原因'}：{debugReasonLabel(debugStep.reason)}</span>
                           <code>{debugStep.reason}</code>
+                          {debugReasonDetail(debugStep.reason) ? <small className="debug-reason-detail">{debugReasonDetail(debugStep.reason)}</small> : null}
                         </div>
                       ) : null}
-                      {debugStep.error ? <div className="debug-reason failed"><Icon name="warning" size={13} /><span>{errorText(debugStep.error)}</span></div> : null}
+                      {selectedUpstreamBlocked.length && !['missing_input', 'upstream_skipped'].includes(debugStep.reason || '') ? (
+                        <div className="debug-reason failed" data-testid="debug-upstream-note">
+                          <Icon name="warning" size={13} />
+                          <span>上游节点被跳过或输入为空：{selectedUpstreamBlocked.map(nodeLabel).join('、')}</span>
+                          <small className="debug-reason-detail">当前节点依赖未满足，后端原始错误可能被误分类。</small>
+                        </div>
+                      ) : null}
+                      {debugStep.error ? (
+                        <div className="debug-reason failed">
+                          <Icon name="warning" size={13} />
+                          <span>{debugStep.reason ? '后端原始信息：' : ''}{errorText(debugStep.error)}</span>
+                        </div>
+                      ) : null}
                       <div className="debug-io">
                         <div><span className="io-label">inputs</span><JsonTree data={debugStep.inputs || {}} /></div>
                         <div><span className="io-label">outputs</span><JsonTree data={debugStep.outputs || {}} /></div>
@@ -1137,7 +1186,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                     return <><StatusBadge status={step.status} /><span className="mono">{formatDuration(step.duration_ms)}</span></>
                   })()}
                   {debugStatusMap.get(selectedNode.node_id)?.reason ? (
-                    <span className="recent-debug-reason">原因：{debugReasonLabel(debugStatusMap.get(selectedNode.node_id)?.reason)} <code>{debugStatusMap.get(selectedNode.node_id)?.reason}</code></span>
+                    <span className="recent-debug-reason">原因：{debugReasonLabel(debugStatusMap.get(selectedNode.node_id)?.reason)} <code>{debugStatusMap.get(selectedNode.node_id)?.reason}</code>{debugReasonDetail(debugStatusMap.get(selectedNode.node_id)?.reason) ? <> · {debugReasonDetail(debugStatusMap.get(selectedNode.node_id)?.reason)}</> : null}</span>
                   ) : null}
                   <details className="recent-debug-io">
                     <summary>查看 reason / inputs / outputs</summary>
@@ -1145,7 +1194,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                       const step = debugStatusMap.get(selectedNode.node_id)!
                       return (
                         <>
-                          {step.reason ? <div className="debug-reason"><Icon name="warning" size={13} /><span>{debugReasonLabel(step.reason)}</span><code>{step.reason}</code></div> : null}
+                          {step.reason ? <div className="debug-reason"><Icon name="warning" size={13} /><span>{debugReasonLabel(step.reason)}</span><code>{step.reason}</code>{debugReasonDetail(step.reason) ? <small className="debug-reason-detail">{debugReasonDetail(step.reason)}</small> : null}</div> : null}
                           <div className="debug-io"><div><span className="io-label">inputs</span><JsonTree data={step.inputs || {}} /></div><div><span className="io-label">outputs</span><JsonTree data={step.outputs || {}} /></div></div>
                         </>
                       )
