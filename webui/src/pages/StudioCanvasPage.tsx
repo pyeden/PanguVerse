@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type PointerEvent as ReactPointerEvent } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Background,
@@ -203,6 +203,22 @@ function savePositions(wid: string, nodes: Node<AtomNodeData>[]): void {
   }
 }
 
+const DEBUG_WIDTH_KEY = 'panguverse.studio.debugWidth'
+
+function loadDebugWidth(): number {
+  try {
+    const value = Number(localStorage.getItem(DEBUG_WIDTH_KEY))
+    if (Number.isFinite(value) && value > 0) return Math.min(620, Math.max(260, Math.round(value)))
+  } catch {
+    /* local preference only */
+  }
+  return 320
+}
+
+function clampDebugWidth(value: number): number {
+  return Math.min(620, Math.max(260, Math.round(value)))
+}
+
 export function StudioCanvasPage({ wid }: { wid: string }) {
   return (
     <ReactFlowProvider>
@@ -231,6 +247,9 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [replanOpen, setReplanOpen] = useState(false)
   const [instruction, setInstruction] = useState('补充一条响应耗时断言，并保持锁定节点不变。')
   const [debugOpen, setDebugOpen] = useState(false)
+  const [debugWidth, setDebugWidth] = useState<number>(loadDebugWidth)
+  const [debugResizing, setDebugResizing] = useState(false)
+  const [nodeRailCollapsed, setNodeRailCollapsed] = useState(false)
   const [debugMode, setDebugMode] = useState<'only' | 'from_start' | 'downstream'>('from_start')
   const [debugNodeId, setDebugNodeId] = useState('')
   const [debugSession, setDebugSession] = useState<DebugSession | null>(null)
@@ -254,6 +273,9 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const drainTimerRef = useRef(0)
   const toastDoneRef = useRef(false)
   const drainRef = useRef<() => void>(() => {})
+  const flowWrapRef = useRef<HTMLDivElement | null>(null)
+  const debugWidthRef = useRef(debugWidth)
+  debugWidthRef.current = debugWidth
   const storedProvenance = useMemo(() => readStudioProvenance(wid), [wid])
   const [panelOpen, setPanelOpen] = useState(false)
   const [paramName, setParamName] = useState('')
@@ -498,14 +520,67 @@ function StudioCanvasInner({ wid }: { wid: string }) {
 
   const locateNode = useCallback((nodeId?: string) => {
     if (!nodeId) return
+    setNodeRailCollapsed(false)
     setSelectedId(nodeId)
     setPanelOpen(true)
     centerNode(nodeId)
   }, [centerNode])
 
+  const persistDebugWidth = useCallback((value: number) => {
+    try {
+      localStorage.setItem(DEBUG_WIDTH_KEY, String(clampDebugWidth(value)))
+    } catch {
+      /* local preference only */
+    }
+  }, [])
+
+  const nudgeDebugWidth = useCallback((delta: number) => {
+    const next = clampDebugWidth(debugWidthRef.current + delta)
+    setDebugWidth(next)
+    persistDebugWidth(next)
+  }, [persistDebugWidth])
+
+  const startDebugResize = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return
+    event.preventDefault()
+    let lastX = event.clientX
+    setDebugResizing(true)
+    const onMove = (moveEvent: PointerEvent) => {
+      const next = clampDebugWidth(debugWidthRef.current + (moveEvent.clientX - lastX))
+      lastX = moveEvent.clientX
+      setDebugWidth(next)
+    }
+    const onUp = () => {
+      setDebugResizing(false)
+      persistDebugWidth(debugWidthRef.current)
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+    }
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+  }, [persistDebugWidth])
+
+  useEffect(() => {
+    const element = flowWrapRef.current
+    if (!element) return
+    let timer = 0
+    const observer = new ResizeObserver(() => {
+      window.clearTimeout(timer)
+      timer = window.setTimeout(() => {
+        flowRef.current?.fitView({ padding: 0.14, duration: 220 })
+      }, 160)
+    })
+    observer.observe(element)
+    return () => {
+      observer.disconnect()
+      window.clearTimeout(timer)
+    }
+  }, [workflow?.wid])
+
   useEffect(() => {
     const target = route.query.get('node')
     if (!target || !workflow?.graph?.nodes?.some((node) => node.node_id === target)) return
+    setNodeRailCollapsed(false)
     setSelectedId(target)
     setPanelOpen(true)
   }, [route.path, route.query, workflow?.wid])
@@ -773,7 +848,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
           </span>
           <Button size="sm" variant="ghost" icon="refresh" onClick={() => studioApi.validate(wid).then(setValidation).catch((error) => push(error.message, 'error'))}>校验</Button>
           <Button size="sm" variant="ghost" icon="spark" onClick={() => setReplanOpen(true)}>AI 重规划</Button>
-          <Button size="sm" variant="ghost" icon="settings" className="mobile-only" onClick={() => setPanelOpen(true)}>节点设置</Button>
+          <Button size="sm" variant="ghost" icon="settings" className="mobile-only" onClick={() => { setNodeRailCollapsed(false); setPanelOpen(true) }}>节点设置</Button>
           <Button
             size="sm"
             variant="primary"
@@ -788,93 +863,36 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         </div>
       </div>
 
-      <div className="studio-workspace">
-        <section className="canvas-panel">
-          <div className={`plan-banner plan-${planMode}`} data-testid="plan-banner">
-            <span className="plan-source">
-              <Icon name={planMode === 'ai' ? 'spark' : planMode === 'rules' ? 'layers' : 'warning'} size={14} />
-              {planMode === 'ai' ? 'AI 规划' : planMode === 'rules' ? `规则模板${plannerRaw === 'template' ? ' · 模板' : ''}` : '来源未标注'}
-            </span>
-            <span className="plan-confidence">置信度 <strong>{confidence === null ? '—' : confidence.toFixed(2)}</strong></span>
-            {planMode === 'rules' ? <span className="plan-low"><Icon name="warning" size={12} />低置信度，请人工核对</span> : null}
-            {planMode === 'unknown' ? <span className="plan-low">请人工核对计划来源</span> : null}
-            {assumptions.length ? (
-              <span className="plan-assumptions">
-                待确认环境变量
-                {assumptions.map((item) => <code key={item}>{item}</code>)}
-              </span>
-            ) : <span className="plan-assumptions muted">没有待确认假设</span>}
-          </div>
-          {capabilityGaps.length ? (
-            <div className="capability-gap-bar" data-testid="capability-gap-bar">
-              <Icon name="warning" size={14} />
-              <strong>能力缺口 {capabilityGaps.length}</strong>
-              {capabilityGaps.map((gap) => (
-                <span className="gap-chip" key={gap.atom} title={gap.message || ''}>
-                  <code>{gap.atom}</code>
-                  {gap.suggestions.length ? <em>{gap.suggestions.join(' / ')}</em> : null}
-                </span>
-              ))}
-            </div>
-          ) : null}
-          <div className="canvas-toolbar">
-            <div className="canvas-toolbar-left">
-              <Button size="sm" variant="ghost" icon="plus" onClick={() => setAddOpen(true)}>添加节点</Button>
-              <span className="legend"><span className="legend-line data" />数据边</span>
-              <span className="legend"><span className="legend-line order" />顺序边 order-only</span>
-            </div>
-            <div className="canvas-toolbar-right">
-              <span>{workflow.graph?.nodes?.length || 0} 节点 · {workflow.graph?.edges?.length || 0} 边</span>
-              <span className="canvas-tip"><Icon name="bug" size={13} /> 拖拽端点连线</span>
-            </div>
-          </div>
-          <div className="flow-wrap">
-            <ReactFlow
-              nodes={nodes}
-              edges={edges}
-              nodeTypes={nodeTypes}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onNodeDragStop={() => setNodes((current) => { savePositions(wid, current); return current })}
-              onConnect={onConnect}
-              onNodeClick={(_, node) => { setSelectedId(node.id); setPanelOpen(true) }}
-              onPaneClick={() => { setSelectedId(''); setPanelOpen(false) }}
-              onNodeDoubleClick={(_, node) => { setSelectedId(node.id); setPanelOpen(true) }}
-              onInit={(instance) => { flowRef.current = instance }}
-              fitView
-              fitViewOptions={{ padding: 0.14 }}
-              minZoom={0.2}
-              maxZoom={1.8}
-              defaultEdgeOptions={{ type: 'smoothstep' }}
-              proOptions={{ hideAttribution: false }}
-              className="studio-flow"
+      <div
+        className={`studio-workspace ${debugOpen ? 'is-debug-open' : 'is-debug-closed'} ${debugResizing ? 'is-resizing' : ''} ${nodeRailCollapsed ? 'is-node-collapsed' : ''}`}
+        style={{ '--debug-width': `${debugWidth}px` } as CSSProperties}
+        data-debug-width={debugWidth}
+        data-debug-open={debugOpen ? 'true' : 'false'}
+      >
+        {debugOpen ? (
+          <>
+            <div className="debug-backdrop" onClick={() => setDebugOpen(false)} aria-hidden="true" />
+            <section
+              className="debug-column"
+              role="region"
+              aria-label="调试面板"
+              data-testid="debug-column"
+              data-width={debugWidth}
             >
-              <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#243149" />
-              <Controls showInteractive={false} />
-              <MiniMap pannable zoomable nodeColor={(node) => (node.selected ? '#8b7cff' : '#26344e')} maskColor="rgba(6,10,18,.72)" className="studio-minimap" />
-            </ReactFlow>
-            {!workflow.graph?.nodes?.length ? (
-              <div className="canvas-empty">
-                <Icon name="flow" size={26} />
-                <strong>画布还是空的</strong>
-                <p>添加一个原子节点开始编排。</p>
-                <Button size="sm" variant="primary" icon="plus" onClick={() => setAddOpen(true)}>添加节点</Button>
-              </div>
-            ) : null}
-          </div>
-          <div className="canvas-statusbar">
-            <div className="status-mini">
-              <span className={`validation-pill ${blockingErrors ? 'bad' : 'ok'}`}><span className="status-dot" />{blockingErrors ? '校验未通过' : '校验通过'}</span>
-              <span className="muted">节点拖动仅保存本地 ui.x/y，不产生新 rev</span>
-            </div>
-            <button type="button" className={`debug-trigger ${debugOpen ? 'is-active' : ''}`} onClick={() => setDebugOpen((value) => !value)}>
-              <Icon name="bug" size={15} />
-              调试
-              {debugSession ? <Badge tone={debugSession.done ? 'ok' : 'warn'}>{finishedCount}/{totalCount}</Badge> : null}
-            </button>
-          </div>
-
-          {debugOpen ? (
+              <div
+                className="debug-resizer"
+                role="separator"
+                aria-orientation="vertical"
+                aria-label="拖拽调整调试面板宽度"
+                title="拖拽调整宽度，双击复位"
+                tabIndex={0}
+                onPointerDown={startDebugResize}
+                onKeyDown={(event) => {
+                  if (event.key === 'ArrowLeft') { event.preventDefault(); nudgeDebugWidth(-20) }
+                  if (event.key === 'ArrowRight') { event.preventDefault(); nudgeDebugWidth(20) }
+                }}
+                onDoubleClick={() => { setDebugWidth(320); persistDebugWidth(320) }}
+              />
             <div className="debug-drawer" role="region" aria-label="调试抽屉">
               <div className="debug-head">
                 <div className="debug-title">
@@ -883,6 +901,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   {debugSessionId ? <Badge tone={debugPolling ? 'warn' : 'ok'}>{debugPolling ? '轮询中' : debugSession?.done ? '已完成' : '等待'}</Badge> : null}
                   {debugSession?.legacy ? <Badge tone="warn">同步旧接口</Badge> : null}
                   <span className="debug-sub">POST 202 · GET cursor 增量</span>
+                  <span className="debug-mobile-note">窄屏以抽屉覆盖画布，关闭后恢复编辑</span>
                 </div>
                 <div className="debug-head-actions">
                   <button
@@ -1078,13 +1097,131 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 </div>
               </div>
             </div>
+            </section>
+          </>
+        ) : (
+          <aside className="debug-rail" aria-label="调试面板已折叠">
+            <button
+              type="button"
+              className="debug-rail-btn"
+              data-testid="debug-rail-toggle"
+              onClick={() => setDebugOpen(true)}
+              title="展开调试面板"
+            >
+              <Icon name="bug" size={16} />
+              <span>调试</span>
+              {debugSession ? <Badge tone={debugSession.done ? 'ok' : 'warn'}>{finishedCount}/{totalCount}</Badge> : null}
+            </button>
+          </aside>
+        )}
+
+        <section className="canvas-panel">
+          <div className={`plan-banner plan-${planMode}`} data-testid="plan-banner">
+            <span className="plan-source">
+              <Icon name={planMode === 'ai' ? 'spark' : planMode === 'rules' ? 'layers' : 'warning'} size={14} />
+              {planMode === 'ai' ? 'AI 规划' : planMode === 'rules' ? `规则模板${plannerRaw === 'template' ? ' · 模板' : ''}` : '来源未标注'}
+            </span>
+            <span className="plan-confidence">置信度 <strong>{confidence === null ? '—' : confidence.toFixed(2)}</strong></span>
+            {planMode === 'rules' ? <span className="plan-low"><Icon name="warning" size={12} />低置信度，请人工核对</span> : null}
+            {planMode === 'unknown' ? <span className="plan-low">请人工核对计划来源</span> : null}
+            {assumptions.length ? (
+              <span className="plan-assumptions">
+                待确认环境变量
+                {assumptions.map((item) => <code key={item}>{item}</code>)}
+              </span>
+            ) : <span className="plan-assumptions muted">没有待确认假设</span>}
+          </div>
+          {capabilityGaps.length ? (
+            <div className="capability-gap-bar" data-testid="capability-gap-bar">
+              <Icon name="warning" size={14} />
+              <strong>能力缺口 {capabilityGaps.length}</strong>
+              {capabilityGaps.map((gap) => (
+                <span className="gap-chip" key={gap.atom} title={gap.message || ''}>
+                  <code>{gap.atom}</code>
+                  {gap.suggestions.length ? <em>{gap.suggestions.join(' / ')}</em> : null}
+                </span>
+              ))}
+            </div>
           ) : null}
+          <div className="canvas-toolbar">
+            <div className="canvas-toolbar-left">
+              <Button size="sm" variant="ghost" icon="plus" onClick={() => setAddOpen(true)}>添加节点</Button>
+              <span className="legend"><span className="legend-line data" />数据边</span>
+              <span className="legend"><span className="legend-line order" />顺序边 order-only</span>
+            </div>
+            <div className="canvas-toolbar-right">
+              <span>{workflow.graph?.nodes?.length || 0} 节点 · {workflow.graph?.edges?.length || 0} 边</span>
+              <span className="canvas-tip"><Icon name="bug" size={13} /> 拖拽端点连线</span>
+            </div>
+          </div>
+          <div className="flow-wrap" ref={flowWrapRef}>
+            <ReactFlow
+              nodes={nodes}
+              edges={edges}
+              nodeTypes={nodeTypes}
+              onNodesChange={onNodesChange}
+              onEdgesChange={onEdgesChange}
+              onNodeDragStop={() => setNodes((current) => { savePositions(wid, current); return current })}
+              onConnect={onConnect}
+              onNodeClick={(_, node) => { setNodeRailCollapsed(false); setSelectedId(node.id); setPanelOpen(true) }}
+              onPaneClick={() => { setSelectedId(''); setPanelOpen(false) }}
+              onNodeDoubleClick={(_, node) => { setNodeRailCollapsed(false); setSelectedId(node.id); setPanelOpen(true) }}
+              onInit={(instance) => { flowRef.current = instance }}
+              fitView
+              fitViewOptions={{ padding: 0.14 }}
+              minZoom={0.2}
+              maxZoom={1.8}
+              defaultEdgeOptions={{ type: 'smoothstep' }}
+              proOptions={{ hideAttribution: false }}
+              className="studio-flow"
+            >
+              <Background variant={BackgroundVariant.Dots} gap={22} size={1} color="#243149" />
+              <Controls showInteractive={false} />
+              <MiniMap pannable zoomable nodeColor={(node) => (node.selected ? '#8b7cff' : '#26344e')} maskColor="rgba(6,10,18,.72)" className="studio-minimap" />
+            </ReactFlow>
+            {!workflow.graph?.nodes?.length ? (
+              <div className="canvas-empty">
+                <Icon name="flow" size={26} />
+                <strong>画布还是空的</strong>
+                <p>添加一个原子节点开始编排。</p>
+                <Button size="sm" variant="primary" icon="plus" onClick={() => setAddOpen(true)}>添加节点</Button>
+              </div>
+            ) : null}
+          </div>
+          <div className="canvas-statusbar">
+            <div className="status-mini">
+              <span className={`validation-pill ${blockingErrors ? 'bad' : 'ok'}`}><span className="status-dot" />{blockingErrors ? '校验未通过' : '校验通过'}</span>
+              <span className="muted">节点拖动仅保存本地 ui.x/y，不产生新 rev</span>
+            </div>
+            <button type="button" className={`debug-trigger ${debugOpen ? 'is-active' : ''}`} onClick={() => setDebugOpen((value) => !value)}>
+              <Icon name="bug" size={15} />
+              调试
+              {debugSession ? <Badge tone={debugSession.done ? 'ok' : 'warn'}>{finishedCount}/{totalCount}</Badge> : null}
+            </button>
+          </div>
         </section>
 
+        {nodeRailCollapsed ? (
+          <aside className="side-panel-rail" aria-label="节点属性面板已折叠">
+            <button
+              type="button"
+              data-testid="node-panel-rail-toggle"
+              onClick={() => {
+                setNodeRailCollapsed(false)
+                if (window.matchMedia('(max-width: 1080px)').matches) setPanelOpen(true)
+              }}
+              title="展开节点属性面板"
+            >
+              <Icon name="settings" size={16} />
+              <span>节点</span>
+            </button>
+          </aside>
+        ) : (
         <aside className={`side-panel studio-node-panel ${panelOpen ? 'is-mobile-open' : ''}`}>
           <div className="side-panel-head">
             <div><span className="side-kicker">{selectedNode ? '节点设置' : '流程检查'}</span><h2>{selectedNode?.name || '未选择节点'}</h2></div>
             <div className="side-head-actions">
+              <IconButton label="折叠属性面板" icon="chevron" className="node-panel-collapse" onClick={() => setNodeRailCollapsed(true)} />
               <IconButton label="关闭面板" icon="close" className="mobile-only" onClick={() => setPanelOpen(false)} />
               {selectedNode ? <IconButton label={selectedNode.locked ? '解锁节点' : '锁定节点'} icon={selectedNode.locked ? 'lock' : 'unlock'} className={selectedNode.locked ? 'is-locked' : ''} onClick={() => toggleLock.mutate()} /> : null}
             </div>
@@ -1264,6 +1401,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
             </div>
           )}
         </aside>
+        )}
       </div>
 
       <Modal

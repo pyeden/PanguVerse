@@ -1713,3 +1713,150 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
   .debug-counts { margin-left: 0; }
   .debug-progress-head { gap: 5px; }
 }
+
+/* ------------------------------------------------- Workbench 3-column layout */
+.studio-workspace { display: flex; align-items: stretch; gap: 12px; }
+.studio-workspace > .canvas-panel { flex: 1 1 auto; min-width: 0; width: auto; }
+.studio-workspace > .side-panel { flex: 0 0 326px; width: 326px; }
+
+.debug-column {
+  position: relative;
+  flex: 0 0 var(--debug-width, 320px);
+  width: var(--debug-width, 320px);
+  min-width: 0;
+  height: clamp(540px, calc(100vh - 174px), 900px);
+  display: flex;
+}
+.debug-column > .debug-drawer {
+  position: relative;
+  left: auto; right: auto; bottom: auto;
+  width: 100%; height: 100%; min-height: 0;
+  z-index: auto;
+  box-shadow: var(--shadow-soft);
+  animation: panel-in .16s ease both;
+}
+@keyframes panel-in { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+.debug-column .debug-head { flex-wrap: wrap; row-gap: 5px; }
+.debug-column .debug-title { min-width: 0; gap: 5px; }
+.debug-column .debug-head-actions { margin-left: auto; }
+.debug-column .debug-sub { flex-basis: 100%; order: 9; }
+.debug-mobile-note { display: none; color: var(--dim); font-size: 7.5px; flex-basis: 100%; }
+.debug-column .debug-controls { gap: 5px; }
+.debug-column .debug-controls .select { flex: 1 1 100%; width: 100%; min-width: 0; }
+.debug-column .debug-body {
+  display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden;
+}
+.debug-column .debug-trace {
+  flex: 0 0 auto;
+  overflow: visible;
+  border-right: 0;
+  border-bottom: 1px solid var(--line);
+}
+.debug-column .debug-trace-head { display: none; }
+.debug-column .debug-row {
+  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-areas: "node status" "error error";
+  row-gap: 3px;
+  padding: 7px 9px;
+}
+.debug-column .debug-row > span:first-child { grid-area: node; }
+.debug-column .debug-row > .debug-status { grid-area: status; justify-self: end; }
+.debug-column .debug-row > .mono { display: none; }
+.debug-column .debug-error { grid-area: error; white-space: normal; line-height: 1.4; }
+.debug-column .debug-detail { overflow: visible; padding-bottom: 14px; }
+.debug-column .debug-io { grid-template-columns: 1fr; }
+.debug-column .debug-io .json-block { max-height: 180px; }
+.debug-column .debug-progress-head { gap: 5px; }
+.debug-column .debug-counts { margin-left: 0; width: 100%; }
+.debug-column .debug-reason { align-items: flex-start; }
+.debug-column .variable-row { grid-template-columns: minmax(0, 1fr); }
+.debug-column .variable-row span { white-space: normal; word-break: break-word; }
+.debug-column .debug-empty { min-height: 90px; }
+
+.debug-resizer {
+  position: absolute; right: -9px; top: 0; bottom: 0; width: 16px;
+  z-index: 30; cursor: col-resize; touch-action: none;
+  background: transparent;
+}
+.debug-resizer::after {
+  content: ''; position: absolute; left: 7px; top: 50%; transform: translateY(-50%);
+  width: 2px; height: 42px; border-radius: 2px;
+  background: rgba(154, 177, 214, .3);
+  transition: background .14s ease, height .14s ease;
+}
+.debug-resizer:hover::after, .studio-workspace.is-resizing .debug-resizer::after {
+  background: var(--amber); height: 64px;
+}
+.studio-workspace.is-resizing { cursor: col-resize; user-select: none; }
+.studio-workspace.is-resizing .studio-flow { pointer-events: none; }
+
+.debug-rail {
+  flex: 0 0 42px; width: 42px;
+  height: clamp(540px, calc(100vh - 174px), 900px);
+  border: 1px solid rgba(247, 187, 99, .2);
+  border-radius: 12px;
+  background: linear-gradient(165deg, rgba(18, 27, 43, .9), rgba(8, 13, 22, .96));
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 8px;
+}
+.debug-rail-btn {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  border: 0; background: transparent; color: #ffd08c; cursor: pointer;
+  padding: 7px 4px; border-radius: 8px;
+}
+.debug-rail-btn:hover { background: rgba(247, 187, 99, .08); }
+.debug-rail-btn span { writing-mode: vertical-rl; letter-spacing: .12em; font-size: 9px; }
+.debug-rail-btn .badge { font-size: 7px; padding: 1px 4px; }
+
+.side-panel-rail {
+  flex: 0 0 38px; width: 38px;
+  height: clamp(540px, calc(100vh - 174px), 900px);
+  border: 1px solid var(--line); border-radius: 12px;
+  background: rgba(14, 21, 35, .82);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding-top: 8px;
+}
+.side-panel-rail button {
+  display: flex; flex-direction: column; align-items: center; gap: 7px;
+  border: 0; background: transparent; color: var(--muted); cursor: pointer;
+  padding: 7px 4px; border-radius: 8px;
+}
+.side-panel-rail button span { writing-mode: vertical-rl; letter-spacing: .12em; font-size: 9px; }
+.side-panel-rail button:hover { color: var(--text); background: rgba(154, 177, 214, .06); }
+.node-panel-collapse { display: inline-flex; }
+.debug-backdrop { display: none; }
+
+@media (max-width: 1100px) {
+  .studio-workspace { gap: 8px; }
+  .studio-workspace > .side-panel { display: none; }
+  .side-panel-rail { display: none; }
+  .debug-column {
+    position: fixed;
+    left: 8px;
+    top: 64px;
+    bottom: 8px;
+    z-index: 96;
+    width: min(var(--debug-width, 320px), calc(100vw - 56px)) !important;
+    height: auto;
+    box-shadow: 0 24px 70px rgba(0, 0, 0, .55);
+  }
+  .debug-column > .debug-drawer { height: 100%; border-radius: 12px; }
+  .debug-backdrop {
+    display: block;
+    position: fixed; inset: 0; z-index: 95;
+    border: 0; padding: 0; margin: 0;
+    background: rgba(3, 6, 11, .58);
+    backdrop-filter: blur(2px);
+  }
+  .debug-resizer { display: none; }
+  .debug-mobile-note { display: block; }
+  .debug-rail { height: auto; min-height: 0; align-self: stretch; }
+  .node-panel-collapse { display: none !important; }
+  .debug-column .debug-controls .select { flex: 1 1 100%; }
+}
+
+@media (max-width: 760px) {
+  .debug-column { left: 6px; top: 58px; bottom: 6px; width: min(var(--debug-width, 320px), calc(100vw - 44px)) !important; }
+  .debug-rail { flex-basis: 38px; width: 38px; }
+}
