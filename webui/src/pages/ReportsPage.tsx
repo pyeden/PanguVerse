@@ -258,15 +258,13 @@ export function ReportsPage() {
             <>
               <Button variant="ghost" onClick={() => updateQuery({ run: null })}>关闭</Button>
               <a className="btn btn-ghost btn-sm" href={`api/runs/${encodeURIComponent(selectedId)}/report.html`} target="_blank" rel="noopener noreferrer"><Icon name="external" size={14} />HTML</a>
-              {selectedReport && !selectedReport.voided ? <Button variant="ghost" size="sm" icon="edit" onClick={() => openSign(selectedReport)}>{selectedReport.signed ? '重新签署' : '签署'}</Button> : null}
-              {selectedReport && !selectedReport.voided ? <Button variant="ghost" size="sm" icon="trash" onClick={() => openVoid(selectedReport)}>作废</Button> : null}
               {selectedReport?.project_id ? <a className="btn btn-primary btn-sm" href={href(`/p/${selectedReport.project_id}/runs/${selectedId}`)}>完整报告 <Icon name="arrow" size={14} /></a> : null}
             </>
           ) : null
         }
       >
         {!selectedId ? null : !selectedReport ? <Loading label="正在读取报告元信息…" /> : (
-          <div className="stack-lg">
+          <div className="stack-lg" data-testid="report-detail">
             <div className="report-drawer-head">
               <StatusBadge status={selectedStatus} />
               <Badge tone="neutral">{selectedReport.trigger || 'manual'}</Badge>
@@ -281,6 +279,13 @@ export function ReportsPage() {
             </div>
             <Progress value={selectedReport.total ? ((selectedReport.passed || 0) / selectedReport.total) * 100 : 0} tone={selectedStatus === 'passed' ? 'ok' : 'bad'} />
             <SignatureBlock report={selectedReport} />
+            {!selectedReport.voided ? (
+              <div className="report-detail-actions">
+                <Button variant="ghost" size="sm" icon="edit" onClick={() => openSign(selectedReport)} data-testid={`sign-report-${selectedReport.run_id}-detail`}>{selectedReport.signed ? '重新签署' : '签署'}</Button>
+                <Button variant="ghost" size="sm" icon="trash" onClick={() => openVoid(selectedReport)} data-testid={`void-report-${selectedReport.run_id}-detail`}>作废</Button>
+                <span>人工结论仅作用于当前报告；作废后签署入口消失。</span>
+              </div>
+            ) : null}
             <div>
               <div className="subsection-head">
                 <h3 className="subsection-title">AI 总结</h3>
@@ -430,7 +435,7 @@ function ReportCard({ report, projects, onOpen, onSign, onVoid }: { report: Repo
   const rate = rateOf(counts.passed, counts.total)
   const project = projects.find((item) => item.project_id === report.project_id)
   return (
-    <article className={`report-card ${report.voided ? 'is-voided' : report.signed ? 'is-signed' : ''}`}>
+    <article className={`report-card ${report.voided ? 'is-voided' : report.signed ? 'is-signed' : ''}`} data-testid={`report-row-${report.run_id}`}>
       <button type="button" className="report-card-body" onClick={onOpen}>
         <div className="report-card-head">
           <StatusBadge status={status} />
@@ -458,8 +463,8 @@ function ReportCard({ report, projects, onOpen, onSign, onVoid }: { report: Repo
         <span className="muted">{report.voided_at ? `作废于 ${relativeTime(report.voided_at)}` : report.signed_at ? `签署于 ${relativeTime(report.signed_at)}` : '等待人工签署'}</span>
         <div className="row-actions">
           <Button size="sm" variant="ghost" icon="eye" onClick={onOpen}>预览</Button>
-          {!report.voided ? <Button size="sm" variant="ghost" icon={report.signed ? 'refresh' : 'edit'} onClick={onSign}>{report.signed ? '重签' : '签署'}</Button> : null}
-          {!report.voided ? <Button size="sm" variant="ghost" icon="trash" onClick={onVoid}>作废</Button> : null}
+          {!report.voided ? <Button size="sm" variant="ghost" icon={report.signed ? 'refresh' : 'edit'} onClick={onSign} data-testid={`sign-report-${report.run_id}`}>{report.signed ? '重签' : '签署'}</Button> : null}
+          {!report.voided ? <Button size="sm" variant="ghost" icon="trash" onClick={onVoid} data-testid={`void-report-${report.run_id}`}>作废</Button> : null}
         </div>
       </div>
     </article>

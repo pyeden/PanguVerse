@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
@@ -35,6 +35,7 @@ export function ExecutionsPage() {
   const [cancelError, setCancelError] = useState('')
   const [triggerOpen, setTriggerOpen] = useState(false)
   const [taskId, setTaskId] = useState('')
+  const [watchedBatches, setWatchedBatches] = useState<string[]>([])
 
   const params = useMemo(() => {
     const next = new URLSearchParams({ offset: String(offset), limit: String(pageSize), status: statusFilter })
@@ -61,6 +62,26 @@ export function ExecutionsPage() {
       return data && ['queued', 'running', 'cancelling'].includes(data.status) ? 1500 : false
     },
   })
+  const batchWatchQuery = useQuery({
+    queryKey: ['execution-batch-watch', watchedBatches],
+    queryFn: () => Promise.all(watchedBatches.map((batchId) => api.batch(batchId))),
+    enabled: watchedBatches.length > 0,
+    refetchInterval: (query) => {
+      const data = query.state.data
+      if (!data) return 1000
+      return data.every((batch) => ['done', 'failed', 'cancelled'].includes(batch.status)) ? false : 1200
+    },
+  })
+
+  useEffect(() => {
+    if (!watchedBatches.length || !batchWatchQuery.data) return
+    if (!batchWatchQuery.data.every((batch) => ['done', 'failed', 'cancelled'].includes(batch.status))) return
+    const summary = batchWatchQuery.data.map((batch) => `${batch.batch_id}:${batch.status}`).join(' · ')
+    setWatchedBatches([])
+    queryClient.invalidateQueries({ queryKey: ['executions'] })
+    push(`批次已到终态（${summary}）。已完成 run 保留，未开始套件已标记 cancelled。`, 'ok')
+  }, [batchWatchQuery.data, watchedBatches.length, queryClient, push])
+
   const executions = executionsQuery.data?.executions || []
   const total = executionsQuery.data?.total || 0
   const pages = Math.max(1, Math.ceil(total / pageSize))
@@ -88,8 +109,15 @@ export function ExecutionsPage() {
       queryClient.invalidateQueries({ queryKey: ['executions'] })
       queryClient.invalidateQueries({ queryKey: ['execution', execution.eid] })
       queryClient.invalidateQueries({ queryKey: ['execution', execution.run_id] })
+      if (result.batch_id) setWatchedBatches((current) => current.includes(result.batch_id!) ? current : [...current, result.batch_id!])
       const suiteText = result.cancelled_suites?.length ? `；未开始套件 ${result.cancelled_suites.length} 个已标记 cancelled` : ''
-      push(`取消请求已提交（${statusLabel(result.status)}）。当前步骤结束后停止；已完成 run 保留${suiteText}。`, 'ok')
+      push(`取消请求已提交（${statusLabel(result.status)}）。当前步骤结束后停止；已完成 run 保留${suiteText}。正在等待批处理终态…`, 'ok')
+      if (statusFilter !== 'all') {
+        const next = new URLSearchParams(route.query)
+        next.delete('status')
+        next.delete('page')
+        navigate(withQuery('/executions', next), { replace: true })
+      }
     },
     onError: (error: Error) => {
       setCancelError(error.message)
@@ -282,7 +310,7 @@ function ExecutionRow({ execution, onOpen, onCancel }: { execution: Execution; o
   const status = execution.status || execution.run_status || 'done'
   const suiteName = execution.suite_id || execution.mode || '未归类执行'
   return (
-    <tr>
+    <tr data-testid={`execution-row-${execution.eid || execution.run_id || execution.job_id}`} data-batch-id={execution.batch_id || undefined}>
       <td data-label="状态"><StatusBadge status={status} />{execution.cancellable ? <span className="cancellable-mark">可取消</span> : null}</td>
       <td data-label="执行 / 触发">
         <button type="button" className="execution-link" onClick={onOpen}>
@@ -301,7 +329,7 @@ function ExecutionRow({ execution, onOpen, onCancel }: { execution: Execution; o
         <div className="row-actions">
           {execution.run_id ? <a className="btn btn-ghost btn-sm" href={href(execution.project_id ? `/p/${execution.project_id}/runs/${execution.run_id}` : `/history?focus=${execution.run_id}`)}>报告</a> : null}
           <Button size="sm" variant="ghost" onClick={onOpen}>详情</Button>
-          {execution.cancellable ? <Button size="sm" variant="danger" icon="close" onClick={onCancel}>取消</Button> : null}
+          {execution.cancellable ? <Button size="sm" variant="danger" icon="close" onClick={onCancel} data-testid={`cancel-execution-${execution.eid || execution.run_id || execution.job_id}`}>取消</Button> : null}
         </div>
       </td>
     </tr>
@@ -310,7 +338,7 @@ function ExecutionRow({ execution, onOpen, onCancel }: { execution: Execution; o
 
 function ExecutionDetail({ execution, onCancel }: { execution: Execution; onCancel: () => void }) {
   return (
-    <div className="stack-lg">
+    <div className="stack-lg" data-testid="execution-detail">
       <div className="detail-status-row">
         <StatusBadge status={execution.status || 'done'} />
         <Badge tone="neutral">{execution.mode || 'run'}</Badge>
@@ -349,7 +377,7 @@ function ExecutionDetail({ execution, onCancel }: { execution: Execution; onCanc
       {execution.cancellable ? (
         <div className="detail-danger">
           <div><strong>取消执行</strong><span>当前步骤结束后停止；已完成的 run 与报告保留。</span></div>
-          <Button size="sm" variant="danger" icon="close" onClick={onCancel}>取消</Button>
+          <Button size="sm" variant="danger" icon="close" onClick={onCancel} data-testid={`cancel-execution-${execution.eid || execution.run_id || execution.job_id}-detail`}>取消</Button>
         </div>
       ) : null}
       {execution.run_id ? <a className="btn btn-primary btn-sm" href={href(execution.project_id ? `/p/${execution.project_id}/runs/${execution.run_id}` : `/history?focus=${execution.run_id}`)}>打开运行报告 <Icon name="arrow" size={14} /></a> : null}

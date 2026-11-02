@@ -225,7 +225,7 @@ export function TasksPage() {
             const meta = modeMeta[task.mode] || { label: task.mode, tone: 'neutral' as const, hint: '' }
             const lastStatus = task.last_status ? statusOf({ run_id: task.last_run_id || '', summary: { total: 1, failed: task.last_status === 'failed' ? 1 : 0, passed: task.last_status === 'passed' ? 1 : 0 } }) : 'none'
             return (
-              <article className={`task-card ${task.archived_at ? 'is-archived' : ''}`} key={task.task_id}>
+              <article className={`task-card ${task.archived_at ? 'is-archived' : ''}`} key={task.task_id} data-testid={`task-row-${task.task_id}`}>
                 <div className="task-card-main">
                   <span className={`task-icon tone-${meta.tone}`}><Icon name={task.mode === 'intent' ? 'spark' : task.mode === 'regression' ? 'history' : 'file'} size={18} /></span>
                   <div className="task-copy">
@@ -256,12 +256,12 @@ export function TasksPage() {
                 <div className="task-actions">
                   <Button size="sm" variant="ghost" icon="eye" onClick={() => setDetail(task)}>详情</Button>
                   {task.archived_at ? (
-                    <Button size="sm" variant="ghost" icon="refresh" onClick={() => { setArchiveTarget(task); setArchiveNext(false) }}>取消归档</Button>
+                    <Button size="sm" variant="ghost" icon="refresh" onClick={() => { setArchiveTarget(task); setArchiveNext(false) }} data-testid={`archive-task-${task.task_id}`}>取消归档</Button>
                   ) : (
                     <>
                       <Button size="sm" variant="ghost" icon="edit" onClick={() => openEdit(task)}>编辑</Button>
                       <Button size="sm" variant="primary" icon="play" loading={runTask.isPending && runTask.variables === task.task_id} onClick={() => runTask.mutate(task.task_id)}>运行</Button>
-                      <Button size="sm" variant="ghost" icon="archive" onClick={() => { setArchiveTarget(task); setArchiveNext(true) }}>归档</Button>
+                      <Button size="sm" variant="ghost" icon="archive" onClick={() => { setArchiveTarget(task); setArchiveNext(true) }} data-testid={`archive-task-${task.task_id}`}>归档</Button>
                     </>
                   )}
                 </div>
@@ -357,7 +357,7 @@ export function TasksPage() {
         title={detail?.name}
         subtitle={detail ? `${detail.task_id} · ${modeMeta[detail.mode]?.label || detail.mode}` : ''}
         size="lg"
-        footer={<><Button variant="ghost" onClick={() => setDetail(null)}>关闭</Button>{detail?.archived_at ? <Button variant="soft" icon="refresh" onClick={() => { setArchiveTarget(detail); setArchiveNext(false) }}>取消归档</Button> : <><Button variant="ghost" icon="archive" onClick={() => { setArchiveTarget(detail); setArchiveNext(true) }}>归档</Button><Button variant="ghost" icon="edit" onClick={() => detail && openEdit(detail)}>编辑</Button><Button variant="primary" icon="play" loading={runTask.isPending} onClick={() => detail && runTask.mutate(detail.task_id)}>运行任务</Button></>}</>}
+        footer={<><Button variant="ghost" onClick={() => setDetail(null)}>关闭</Button>{detail?.archived_at ? <Button variant="soft" icon="refresh" onClick={() => { setArchiveTarget(detail); setArchiveNext(false) }} data-testid={`archive-task-${detail?.task_id || ''}-detail`}>取消归档</Button> : <><Button variant="ghost" icon="archive" onClick={() => { setArchiveTarget(detail); setArchiveNext(true) }} data-testid={`archive-task-${detail?.task_id || ''}-detail`}>归档</Button><Button variant="ghost" icon="edit" onClick={() => detail && openEdit(detail)}>编辑</Button><Button variant="primary" icon="play" loading={runTask.isPending} onClick={() => detail && runTask.mutate(detail.task_id)}>运行任务</Button></>}</>}
       >
         {detail ? <TaskDetail task={detail} onArchive={(archived) => { setArchiveTarget(detail); setArchiveNext(archived) }} /> : null}
       </Modal>

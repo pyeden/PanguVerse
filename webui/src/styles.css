@@ -1552,3 +1552,6 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
   .execution-actions-col .row-actions { flex-wrap: wrap; justify-content: flex-start; }
   .project-card-admin { flex-wrap: wrap; }
 }
+
+.report-detail-actions { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; padding: 8px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.report-detail-actions > span { margin-left: auto; color: var(--dim); font-size: 8.5px; }

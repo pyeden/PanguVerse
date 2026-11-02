@@ -215,7 +215,7 @@ function ProjectCard({ project, onArchive }: { project: Project; onArchive: (arc
   const lastAt = project.last_run?.at || project.last_run?.finished_at || project.last_run?.started_at
   const suites = project.suite_count ?? project.suites?.length ?? 0
   return (
-    <article className={`project-card ${project.archived_at ? 'is-archived' : ''}`}>
+    <article className={`project-card ${project.archived_at ? 'is-archived' : ''}`} data-testid={`project-card-${project.project_id}`}>
       <a className="project-card-link" href={`#/p/${project.project_id}/overview`}>
         <div className="project-card-top">
           <div className={`project-sigil tone-${classForStatus(status)}`}>
@@ -254,7 +254,7 @@ function ProjectCard({ project, onArchive }: { project: Project; onArchive: (arc
       </a>
       <div className="project-card-admin">
         <span>{project.archived_at ? `归档于 ${relativeTime(project.archived_at)}` : '归档只影响列表，不删历史'}</span>
-        <Button size="sm" variant="ghost" icon={project.archived_at ? 'refresh' : 'archive'} onClick={() => onArchive(!project.archived_at)}>{project.archived_at ? '取消归档' : '归档'}</Button>
+        <Button size="sm" variant="ghost" icon={project.archived_at ? 'refresh' : 'archive'} onClick={() => onArchive(!project.archived_at)} data-testid={`archive-project-${project.project_id}`}>{project.archived_at ? '取消归档' : '归档'}</Button>
       </div>
     </article>
   )

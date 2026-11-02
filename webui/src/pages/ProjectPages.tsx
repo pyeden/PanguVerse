@@ -766,7 +766,7 @@ export function ProjectSettingsPage() {
           <SectionHeader title="归档项目" description="只归档，不删历史运行、报告与套件配置。" icon="shield" />
           <div className="danger-row">
             <div><strong>{project.archived_at ? '项目已归档' : '归档项目'}</strong><p>{project.archived_at ? `归档于 ${formatTime(project.archived_at)}；取消归档后恢复默认列表可见。` : '归档后默认项目列表不再显示；直接 URL 仍可访问，历史全部保留。'}</p></div>
-            <Button variant={project.archived_at ? 'soft' : 'danger'} size="sm" icon={project.archived_at ? 'refresh' : 'archive'} onClick={() => { setArchiveProjectNext(!project.archived_at); setArchiveProjectOpen(true) }}>{project.archived_at ? '取消归档' : '归档'}</Button>
+            <Button variant={project.archived_at ? 'soft' : 'danger'} size="sm" icon={project.archived_at ? 'refresh' : 'archive'} onClick={() => { setArchiveProjectNext(!project.archived_at); setArchiveProjectOpen(true) }} data-testid={`archive-project-${project.project_id}-detail`}>{project.archived_at ? '取消归档' : '归档'}</Button>
           </div>
           <div className="aside-note">
             <Icon name="shield" size={15} />
