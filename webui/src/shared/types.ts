@@ -174,6 +174,61 @@ export interface Insight {
   [key: string]: any
 }
 
+export interface Schedule {
+  sid: string
+  name: string
+  target: { kind: 'project' | string; project_id: string; suite_ids?: string[] }
+  trigger: {
+    kind: 'cron' | 'interval' | 'webhook' | string
+    expr?: string
+    tz?: string
+    minutes?: number
+    token?: string
+  }
+  env_override?: AnyRecord
+  enabled: boolean
+  archived?: boolean
+  created_at?: number
+  updated_at?: number
+  last_run_at?: number | null
+  last_batch_id?: string | null
+  last_status?: string | null
+  next_run_at?: number | null
+}
+
+export interface ScheduleRunResult {
+  job_id: string
+  batch_id: string
+}
+
+export interface Artifact {
+  artifact_id: string
+  run_id: string
+  project_id?: string
+  name: string
+  type: 'markdown' | 'image' | 'json' | 'xml' | 'text' | 'file' | string
+  bytes: number
+  sha256?: string
+  node_id?: string
+  created_at?: number
+  truncated?: boolean
+  content?: string | null
+  download_url?: string | null
+  share_token?: string | null
+  share_expires_at?: number | null
+}
+
+export interface ArtifactPageData {
+  total: number
+  items: Artifact[]
+}
+
+export interface ArtifactShare {
+  url_token: string
+  expires_at: number
+  url?: string
+}
+
 
 export interface Execution {
   eid: string

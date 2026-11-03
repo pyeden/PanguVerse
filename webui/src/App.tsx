@@ -14,6 +14,8 @@ import { TasksPage } from './pages/TasksPage'
 import { ExecutionsPage } from './pages/ExecutionsPage'
 import { HistoryPage } from './pages/HistoryPage'
 import { ReportsPage } from './pages/ReportsPage'
+import { SchedulesPage } from './pages/SchedulesPage'
+import { ArtifactsPage } from './pages/ArtifactsPage'
 import { StudioNewPage } from './pages/StudioNewPage'
 import { StudioCanvasPage } from './pages/StudioCanvasPage'
 import { StudioReviewPage } from './pages/StudioReviewPage'
@@ -133,6 +135,8 @@ function RoutedPage({ route }: { route: Route }) {
   if (first === 'executions') return <ExecutionsPage />
   if (first === 'history') return <HistoryPage />
   if (first === 'reports') return <ReportsPage />
+  if (first === 'schedules') return <SchedulesPage />
+  if (first === 'artifacts') return <ArtifactsPage />
   if (first === 'studio') {
     if (!parts[1] || parts[1] === 'new') return <StudioNewPage />
     if (parts[2] === 'review') return <StudioReviewPage wid={parts[1]} key={`${parts[1]}-review`} />
@@ -184,6 +188,8 @@ function pageTitle(route: Route): string {
     executions: '执行',
     history: '历史',
     reports: '报告',
+    schedules: '调度',
+    artifacts: '产出物',
     runs: '运行报告',
   }
   return map[first] || 'PanguVerse'

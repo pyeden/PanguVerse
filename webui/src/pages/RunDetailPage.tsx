@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../shared/api'
-import { href, navigate, useRoute } from '../shared/router'
+import { href, navigate, useRoute, withQuery } from '../shared/router'
 import {
   errorText,
+  formatBytes,
   formatDuration,
   formatTime,
   pretty,
@@ -54,6 +55,11 @@ export function RunDetailPage() {
   const runQuery = useQuery({ queryKey: ['run', rid], queryFn: () => api.run(rid), enabled: !!rid })
   const insightQuery = useQuery({ queryKey: ['insight', rid], queryFn: () => api.insight(rid), enabled: !!rid })
   const projectQuery = useQuery({ queryKey: ['project', pid], queryFn: () => api.project(pid), enabled: !!pid })
+  const runArtifactsQuery = useQuery({
+    queryKey: ['run-artifacts', rid],
+    queryFn: () => api.artifacts(new URLSearchParams({ run: rid, limit: '100' })),
+    enabled: !!rid,
+  })
 
   const generateInsight = useMutation({
     mutationFn: (refresh: boolean) => api.generateInsight(rid, refresh),
@@ -172,6 +178,39 @@ export function RunDetailPage() {
                 <Markdown value={insight.summary_md} />
                 {Array.isArray(insight.corrections) && insight.corrections.length ? <div className="insight-corrections"><Badge tone="neutral">确定性校正 {insight.corrections.length} 项</Badge></div> : null}
               </>
+            ) : null}
+          </section>
+
+          <section className="panel run-artifacts-panel">
+            <SectionHeader
+              title="产出物"
+              description="本次运行交付的结果；收藏在产出物页，可下载或生成只读分享链接。"
+              icon="archive"
+              actions={<a className="inline-link" href={href(withQuery('/artifacts', { run: rid }))}>全部产出物 <Icon name="arrow" size={12} /></a>}
+            />
+            {runArtifactsQuery.isLoading ? <Loading label="正在读取产出物…" /> : null}
+            {runArtifactsQuery.error ? (
+              <div className="notice-inline warn-note">
+                <Icon name="warning" size={14} />
+                <div><strong>产出物接口未就绪或读取失败</strong><p>接口上线后，本 run 的 summary_md / 截图会自动列在这里。</p></div>
+              </div>
+            ) : null}
+            {!runArtifactsQuery.isLoading && !runArtifactsQuery.error && !(runArtifactsQuery.data?.items || []).length ? (
+              <div className="run-artifact-empty"><Icon name="archive" size={18} /><span>本次运行没有产出物。节点声明 <code>produces</code> 后才会收集。</span></div>
+            ) : null}
+            {(runArtifactsQuery.data?.items || []).length ? (
+              <div className="run-artifact-list">
+                {(runArtifactsQuery.data?.items || []).map((artifact) => (
+                  <a className="run-artifact-row" key={artifact.artifact_id} href={href(withQuery('/artifacts', { run: rid, focus: artifact.artifact_id }))}>
+                    <span className="run-artifact-type"><Icon name={artifact.type === 'image' ? 'eye' : artifact.type === 'markdown' ? 'report' : 'file'} size={15} /></span>
+                    <span className="run-artifact-copy">
+                      <strong>{artifact.name}</strong>
+                      <small><Badge tone="neutral">{artifact.type}</Badge> {formatBytes(artifact.bytes)} · {artifact.node_id || 'unknown'} · {formatTime(artifact.created_at)}</small>
+                    </span>
+                    <Icon name="arrow" size={14} />
+                  </a>
+                ))}
+              </div>
             ) : null}
           </section>
 

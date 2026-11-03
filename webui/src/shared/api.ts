@@ -28,6 +28,11 @@ import type {
   CapabilityGap,
   DiffItem,
   Risk,
+  Schedule,
+  ScheduleRunResult,
+  Artifact,
+  ArtifactPageData,
+  ArtifactShare,
 } from './types'
 
 export class ApiError extends Error {
@@ -207,6 +212,59 @@ export const api = {
       method: 'POST',
       body,
     }),
+
+  /* Schedules ------------------------------------------------------------- */
+
+  schedules: async (includeDisabled = false) => {
+    const suffix = includeDisabled ? '?include_disabled=1' : ''
+    const payload = await request<AnyRecord>(`api/schedules${suffix}`)
+    const items = Array.isArray(payload) ? payload : payload.schedules || payload.items || []
+    return items as Schedule[]
+  },
+  schedule: async (sid: string) => unwrapSchedule(await request<AnyRecord>(`api/schedules/${encodeURIComponent(sid)}`)),
+  createSchedule: async (body: AnyRecord) => unwrapSchedule(await request<AnyRecord>('api/schedules', { method: 'POST', body })),
+  updateSchedule: async (sid: string, body: AnyRecord) =>
+    unwrapSchedule(await request<AnyRecord>(`api/schedules/${encodeURIComponent(sid)}`, { method: 'PATCH', body })),
+  deleteSchedule: (sid: string) =>
+    request<null>(`api/schedules/${encodeURIComponent(sid)}`, { method: 'DELETE' }),
+  runScheduleNow: (sid: string) =>
+    request<ScheduleRunResult>(`api/schedules/${encodeURIComponent(sid)}/run-now`, { method: 'POST', body: {} }),
+
+  /* Artifacts ------------------------------------------------------------- */
+
+  artifacts: async (params: URLSearchParams) => {
+    const payload = await request<AnyRecord>(`api/artifacts?${params.toString()}`)
+    if (Array.isArray(payload)) return { total: payload.length, items: payload as Artifact[] }
+    const items = (payload.items || payload.artifacts || []) as Artifact[]
+    return { total: Number(payload.total ?? items.length), items }
+  },
+  artifact: async (aid: string) => {
+    const payload = await request<AnyRecord>(`api/artifacts/${encodeURIComponent(aid)}`)
+    const artifact = (payload.artifact || payload) as Artifact
+    if (artifact && payload.content !== undefined) artifact.content = payload.content
+    return artifact
+  },
+  artifactDownloadUrl: (aid: string) => `api/artifacts/${encodeURIComponent(aid)}/download`,
+  shareArtifact: async (aid: string, ttl: string) => {
+    const path = `api/artifacts/${encodeURIComponent(aid)}/share`
+    try {
+      const payload = await request<AnyRecord>(path, { method: 'POST', body: { ttl } })
+      return (payload.share || payload) as ArtifactShare
+    } catch (error) {
+      if (!(error instanceof ApiError) || (error.status !== 400 && error.status !== 422)) throw error
+      const payload = await request<AnyRecord>(path, { method: 'POST', body: { expires_in: ttl } })
+      return (payload.share || payload) as ArtifactShare
+    }
+  },
+  revokeArtifactShare: async (aid: string) => {
+    const path = `api/artifacts/${encodeURIComponent(aid)}/share`
+    try {
+      return await request<null>(path, { method: 'DELETE' })
+    } catch (error) {
+      if (!(error instanceof ApiError) || (error.status !== 404 && error.status !== 405)) throw error
+      return request<null>(`${path}/revoke`, { method: 'POST', body: {} })
+    }
+  },
 }
 
 /* -------------------------------------------------------------------------- */
@@ -790,6 +848,10 @@ export function normalizeDiff(payload: AnyRecord): StudioDiff {
       : [],
     audit_tail: payload.audit_tail || [],
   }
+}
+
+function unwrapSchedule(payload: AnyRecord): Schedule {
+  return (payload?.schedule || payload) as Schedule
 }
 
 export function errorHint(error: unknown): string {

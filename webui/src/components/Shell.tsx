@@ -13,9 +13,15 @@ const navItems: { id: string; label: string; href: string; icon: IconName; hint?
   { id: 'atoms', label: '原子', href: '/atoms', icon: 'atoms', hint: '料' },
   { id: 'tasks', label: '任务', href: '/tasks', icon: 'tasks', hint: '活' },
   { id: 'executions', label: '执行', href: '/executions', icon: 'play', hint: '活' },
+  { id: 'schedules', label: '调度', href: '/schedules', icon: 'clock', hint: '自动' },
+  { id: 'artifacts', label: '产出物', href: '/artifacts', icon: 'archive', hint: '成果' },
   { id: 'history', label: '历史', href: '/history', icon: 'history', hint: '账' },
   { id: 'reports', label: '报告', href: '/reports', icon: 'report', hint: '账' },
 ]
+
+function isCanvasRoute(route: Route): boolean {
+  return route.parts[0] === 'studio' && !!route.parts[1] && route.parts[1] !== 'new' && route.parts[2] !== 'review'
+}
 
 function navActive(route: Route): string {
   const first = route.parts[0] || 'projects'
@@ -32,6 +38,8 @@ function crumbs(route: Route, projects: Project[]): { label: string; href?: stri
   if (first === 'executions') return [{ label: '执行' }]
   if (first === 'history') return [{ label: '历史' }]
   if (first === 'reports') return [{ label: '报告' }]
+  if (first === 'schedules') return [{ label: '调度' }]
+  if (first === 'artifacts') return [{ label: '产出物' }]
   if (first === 'studio') {
     if (route.parts[1] === 'new') return [{ label: '工作台' }, { label: '新建流程' }]
     if (route.parts[2] === 'review') return [{ label: '工作台', href: '/studio/new' }, { label: '流程', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
@@ -199,7 +207,7 @@ export function Shell({
             <a href={href('/studio/new')} className="topbar-create"><Icon name="spark" size={15} />新建流程</a>
           </div>
         </header>
-        <main id="main-content" className="content" tabIndex={-1}>
+        <main id="main-content" className={`content ${isCanvasRoute(route) ? 'content-canvas' : ''}`} tabIndex={-1}>
           {children}
         </main>
       </div>

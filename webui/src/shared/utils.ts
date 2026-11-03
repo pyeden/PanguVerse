@@ -104,6 +104,27 @@ export function relativeTime(timestamp: unknown): string {
   return formatTime(timestamp)
 }
 
+/** Future-facing relative time, e.g. "12 分钟后"; falls back to absolute time. */
+export function relativeUntil(timestamp: unknown): string {
+  const ms = toMs(timestamp)
+  if (!ms) return '—'
+  const delta = ms - Date.now()
+  if (delta <= 0) return `${formatTime(timestamp)}（已到期）`
+  if (delta < 60_000) return '不到 1 分钟后'
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟后`
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时后`
+  return `${Math.floor(delta / 86_400_000)} 天后`
+}
+
+export function formatBytes(bytes: unknown): string {
+  const value = num(bytes, -1)
+  if (value < 0) return '—'
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
+  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(2)} MB`
+  return `${(value / 1024 / 1024 / 1024).toFixed(2)} GB`
+}
+
 export function formatDuration(ms: unknown): string {
   const value = num(ms, -1)
   if (value < 0) return '—'

@@ -250,6 +250,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [debugOpen, setDebugOpen] = useState<boolean>(() => {
     try {
       if (window.matchMedia('(max-width: 1099px)').matches) return false
+      if (window.matchMedia('(max-height: 599px)').matches) return false
       return localStorage.getItem(DEBUG_OPEN_KEY) === '1'
     } catch {
       return false
@@ -315,11 +316,16 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   }, [debugOpen])
 
   useEffect(() => {
-    const query = window.matchMedia('(max-width: 1099px)')
-    const apply = () => { if (query.matches) setDebugOpen(false) }
+    const narrow = window.matchMedia('(max-width: 1099px)')
+    const short = window.matchMedia('(max-height: 599px)')
+    const apply = () => { if (narrow.matches || short.matches) setDebugOpen(false) }
     apply()
-    query.addEventListener('change', apply)
-    return () => query.removeEventListener('change', apply)
+    narrow.addEventListener('change', apply)
+    short.addEventListener('change', apply)
+    return () => {
+      narrow.removeEventListener('change', apply)
+      short.removeEventListener('change', apply)
+    }
   }, [])
 
   useEffect(() => {
