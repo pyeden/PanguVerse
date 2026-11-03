@@ -346,8 +346,8 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     const graph = source.graph || { nodes: [], edges: [] }
     return (graph.nodes || []).map((node, index) => {
       const pos = saved[node.node_id] || node.ui || {
-        x: 50 + (index % 5) * 280,
-        y: 70 + Math.floor(index / 5) * 210,
+        x: 40 + (index % 5) * 240,
+        y: 56 + Math.floor(index / 5) * 170,
       }
       const nodeIssues = issues.filter((issue) => issue.node_id === node.node_id)
       const nodeRisks = risks.filter((risk) => (risk.node_ids || []).includes(node.node_id))
@@ -355,7 +355,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
       return {
         id: node.node_id,
         type: 'atom',
-        position: { x: Number(pos.x) || 50 + (index % 5) * 280, y: Number(pos.y) || 70 + Math.floor(index / 5) * 210 },
+        position: { x: Number(pos.x) || 40 + (index % 5) * 240, y: Number(pos.y) || 56 + Math.floor(index / 5) * 170 },
         data: {
           studioNode: node,
           issues: nodeIssues,
@@ -376,11 +376,12 @@ function StudioCanvasInner({ wid }: { wid: string }) {
       target: edge.to,
       label: edge.kind === 'data' ? (edge.via || 'data') : 'order-only',
       animated: false,
-      markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: edge.kind === 'data' ? '#5eead4' : '#718096' },
+      markerEnd: { type: MarkerType.ArrowClosed, width: 20, height: 20, color: edge.kind === 'data' ? '#5eead4' : '#718096' },
       style: {
         stroke: edge.kind === 'data' ? '#5eead4' : '#718096',
-        strokeWidth: edge.kind === 'data' ? 1.8 : 1.4,
+        strokeWidth: edge.kind === 'data' ? 2.2 : 1.8,
         strokeDasharray: edge.kind === 'data' ? undefined : '6 6',
+        vectorEffect: 'non-scaling-stroke',
       },
       labelStyle: { fill: edge.kind === 'data' ? '#9bf5e8' : '#9aa8bf', fontSize: 10, fontFamily: 'monospace' },
       labelBgStyle: { fill: '#0b1220', fillOpacity: 0.94 },
@@ -1310,7 +1311,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               onInit={(instance) => { flowRef.current = instance }}
               fitView
               fitViewOptions={{ padding: 0.14 }}
-              minZoom={0.2}
+              minZoom={0.35}
               maxZoom={1.8}
               defaultEdgeOptions={{ type: 'smoothstep' }}
               proOptions={{ hideAttribution: false }}

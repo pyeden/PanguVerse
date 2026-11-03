@@ -1019,6 +1019,8 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .studio-minimap { width: 110px !important; height: 75px !important; }
 .studio-flow .react-flow__edge-textbg { fill: #0b1220; }
 .studio-flow .react-flow__edge-text { fill: var(--muted); }
+.studio-flow .react-flow__edge-path { vector-effect: non-scaling-stroke; stroke-linecap: round; stroke-linejoin: round; }
+.studio-flow .react-flow__arrowhead { overflow: visible; }
 .canvas-empty { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; pointer-events: none; }
 .canvas-empty > * { pointer-events: auto; }
 .canvas-empty svg { color: var(--dim); }
