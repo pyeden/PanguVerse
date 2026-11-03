@@ -115,9 +115,17 @@ export function StudioReviewPage({ wid }: { wid: string }) {
     onSuccess: (result) => {
       setLocalPublishedRef(result.workflow_ref)
       queryClient.invalidateQueries({ queryKey: ['studio-workflow', wid] })
+      const tasksRefresh = queryClient.invalidateQueries({ queryKey: ['tasks'] })
       queryClient.invalidateQueries({ queryKey: ['studio-drafts'] })
-      queryClient.invalidateQueries({ queryKey: ['tasks'] })
-      push(`已发布：${result.workflow_ref}`, 'ok')
+      const taskId = result.task?.task_id
+      if (taskId) {
+        // 新任务已由后端创建；等任务列表刷新后再进入详情，避免详情页找不到任务。
+        push('已发布并已创建任务', 'ok')
+        void tasksRefresh.finally(() => navigate(`/tasks?focus=${encodeURIComponent(taskId)}`))
+      } else {
+        // 旧服务 / mock 未返回 task：保留成功横幅与手动创建入口。
+        push(`已发布：${result.workflow_ref}`, 'ok')
+      }
     },
     onError: (error: Error) => push(error.message, 'error'),
   })

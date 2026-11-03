@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, studioApi } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
@@ -57,12 +57,25 @@ export function TasksPage() {
   const publishedWorkflows = (draftsQuery.data || []).filter((workflow) => !!workflow.published_ref)
   const published = route.query.get('published') || ''
   const focus = route.query.get('focus')
+  const openedFocusRef = useRef('')
+  const focusRetriedRef = useRef('')
 
   useEffect(() => {
-    if (!focus || !tasks.length) return
+    if (!focus) return
+    if (openedFocusRef.current === focus) return
+    if (tasksQuery.isLoading || tasksQuery.isFetching) return
     const target = tasks.find((task) => task.task_id === focus)
-    if (target) setDetail(target)
-  }, [focus, tasks])
+    if (target) {
+      openedFocusRef.current = focus
+      setDetail(target)
+      return
+    }
+    // 发布后后端可能刚写入任务；首次未命中时补拉一次，避免缓存里没有新任务。
+    if (focusRetriedRef.current !== focus) {
+      focusRetriedRef.current = focus
+      void tasksQuery.refetch()
+    }
+  }, [focus, tasks, tasksQuery.isLoading, tasksQuery.isFetching, tasksQuery.refetch])
 
   useEffect(() => {
     setActiveJob(route.query.get('job') || '')

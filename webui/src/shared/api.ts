@@ -557,9 +557,9 @@ export const studioApi = {
     )
   },
 
-  async publish(wid: string, rev: number, message: string): Promise<{ workflow_ref: string }> {
+  async publish(wid: string, rev: number, message: string): Promise<{ workflow_ref: string; task?: Task }> {
     return realOrMock(
-      async () => request<{ workflow_ref: string }>(`api/studio/${encode(wid)}/publish`, {
+      async () => request<{ workflow_ref: string; task?: Task }>(`api/studio/${encode(wid)}/publish`, {
         method: 'POST',
         body: { rev, message },
       }),

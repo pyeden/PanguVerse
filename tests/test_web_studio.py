@@ -48,6 +48,17 @@ def wait_batch(api: WebAPI, batch_id: str, *, timeout: float = 30.0) -> dict[str
     raise AssertionError(f"batch {batch_id} 未在 {timeout}s 内结束")
 
 
+def wait_job(api: WebAPI, job_id: str, *, timeout: float = 30.0) -> dict[str, Any]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        status, body = call(api, "GET", f"/api/jobs/{job_id}")
+        assert status == 200, body
+        if body.get("status") in ("done", "failed", "cancelled"):
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"job {job_id} 未在 {timeout}s 内结束")
+
+
 def mode_of(path: Path) -> int:
     return stat.S_IMODE(path.stat().st_mode)
 
@@ -288,6 +299,10 @@ def test_publish_gate_and_immutability(api: WebAPI) -> None:
 
     status, body = call(api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "  "})
     assert status == 400
+    # 门禁失败不应产生任何任务
+    status, listing = call(api, "GET", "/api/tasks")
+    assert status == 200
+    assert listing["tasks"] == []
 
     status, published = call(
         api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "首个发布"}
@@ -306,6 +321,164 @@ def test_publish_gate_and_immutability(api: WebAPI) -> None:
     # 人工改图后状态回到 draft，不能直接发布 rev1
     status, body = call(api, "POST", f"/api/studio/{wid}/publish", {"rev": 1, "message": "v2"})
     assert status == 409
+
+
+# --------------------------------------------------------------------------- #
+# 发布即建任务（方案 A）
+# --------------------------------------------------------------------------- #
+def _approved_draft(api: WebAPI) -> dict[str, Any]:
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "备份配置文件并校验备份存在", "domain_pack": "local_fs"},
+    )
+    assert status == 201, draft
+    status, body = call(
+        api, "POST", f"/api/studio/{draft['wid']}/state", {"to": "approved", "risk_ack": True}
+    )
+    assert status == 200, body
+    return draft
+
+
+def test_publish_creates_and_reuses_workflow_task(api: WebAPI) -> None:
+    draft = _approved_draft(api)
+    wid = draft["wid"]
+    workflow_name = studio.read_workflow(api.root, wid)["name"]
+
+    status, published = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "首个发布"}
+    )
+    assert status == 200, published
+    task = published["task"]
+    assert task["mode"] == "workflow"
+    assert task["workflow_ref"] == f"{wid}@0"
+    assert task["name"] == f"{workflow_name} 任务"
+    assert task["env"] == {}
+    assert task["regression"] is False
+    assert task["no_llm"] is False
+
+    # 发布后任务列表立即可见
+    status, listing = call(api, "GET", "/api/tasks")
+    assert status == 200
+    assert [item["task_id"] for item in listing["tasks"]] == [task["task_id"]]
+    assert listing["tasks"][0]["workflow_ref"] == f"{wid}@0"
+
+    # 同一 rev 重复发布：reused=true，task_id 与任务数不变
+    status, again = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "重复发布"}
+    )
+    assert status == 200, again
+    assert again["reused"] is True
+    assert again["task"]["task_id"] == task["task_id"]
+    assert again["task"]["workflow_ref"] == f"{wid}@0"
+    status, listing2 = call(api, "GET", "/api/tasks")
+    assert len(listing2["tasks"]) == 1
+
+    # 发布新 rev：仍是同一个 task_id，只更新 workflow_ref
+    node_id = draft["graph"]["nodes"][0]["id"]
+    status, patched = call(
+        api, "PATCH", f"/api/studio/{wid}/nodes/{node_id}", {"description": "补充说明"}
+    )
+    assert status == 200, patched
+    assert patched["rev"] == 1
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/state", {"to": "approved", "risk_ack": True}
+    )
+    assert status == 200, body
+    status, published2 = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 1, "message": "第二版"}
+    )
+    assert status == 200, published2
+    assert published2["reused"] is False
+    assert published2["task"]["task_id"] == task["task_id"]
+    assert published2["task"]["name"] == task["name"]
+    assert published2["task"]["workflow_ref"] == f"{wid}@1"
+    status, listing3 = call(api, "GET", "/api/tasks")
+    assert len(listing3["tasks"]) == 1
+    assert listing3["tasks"][0]["task_id"] == task["task_id"]
+
+
+def test_publish_reuses_manual_workflow_task(api: WebAPI) -> None:
+    draft = _approved_draft(api)
+    wid = draft["wid"]
+    # 直接落发布记录（模拟发布前已存在的历史版本），不触发建任务
+    studio.publish(api.root, wid, {"rev": 0, "message": "seed"})
+
+    status, manual = call(
+        api,
+        "POST",
+        "/api/tasks",
+        {
+            "name": "我的手动流程任务",
+            "mode": "workflow",
+            "workflow_ref": f"{wid}@0",
+            "env": {"KEEP_ME": "manual-value"},
+            "regression": True,
+            "no_llm": True,
+        },
+    )
+    assert status == 201, manual
+
+    status, published = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "发布复用"}
+    )
+    assert status == 200, published
+    assert published["reused"] is True
+    task = published["task"]
+    assert task["task_id"] == manual["task_id"]
+    assert task["name"] == "我的手动流程任务"
+    assert task["env"]["KEEP_ME"] == "manual-value"
+    assert task["regression"] is True
+    assert task["no_llm"] is True
+    assert task["workflow_ref"] == f"{wid}@0"
+
+    status, listing = call(api, "GET", "/api/tasks")
+    assert [item["task_id"] for item in listing["tasks"]] == [manual["task_id"]]
+
+
+def test_task_run_records_task_trigger(api: WebAPI, tmp_path: Path) -> None:
+    """任务入口运行 workflow 应记 trigger=task；直接 /api/runs 仍记 manual。"""
+    service.save_last_env(api.root, {"FS_ROOT": str(tmp_path / "fs")})
+    draft = _approved_draft(api)
+    wid = draft["wid"]
+    status, published = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "备份流程"}
+    )
+    assert status == 200, published
+    ref = published["workflow_ref"]
+    task_id = published["task"]["task_id"]
+
+    status, queued = call(api, "POST", f"/api/tasks/{task_id}/run", {})
+    assert status == 202, queued
+    job = wait_job(api, queued["job_id"])
+    assert job["status"] == "done", job
+    run_id = job["run_id"]
+
+    execution = api.root / ".panguverse" / "executions" / run_id / "execution.json"
+    record = json.loads(execution.read_text(encoding="utf-8"))
+    assert record["trigger"] == "task"
+    assert record["workflow_ref"] == ref
+
+    status, listing = call(api, "GET", "/api/executions")
+    assert status == 200, listing
+    row = next(item for item in listing["executions"] if item["run_id"] == run_id)
+    assert row["trigger"] == "task"
+    assert row["workflow_ref"] == ref
+
+    # 直接 /api/runs（非任务入口）保持 manual
+    status, direct = call(
+        api, "POST", "/api/runs", {"mode": "workflow", "workflow_ref": ref}
+    )
+    assert status == 202, direct
+    direct_job = wait_job(api, direct["job_id"])
+    assert direct_job["status"] == "done", direct_job
+    direct_execution = (
+        api.root / ".panguverse" / "executions" / direct_job["run_id"] / "execution.json"
+    )
+    direct_record = json.loads(direct_execution.read_text(encoding="utf-8"))
+    assert direct_record["trigger"] == "manual"
+    assert direct_record["workflow_ref"] == ref
 
 
 # --------------------------------------------------------------------------- #

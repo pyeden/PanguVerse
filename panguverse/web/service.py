@@ -421,6 +421,7 @@ def submit_run(
     payload: Any,
     *,
     on_finish: Callable[[Job], None] | None = None,
+    trigger: str | None = None,
 ) -> Job:
     request = parse_run_request(payload)
     if request.mode == "demo":
@@ -431,7 +432,11 @@ def submit_run(
     if request.mode == "intent":
         return jobs.submit("intent", _intent_task(root, request), on_finish=on_finish)
     if request.mode == "workflow":
-        return jobs.submit("workflow", _workflow_task(root, request), on_finish=on_finish)
+        return jobs.submit(
+            "workflow",
+            _workflow_task(root, request, trigger=trigger),
+            on_finish=on_finish,
+        )
     return jobs.submit("regression", _regression_task(root, request), on_finish=on_finish)
 
 
@@ -1372,6 +1377,59 @@ def create_task(root: Path, payload: Any) -> dict[str, Any]:
     return tasks_store.write_task(root, task)
 
 
+def ensure_published_workflow_task(root: Path, wid: str, rev: int) -> dict[str, Any]:
+    """发布成功后幂等确保存在一条 ``mode:"workflow"`` 任务定义。
+
+    以 ``wid`` 为幂等维度：已有同 ``wid`` 的 workflow 任务时只把
+    ``workflow_ref`` 指向新 rev 并刷新 ``updated_at``，保留 task_id/name/env；
+    没有时才按发布记录里的工作流名新建。
+    """
+    from . import studio
+
+    ref = f"{wid}@{int(rev)}"
+    published = studio.load_published(root, ref)
+    workflow = published.get("workflow") or {}
+    record = published.get("record") or {}
+
+    prefix = f"{wid}@"
+    candidates = [
+        task
+        for task in tasks_store.list_tasks(root)
+        if task.get("mode") == "workflow"
+        and not task.get("archived_at")
+        and isinstance(task.get("workflow_ref"), str)
+        and str(task["workflow_ref"]).startswith(prefix)
+    ]
+    now = time.time()
+    if candidates:
+        # list_tasks 按 updated_at 倒序：复用最近使用的那条，避免重复建任务。
+        task = candidates[0]
+        task["workflow_ref"] = ref
+        task["updated_at"] = now
+        return tasks_store.write_task(root, task)
+
+    raw_name = str(record.get("name") or workflow.get("name") or wid).strip() or wid
+    name = f"{raw_name} 任务"
+    if len(name) > TASK_NAME_MAX:
+        name = f"{raw_name[: TASK_NAME_MAX - 3]} 任务"
+    task = {
+        "task_id": tasks_store.new_task_id(),
+        "name": name,
+        "mode": "workflow",
+        "scenario": "",
+        "intent": str(workflow.get("intent") or record.get("intent") or ""),
+        "env": {},
+        "regression": False,
+        "no_llm": False,
+        "workflow_ref": ref,
+        "created_at": now,
+        "updated_at": now,
+        "last_run_id": "",
+        "last_status": "",
+    }
+    return tasks_store.write_task(root, task)
+
+
 def update_task(root: Path, task_id: str, payload: Any) -> dict[str, Any]:
     task = tasks_store.read_task(root, task_id)
     data = _as_body(payload)
@@ -1473,7 +1531,11 @@ def run_task(
     overrides = _env_override(data.get("env")) if "env" in data else {}
     body = _task_run_payload(task, overrides)
     return submit_run(
-        jobs, root, body, on_finish=lambda job: record_task_run(root, task_id, job)
+        jobs,
+        root,
+        body,
+        on_finish=lambda job: record_task_run(root, task_id, job),
+        trigger="task",
     )
 
 

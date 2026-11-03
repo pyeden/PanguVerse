@@ -490,7 +490,7 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 | GET | `/api/studio/debug/{session_id}` | `?cursor=` → `{session_id,cursor,done,nodes:[{node_id,status,reason,attempts,duration_ms,error,inputs,outputs}],summary}` |
 | POST | `/api/studio/{wid}/review` | `{base_rev?, rev}` → `{diff, risks, validation, audit_tail}` |
 | POST | `/api/studio/{wid}/state` | `{to:"review|approved|rejected", note?, risk_ack?, confirmed_risks?}` |
-| POST | `/api/studio/{wid}/publish` | `{rev, message}` → `{workflow_ref:"<wid>@<rev>"}` |
+| POST | `/api/studio/{wid}/publish` | `{rev, message}` → `{workflow_ref:"<wid>@<rev>", reused, task}` |
 
 节点坐标：`PATCH .../nodes/{nid}` 只带 `{"ui":{"x":..,"y":..}}` 时只更新 `ui.json`，**不产生新 rev**。
 其它字段变更一律产生新 rev，并把 `state` 重置为 `draft`（旧批准失效）。
@@ -549,6 +549,14 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 - `publish`：必须 `state=approved`、`rev=current_rev`、`message` 非空；否则 409/400。
 - 发布生成 `workflow_ref="<wid>@<rev>"`，写 `published/<rev>.json`；旧版本文件永不回溯修改。
   同一 rev 重复发布幂等返回原记录（`reused:true`）。
+- 发布成功会按 **`wid` 维度**幂等创建/复用一条 `mode:"workflow"` 任务定义，并在响应的
+  `task` 字段返回（`task_id`、`name`、`mode`、`workflow_ref`、`env` 等；`env` 沿用统一打码规则）：
+  - 首次发布（或原任务已删除）新建任务：`name="<工作流名> 任务"`、`env={}`、
+    `regression=false`、`no_llm=false`。
+  - 同一 `wid` 再次发布复用原任务：同一 rev 的 `reused:true` 或发布新 rev 都只更新
+    `workflow_ref="<wid>@<rev>"` 与 `updated_at`，`task_id`/`name`/`env` 不变。
+  - 已有手工创建的同 `wid` workflow 任务同样会被复用；发布后任务立即可在
+    `GET /api/tasks` 看到。归档任务不参与复用。
 
 ### 7.6 调试隔离与环境限制
 

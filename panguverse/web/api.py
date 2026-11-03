@@ -670,7 +670,12 @@ class WebAPI:
             if action == "review" and method == "POST":
                 return json_response(studio.review(self.root, wid, body))
             if action == "publish" and method == "POST":
-                return json_response(studio.publish(self.root, wid, body, actor=actor))
+                result = studio.publish(self.root, wid, body, actor=actor)
+                # 发布成功即按 wid 幂等建/复用 workflow 任务，便于任务列表直接运行。
+                result["task"] = service.ensure_published_workflow_task(
+                    self.root, wid, int(result["rev"])
+                )
+                return json_response(result)
             if action == "state" and method == "POST":
                 return json_response(
                     studio.transition_state(self.root, wid, body, actor=actor)
