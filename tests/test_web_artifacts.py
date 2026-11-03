@@ -413,3 +413,181 @@ def test_a7_collection_failure_does_not_fail_run(web: WebClient) -> None:
     status, run = web.get_json(f"/api/runs/{job['run_id']}")
     assert status == 200 and run["report"]["summary"]["success"] is True
     assert any("收集" in phase["detail"] or "失败" in phase["detail"] for phase in phases)
+
+
+# --------------------------------------------------------------------------- #
+# A8 图片产物：路径 → 真实文件字节；类型以魔数为准
+# --------------------------------------------------------------------------- #
+def _download(web: WebClient, aid: str, query: str = "") -> tuple[int, dict[str, str], bytes]:
+    return web.request("GET", f"/api/artifacts/{aid}/download{query}")
+
+
+def test_a8_screenshot_reads_workspace_file(web: WebClient) -> None:
+    relative = "artifacts/web/shot.png"
+    target = web.workspace / ".panguverse" / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(PNG)
+
+    result = _collect(
+        web,
+        _run(
+            "777777777777",
+            [
+                _step(
+                    "web_screenshot",
+                    {"path": relative, "bytes": len(PNG), "width": 1, "height": 1},
+                )
+            ],
+        ),
+    )
+    assert result["count"] == 1, result
+    item = result["artifacts"][0]
+    assert item["type"] == "image"
+    assert item["bytes"] == len(PNG)
+    assert item["sha256"] == hashlib.sha256(PNG).hexdigest()
+    assert item["file"].endswith(".png")
+
+    status, headers, body = _download(web, item["artifact_id"])
+    assert status == 200
+    assert body == PNG
+    assert body[:8] == b"\x89PNG\r\n\x1a\n"
+    assert headers.get("Content-Type", "").startswith("image/png")
+
+
+def test_a8_image_type_uses_magic_not_suffix(web: WebClient) -> None:
+    relative = "artifacts/web/not-really.jpg"
+    target = web.workspace / ".panguverse" / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(PNG)
+
+    result = _collect(
+        web,
+        _run("777777777778", [_step("web_screenshot", {"path": relative})]),
+    )
+    item = result["artifacts"][0]
+    assert item["type"] == "image"
+    # PNG 魔数优先于 .jpg 文件名后缀
+    assert item["file"].endswith(".png")
+    status, headers, body = _download(web, item["artifact_id"])
+    assert status == 200 and headers["Content-Type"].startswith("image/png")
+    assert body == PNG
+
+
+def test_a8_missing_image_source_warns_without_artifact(web: WebClient) -> None:
+    result = _collect(
+        web,
+        _run(
+            "777777777779",
+            [_step("web_screenshot", {"path": "artifacts/web/missing.png"})],
+        ),
+    )
+    assert result["count"] == 0
+    assert any("artifact_source_missing" in warning for warning in result["warnings"])
+    status, listing = _items(web, "?run=777777777779")
+    assert status == 200 and listing["total"] == 0
+
+
+# --------------------------------------------------------------------------- #
+# A9 ui_tree：落完整 XML（不是截断回显）；只有 nodes 时重建
+# --------------------------------------------------------------------------- #
+def test_a9_ui_tree_uses_full_xml(web: WebClient) -> None:
+    full = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<hierarchy>"
+        + "".join(
+            f'<node text="节点{i}" resource-id="id/{i}" bounds="[0,{i}][10,{i + 1}]"/>'
+            for i in range(400)
+        )
+        + "</hierarchy>"
+    )
+    clipped = full[:3000] + "…（已截断）"
+    result = _collect(
+        web,
+        _run(
+            "888888888888",
+            [
+                _step(
+                    "android_ui_dump",
+                    {
+                        "xml": clipped,
+                        "xml_full": full,
+                        "xml_chars": len(full),
+                        "nodes": [{"text": "节点0"}],
+                        "count": 1,
+                    },
+                )
+            ],
+        ),
+    )
+    assert result["count"] == 1, result
+    item = result["artifacts"][0]
+    assert item["name"] == "ui_tree" and item["type"] == "xml"
+    assert item["bytes"] == len(full.encode())
+    path = (
+        web.workspace
+        / ".panguverse"
+        / "artifacts"
+        / "unclassified"
+        / "888888888888"
+        / "ui_tree.xml"
+    )
+    assert path.read_bytes() == full.encode()
+    status, headers, body = _download(web, item["artifact_id"])
+    assert status == 200 and body == full.encode()
+    assert headers["Content-Type"].startswith("application/xml")
+
+
+def test_a9_ui_tree_rebuilds_from_nodes(web: WebClient) -> None:
+    nodes = [{"text": "深层节点", "bounds": "[0,690][1080,699]"}]
+    result = _collect(
+        web,
+        _run(
+            "888888888889",
+            [_step("android_ui_dump", {"xml_chars": 0, "nodes": nodes, "count": 1})],
+        ),
+    )
+    assert result["count"] == 1, result
+    item = result["artifacts"][0]
+    assert item["type"] == "xml"
+    path = (
+        web.workspace
+        / ".panguverse"
+        / "artifacts"
+        / "unclassified"
+        / "888888888889"
+        / "ui_tree.xml"
+    )
+    body = path.read_text(encoding="utf-8")
+    assert body.startswith("<?xml")
+    assert 'text="深层节点"' in body
+
+
+def test_a6_cross_project_download_returns_404(web: WebClient) -> None:
+    result = _collect(
+        web,
+        _run(
+            "666666666667",
+            [_step("llm_summarize", {"summary_md": "# secret"})],
+            project="p-aaa111",
+        ),
+    )
+    aid = result["artifacts"][0]["artifact_id"]
+
+    for query in ("?project=p-other", "?project=p-bbb222"):
+        status, headers, body = web.request(
+            "GET", f"/api/artifacts/{aid}/download{query}"
+        )
+        assert status == 404, (query, status, body)
+        assert json.loads(body.decode("utf-8"))["error"]["code"] == "not_found"
+        assert headers.get("Content-Type", "").startswith("application/json")
+
+    # 列表过滤也按「不存在」处理，不是 400 探针
+    status, body = web.get_json("/api/artifacts?project=p-other")
+    assert status == 404 and body["error"]["code"] == "not_found"
+    status, body = web.get_json("/api/artifacts?run=not-a-hex-run")
+    assert status == 404 and body["error"]["code"] == "not_found"
+
+    status, headers, body = web.request(
+        "GET", f"/api/artifacts/{aid}/download?project=p-aaa111"
+    )
+    assert status == 200 and body == b"# secret"

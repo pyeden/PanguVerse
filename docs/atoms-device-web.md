@@ -48,7 +48,7 @@
 | `android_input_text` | `text`, `serial?` | `ok` | **mutate** |
 | `android_keyevent` | `key`, `serial?` | `ok` | **mutate** |
 | `android_screencap` | `serial?`, `name?` | `path/bytes` | read + 本地写 |
-| `android_ui_dump` | `serial?` | `xml/nodes[]` | read |
+| `android_ui_dump` | `serial?` | `xml`（限长回显）/`xml_full`（完整）/`nodes[]` | read |
 | `android_find_text` | `text`, `xml?`/`nodes?`, `match?` | `found/node` | pure |
 | `android_wait_text` | `text`, `timeout?`, `interval?` | `found/attempts` | read |
 

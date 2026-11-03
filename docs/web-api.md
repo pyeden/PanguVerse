@@ -753,7 +753,14 @@ P0 补齐执行中心、软归档、报告签署/作废；原子启用/停用明
 ```
 
 - 目录 `0700`、文件 `0600`；manifest 记录 `artifact_id/run_id/project_id/name/type/bytes/sha256/node_id/step_id/case_id/created_at`。
-- 类型按 produces 声明优先，其次内容嗅探：`markdown|image|json|xml|text|file`。
+- 类型以**真实字节**为准：PNG/JPEG/GIF/WebP 魔数 → `image`；其余按
+  `produces` 提示与内容嗅探得到 `markdown|image|json|xml|text|file`。
+- 当输出值是工作区内文件路径（如 `web_screenshot` 的
+  `artifacts/web/a.png`，相对 `.panguverse` 或 artifacts 根均可）时，收集器
+  **读取文件字节**落盘，`bytes/sha256` 基于真实内容；路径不存在或不可读 →
+  不产生产物，只记 `artifact_source_missing` 告警。
+- `android_ui_dump.ui_tree` 落完整 XML（读取原子的 `xml_full`，而不是
+  `xml` 的限长回显）；若只有 `nodes`，用节点重建最小 `<hierarchy>` XML。
 - 同名产物按 `<name>-<seq>` 去重；单产物上限 **20MB**，超出只记元信息并标
   `truncated=true`（下载返回 409）。
 - 收集是**旁路**：失败只写 job 阶段告警（`artifacts: warning`），运行结论不变（A7）。
@@ -772,4 +779,5 @@ P0 补齐执行中心、软归档、报告签署/作废；原子启用/停用明
 
 - 分享 token 只读、不可列目录；不存在/已撤销 → **404**，过期 → **410**。
 - `aid` 必须匹配 `^ar-[0-9a-f]{6,12}$`；文件名由服务端清洗，路径穿越、
-  跨项目 `project` 过滤不匹配、直接读取 `manifest.json` 均返回 404。
+  跨项目 `project` 过滤不匹配（含非法 project/run 过滤值）、直接读取
+  `manifest.json` 均返回 **404 `not_found`**，不返回 400。

@@ -407,9 +407,10 @@ def test_android_ui_dump_parses_xml_longer_than_clip_limit(
     out = android_ui_dump.invoke(ctx, {})
     assert out["count"] == 70
     assert out["xml_chars"] > 8000
-    # 回显仍限长，但总长度单独保留
+    # 回显仍限长，但完整 XML 另外保留给产物收集
     assert len(out["xml"]) <= 4000
     assert "已截断" in out["xml"]
+    assert out["xml_full"] == large.read_text(encoding="utf-8")
 
     deep = next(node for node in out["nodes"] if node["text"] == "深层节点")
     assert deep["bounds"] == "[0,690][1080,699]"

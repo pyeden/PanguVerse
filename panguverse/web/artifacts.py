@@ -30,6 +30,7 @@ import tempfile
 import threading
 import time
 import uuid
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -67,8 +68,9 @@ DEFAULT_PRODUCES = {
 }
 #: 原子输出键与 produces 名字不一致时的映射（不改变原子语义）
 PRODUCES_ALIASES = {
-    "web_screenshot": {"screenshot": "path"},
-    "android_ui_dump": {"ui_tree": "xml"},
+    "web_screenshot": {"screenshot": ("path",)},
+    # ``xml`` 是给报告/UI 的限长回显；``xml_full`` 才是落盘用的完整 XML。
+    "android_ui_dump": {"ui_tree": ("xml_full", "xml")},
 }
 _EXT_BY_TYPE = {
     "markdown": ".md",
@@ -115,6 +117,10 @@ class ArtifactError(Exception):
         self.status = status or _STATUS_BY_CODE.get(code, 500)
 
 
+class _ArtifactSourceMissing(Exception):
+    """声明为文件的输出指向不存在的路径（收集时转成告警，不产生伪产物）。"""
+
+
 # --------------------------------------------------------------------------- #
 # 路径与原子
 # --------------------------------------------------------------------------- #
@@ -146,7 +152,8 @@ def normalize_project(value: Any) -> str | None:
     if _looks_like_traversal(text):
         raise ArtifactError("not_found", "产出物不存在")
     if not PROJECT_RE.match(text):
-        raise ArtifactError("bad_request", "project 非法")
+        # 项目过滤不匹配一律 404：既不暴露「存在但无权」，也不让非法 id 变成 400。
+        raise ArtifactError("not_found", "产出物不存在")
     return text
 
 
@@ -240,29 +247,84 @@ def _write_manifest(path: Path, manifest: dict[str, Any]) -> None:
 # 内容/类型
 # --------------------------------------------------------------------------- #
 def _workspace_file(root: Path, value: str) -> Path | None:
-    """``web_screenshot`` 等原子返回的是 workspace 内相对路径：读真实文件。"""
-    if not value or "\n" in value or len(value) > 4096:
+    """把原子返回的路径解析成工作区内的真实文件。
+
+    设备/Web 原子返回的是相对 ``.panguverse`` 的路径（如
+    ``artifacts/web/a.png``），而收集器的 ``root`` 是工作区根目录。这里同时
+    尝试工作区根、``.panguverse`` 与 artifacts 根三种基准，且只接受解析后仍
+    位于工作区内的普通文件。
+    """
+    text = str(value or "").strip()
+    if not text or "\n" in text or "\r" in text or len(text) > 4096:
         return None
     try:
-        candidate = (Path(root) / value).resolve()
+        root_abs = Path(root).resolve()
     except (OSError, RuntimeError):
         return None
+    candidate_text = Path(text)
+    if candidate_text.is_absolute():
+        candidates = [candidate_text]
+    else:
+        candidates = [
+            root_abs / text,
+            root_abs / STATE_DIRNAME / text,
+            artifacts_root(root_abs) / text,
+        ]
+    for candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError, ValueError):
+            continue
+        try:
+            resolved.relative_to(root_abs)
+        except ValueError:
+            continue
+        if resolved.is_file():
+            return resolved
+    return None
+
+
+def _looks_like_source_path(value: str, declared_type: str | None = None) -> bool:
+    """判断字符串是否是「文件路径」而不是内容本身。
+
+    对 ``screenshot``（声明为 image）来说，原子约定输出路径；因此非空的单行
+    字符串都按路径处理，解析失败就告警而不是把路径字符串当图片内容落盘。
+    """
+    text = str(value or "").strip()
+    if "\n" in text or "\r" in text or len(text) > 4096:
+        return False
+    if text.startswith("data:"):
+        return False
+    if declared_type == "image":
+        return True
+    if text.startswith(("artifacts/", f"{STATE_DIRNAME}/")):
+        return True
+    return Path(text).suffix.lower() in _EXT_MIME
+
+
+def _read_source_file(path: Path | None, value: str) -> bytes:
+    if path is None:
+        raise _ArtifactSourceMissing(f"路径不存在或不在工作区内: {value}")
     try:
-        candidate.relative_to(Path(root).resolve())
-    except ValueError:
-        return None
-    return candidate if candidate.is_file() else None
+        return path.read_bytes()
+    except OSError as exc:
+        raise _ArtifactSourceMissing(f"路径不可读: {value}: {exc}") from exc
 
 
-def _to_bytes(root: Path, value: Any) -> bytes:
+def _to_bytes(root: Path, value: Any, declared_type: str | None = None) -> bytes:
     if isinstance(value, bytes):
         return value
+    if isinstance(value, os.PathLike):
+        text = os.fspath(value)
+        return _read_source_file(_workspace_file(root, text), text)
     if isinstance(value, (dict, list)):
         return json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
     if isinstance(value, str):
         path = _workspace_file(root, value)
         if path is not None:
-            return path.read_bytes()
+            return _read_source_file(path, value)
+        if _looks_like_source_path(value, declared_type):
+            raise _ArtifactSourceMissing(f"路径不存在或不可读: {value}")
         return value.encode("utf-8")
     return json.dumps(value, ensure_ascii=False, default=str).encode("utf-8")
 
@@ -274,7 +336,7 @@ def _decode(data: bytes) -> str | None:
         return None
 
 
-def _image_ext(data: bytes) -> str:
+def _image_ext(data: bytes) -> str | None:
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return ".png"
     if data.startswith(b"\xff\xd8\xff"):
@@ -283,19 +345,19 @@ def _image_ext(data: bytes) -> str:
         return ".gif"
     if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return ".webp"
-    return ".png"
+    return None
 
 
 def infer_type(name: str, data: bytes, declared: str | None = None) -> str:
-    """按 produces 声明优先，其次内容嗅探（image/json/xml/markdown/text）。"""
+    """按真实字节嗅探类型，``produces`` 声明只作为非图片的提示。
+
+    图片必须由 PNG/JPEG/GIF/WebP 魔数确认；文件名后缀或 ``produces`` 声明都
+    不能把一段路径字符串伪装成图片。
+    """
+    if _image_ext(data) is not None:
+        return "image"
     if declared in KNOWN_TYPES:
-        return declared
-    if data.startswith(
-        (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a")
-    ):
-        return "image"
-    if data.startswith(b"RIFF") and data[8:12] == b"WEBP":
-        return "image"
+        return "file" if declared == "image" else declared
     text = _decode(data)
     if text is None:
         return "file"
@@ -316,6 +378,22 @@ def infer_type(name: str, data: bytes, declared: str | None = None) -> str:
     return "text"
 
 
+def _nodes_to_xml(nodes: list[Any]) -> str:
+    """只有 ``nodes`` 时重建最小 UI XML，避免产物静默缺失。"""
+    root = ET.Element("hierarchy")
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        attrs: dict[str, str] = {}
+        for key, value in node.items():
+            if value is None or isinstance(value, (dict, list)):
+                continue
+            attrs[str(key)] = str(value)
+        ET.SubElement(root, "node", attrs)
+    body = ET.tostring(root, encoding="unicode")
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + body
+
+
 def _safe_name(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name or "")).strip("._")
     if not cleaned or cleaned.lower() == MANIFEST_NAME:
@@ -325,7 +403,7 @@ def _safe_name(name: str) -> str:
 
 def _extension(name: str, artifact_type: str, data: bytes) -> str:
     if artifact_type == "image":
-        return _image_ext(data)
+        return _image_ext(data) or ".bin"
     return _EXT_BY_TYPE.get(artifact_type, ".bin")
 
 
@@ -345,9 +423,22 @@ def _resolve_output_value(atom_name: str, produces: str, outputs: dict[str, Any]
     if produces in outputs:
         return outputs[produces]
     alias = PRODUCES_ALIASES.get(atom_name, {}).get(produces)
-    if alias and alias in outputs:
-        return outputs[alias]
+    aliases = alias if isinstance(alias, (tuple, list)) else (alias,)
+    for key in aliases:
+        if key and key in outputs:
+            return outputs[key]
     return None
+
+
+def _ui_tree_value(outputs: dict[str, Any]) -> Any:
+    """``ui_tree`` 优先完整 XML；只有 nodes 时重建；绝不静默返回空。"""
+    value = _resolve_output_value("android_ui_dump", "ui_tree", outputs)
+    nodes = outputs.get("nodes")
+    if isinstance(value, str) and value.strip() and "…（已截断）" not in value:
+        return value
+    if isinstance(nodes, list) and nodes:
+        return _nodes_to_xml(nodes)
+    return value
 
 
 def _dedupe_name(manifest: dict[str, Any], base: str) -> str:
@@ -382,7 +473,7 @@ def _store(
     declared_type: str | None = None,
     replace: bool = False,
 ) -> dict[str, Any]:
-    data = _to_bytes(root, value)
+    data = _to_bytes(root, value, declared_type)
     artifact_type = infer_type(name, data, declared_type)
     base = _safe_name(name)
     base_dir = artifacts_root(root)
@@ -483,8 +574,11 @@ def collect_run(
             outputs = getattr(step, "outputs", None)
             outputs = outputs if isinstance(outputs, dict) else {}
             for name in produces:
-                value = _resolve_output_value(atom_name, str(name), outputs)
-                if value is None:
+                if atom_name == "android_ui_dump" and str(name) == "ui_tree":
+                    value = _ui_tree_value(outputs)
+                else:
+                    value = _resolve_output_value(atom_name, str(name), outputs)
+                if value is None or (isinstance(value, str) and not value.strip()):
                     warnings.append(f"{atom_name}.{name} 没有输出值，已跳过")
                     continue
                 try:
@@ -502,6 +596,9 @@ def collect_run(
                             case_id=case_id,
                             declared_type=DEFAULT_PRODUCES.get(str(name)),
                         )
+                except _ArtifactSourceMissing as exc:
+                    warnings.append(f"artifact_source_missing: {atom_name}.{name}: {exc}")
+                    continue
                 except (OSError, ArtifactError, ValueError) as exc:
                     warnings.append(f"{atom_name}.{name} 收集失败: {exc}")
                     continue
@@ -585,7 +682,11 @@ def list_artifacts(
     limit: int = 50,
 ) -> dict[str, Any]:
     project_filter = normalize_project(project)
-    run_filter = validate_run_id(run) if run else None
+    try:
+        run_filter = validate_run_id(run) if run else None
+    except ArtifactError as exc:
+        # 非法 run 过滤同样按「不存在」处理，避免把 400 当成存在性探针。
+        raise ArtifactError("not_found", "产出物不存在") from exc
     type_filter = str(type).strip() if type else None
     if type_filter and type_filter not in KNOWN_TYPES:
         raise ArtifactError("bad_request", f"type 非法: {type_filter}")

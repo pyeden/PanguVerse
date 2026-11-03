@@ -867,7 +867,9 @@ def android_screencap(
     tags=("device", "android", "adb", "read", "tool:adb"),
     inputs={"serial?": "string", "timeout?": "number"},
     outputs={
+        # ``xml`` 是限长回显；``xml_full`` 是完整 XML，供产物收集落盘。
         "xml": "string",
+        "xml_full": "string",
         "xml_chars": "integer",
         "nodes": "array",
         "count": "integer",
@@ -887,9 +889,11 @@ def android_ui_dump(
     target = resolve_serial(serial)
     xml, nodes = _dump_with_retry(target, timeout=timeout or DEFAULT_TIMEOUT)
     return {
-        # XML 回显可以截断（完整内容可能远大于 MAX_OUTPUT_CHARS），但必须
-        # 保留原始总长度，且解析始终基于截断前的完整 XML。
+        # ``xml`` 回显可以截断（完整内容可能远大于 MAX_OUTPUT_CHARS），但必须
+        # 保留原始总长度，且解析始终基于截断前的完整 XML。产物收集读取
+        # ``xml_full``，确保落盘的是完整 XML 而不是截断回显。
         "xml": clip_output(xml),
+        "xml_full": xml,
         "xml_chars": len(xml),
         "nodes": nodes,
         "count": len(nodes),
