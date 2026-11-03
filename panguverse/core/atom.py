@@ -66,6 +66,9 @@ class Atom:
     #: 原子依赖的本机工具（``chrome`` / ``adb`` / ``simctl``）；无工具依赖为空。
     #: 序列化到 ``/api/atoms``，供 UI 与规划器直接读取，无需从 tags 猜。
     needs_tool: str = ""
+    #: 该原子产出的「任务产出物」名字（如 ``("summary_md",)``）；空表示不产出。
+    #: 只声明语义，不改变执行结果：收集由 Web 层在运行结束后尽力完成。
+    produces: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -86,6 +89,7 @@ class Atom:
         self.secret_outputs = tuple(self.secret_outputs)
         self.declares_variables = tuple(self.declares_variables)
         self.needs_tool = str(self.needs_tool or "")
+        self.produces = tuple(str(item) for item in self.produces)
 
     # ------------------------------------------------------------------ #
     # 契约视图
@@ -204,6 +208,8 @@ class Atom:
             data["secret_outputs"] = list(self.secret_outputs)
         if self.declares_variables:
             data["declares_variables"] = list(self.declares_variables)
+        if self.produces:
+            data["produces"] = list(self.produces)
         return data
 
     def __str__(self) -> str:  # pragma: no cover - 展示用
@@ -230,6 +236,7 @@ def atom(
     idempotent: bool | None = None,
     effect_resolver: Callable[[Mapping[str, Any]], Iterable[str]] | None = None,
     needs_tool: str = "",
+    produces: Iterable[str] = (),
 ) -> Callable[[Callable[..., Any]], Atom]:
     """装饰器写法：``@atom("http_request", ...) def http_request(ctx, url): ...``"""
 
@@ -256,6 +263,7 @@ def atom(
             idempotent=idempotent,
             effect_resolver=effect_resolver,
             needs_tool=needs_tool,
+            produces=tuple(produces),
         )
 
     return decorate

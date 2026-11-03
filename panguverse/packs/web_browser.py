@@ -437,6 +437,7 @@ def web_get_text(ctx: RunContext, html: str) -> dict[str, Any]:
     effects=("read", "write"),
     capabilities=("browser", "network"),
     domain="web_browser",
+    produces=("screenshot",),
 )
 def web_screenshot(
     ctx: RunContext,
@@ -510,6 +511,7 @@ def web_screenshot(
     required=("html",),
     effects=("pure",),
     domain="web_browser",
+    produces=("links",),
 )
 def web_extract_links(
     ctx: RunContext,

@@ -485,9 +485,19 @@ def _scenario_task(
     suite: TestSuite,
     *,
     attribution: dict[str, str] | None = None,
+    extra_meta: dict[str, Any] | None = None,
+    trigger: str = "task",
 ) -> Callable[[Job], dict[str, Any]]:
     def task(job: Job) -> dict[str, Any]:
-        return _scenario_execute(root, job, request, suite, attribution=attribution)
+        return _scenario_execute(
+            root,
+            job,
+            request,
+            suite,
+            attribution=attribution,
+            extra_meta=extra_meta,
+            trigger=trigger,
+        )
 
     return task
 
@@ -499,6 +509,8 @@ def _scenario_execute(
     suite: TestSuite,
     *,
     attribution: dict[str, str] | None = None,
+    extra_meta: dict[str, Any] | None = None,
+    trigger: str = "task",
 ) -> dict[str, Any]:
     baseline = load_last_env(root)
     # 这里只放「显式给出的 env」：场景文件里的 FS_ROOT 等声明必须能生效，
@@ -523,8 +535,10 @@ def _scenario_execute(
             "regression": bool(request.regression),
             "no_llm": bool(request.no_llm),
             "uses_mock": False,
+            "trigger": trigger,
         },
         attribution=attribution,
+        extra_meta=extra_meta,
     )
 
 
@@ -532,12 +546,23 @@ def _suite_run_task(
     root: Path,
     request: RunRequest,
     attribution: dict[str, str],
+    *,
+    extra_meta: dict[str, Any] | None = None,
+    trigger: str = "task",
 ) -> Callable[[Job], dict[str, Any]]:
     """项目套件运行：场景在 **job 内**才解析，单套件坏文件只失败自己。"""
 
     def task(job: Job) -> dict[str, Any]:
         suite = load_scenario_suite(resolve_scenario(root, request.scenario))
-        return _scenario_execute(root, job, request, suite, attribution=attribution)
+        return _scenario_execute(
+            root,
+            job,
+            request,
+            suite,
+            attribution=attribution,
+            extra_meta=extra_meta,
+            trigger=trigger,
+        )
 
     return task
 
@@ -584,6 +609,8 @@ def _workflow_task(
     request: RunRequest,
     *,
     attribution: dict[str, str] | None = None,
+    extra_meta: dict[str, Any] | None = None,
+    trigger: str | None = None,
 ) -> Callable[[Job], dict[str, Any]]:
     """运行已发布的工作流（``<wid>@<rev>``）；只读版本，不再规划/不让 AI 改写。"""
 
@@ -595,7 +622,7 @@ def _workflow_task(
         baseline = load_last_env(root)
         request_env = dict(request.env)
         axe = build_axe(root, enable_llm=False)
-        trigger = "manual" if attribution is None else "task"
+        trigger_name = trigger or ("manual" if attribution is None else "task")
         return _execute(
             axe,
             job,
@@ -614,10 +641,10 @@ def _workflow_task(
                 "regression": bool(request.regression),
                 "no_llm": True,
                 "uses_mock": False,
-                "trigger": trigger,
+                "trigger": trigger_name,
             },
             attribution=attribution,
-            extra_meta={"workflow_ref": request.workflow_ref},
+            extra_meta={"workflow_ref": request.workflow_ref, **(extra_meta or {})},
         )
 
     return task
@@ -785,6 +812,22 @@ def _execute(
     )
     artifacts["plan"] = str(plan_path)
     job.add_phase("report", "ok", f"产物目录 {out_dir}")
+    # 产出物收集是**旁路**：失败只告警，绝不改变运行结论（契约 A7）
+    try:
+        from . import artifacts as artifacts_mod
+
+        collected = artifacts_mod.collect_run(
+            root, run, project_id=(attribution or {}).get("project_id")
+        )
+        count = int(collected.get("count") or 0)
+        warnings = [str(item) for item in collected.get("warnings") or []]
+        detail = f"已收集 {count} 个产出物" if count else "本次运行没有产出物"
+        if warnings:
+            job.add_phase("artifacts", "warning", f"{detail}；" + "；".join(warnings))
+        else:
+            job.add_phase("artifacts", "ok" if count else "skipped", detail)
+    except Exception as exc:  # noqa: BLE001 - A7：收集失败不得影响运行结论
+        job.add_phase("artifacts", "warning", f"产出物收集失败: {sanitize_message(exc)}")
     cancelled = bool(job.cancel_requested)
     if cancelled:
         job.cancel("用户取消")
@@ -890,6 +933,8 @@ def _write_execution_record(
             "suite_id": (attribution or {}).get("suite_id"),
             "workflow_ref": (extra_meta or {}).get("workflow_ref")
             or config.get("workflow_ref"),
+            "schedule_id": (extra_meta or {}).get("schedule_id")
+            or config.get("schedule_id"),
             "created_at": time.time(),
         }
         path = directory / "execution.json"
@@ -1144,6 +1189,15 @@ def generate_insight(
     client = llm_client if llm_client is not None else _default_insight_llm()
     result = insight.build_payload(report, plan, run_id=run_id, llm_client=client)
     write_insight_cache(root, run_id, result)
+    # 报告级 AI 总结自动成为产出物；失败不阻断总结本身
+    try:
+        from . import artifacts as artifacts_mod
+
+        artifacts_mod.record_insight(
+            root, run_id, result.get("summary_md"), report=report
+        )
+    except Exception:  # noqa: BLE001 - 产出物是旁路
+        pass
     return result
 
 
@@ -2083,8 +2137,15 @@ def start_project_batch(
     root: Path,
     project_id: str,
     payload: Any = None,
+    *,
+    trigger: str = "task",
+    extra_meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """``POST /api/projects/{pid}/run``：登记全部 job 后交给 BatchManager 串行执行。"""
+    """``POST /api/projects/{pid}/run``：登记全部 job 后交给 BatchManager 串行执行。
+
+    ``trigger``/``extra_meta`` 由调度器注入（``schedule|webhook|manual`` +
+    ``schedule_id``），普通项目运行保持 ``task`` 不变。
+    """
     project = projects.read_project(root, project_id)
     data = _as_body(payload)
     suites = list(project.get("suites") or [])
@@ -2125,11 +2186,23 @@ def start_project_batch(
                 env=env,
             )
             job = jobs.create("workflow")
-            task = _workflow_task(root, request, attribution=attribution)
+            task = _workflow_task(
+                root,
+                request,
+                attribution=attribution,
+                extra_meta=extra_meta,
+                trigger=trigger,
+            )
         else:
             request = RunRequest(mode="scenario", scenario=scenario, env=env)
             job = jobs.create("scenario")
-            task = _suite_run_task(root, request, attribution)
+            task = _suite_run_task(
+                root,
+                request,
+                attribution,
+                extra_meta=extra_meta,
+                trigger=trigger,
+            )
         items.append(
             {
                 "suite_id": suite_id,

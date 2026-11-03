@@ -503,6 +503,7 @@ def html_extract_structure(ctx: RunContext, html: str) -> dict[str, Any]:
     effects=("read",),
     capabilities=("network", "needs_llm"),
     domain="web_research",
+    produces=("summary_md",),
 )
 def llm_summarize(
     ctx: RunContext,

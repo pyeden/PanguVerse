@@ -877,6 +877,7 @@ def android_screencap(
     effects=("read",),
     capabilities=("device",),
     domain="android_adb",
+    produces=("ui_tree",),
 )
 def android_ui_dump(
     ctx: RunContext,

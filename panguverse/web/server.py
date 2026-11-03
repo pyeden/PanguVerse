@@ -297,11 +297,14 @@ def serve(
 
     if open_browser and host in {"127.0.0.1", "localhost", "::1"}:
         threading.Timer(0.5, lambda: webbrowser.open(url)).start()
+    httpd.api.start_scheduler()
+    announce("⏰ 调度线程已启动（单进程；错过的任务不补跑）")
     try:
         httpd.serve_forever(poll_interval=0.2)
     except KeyboardInterrupt:
         print("\n已停止")
     finally:
+        httpd.api.stop_scheduler()
         httpd.server_close()
     return 0
 

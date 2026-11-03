@@ -13,14 +13,16 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 from ..report import html_report, junit
-from . import executions, reports, service, studio
+from . import artifacts, executions, reports, schedules, service, studio
+from .artifacts import ArtifactError
 from .auth import AuthManager, build_cookie
 from .batches import BatchManager
 from .jobs import JobManager
 from .projects import ProjectStoreError
+from .schedules import ScheduleError
 from .service import ApiError
 from .studio import StudioError
 from .tasks_store import TaskStoreError
@@ -130,6 +132,15 @@ class WebAPI:
         self.auth = auth
         #: 注入用的 LLM client（A44 假 client）；``None`` = 按环境变量自动判定
         self.insight_llm = insight_llm
+        #: 调度线程（单进程）：只在 ``serve`` 里 start/stop；测试可手动调用
+        self.scheduler = schedules.Scheduler(self.root, self.jobs, self.batches)
+
+    # ------------------------------------------------------------------ #
+    def start_scheduler(self) -> None:
+        self.scheduler.start()
+
+    def stop_scheduler(self) -> None:
+        self.scheduler.stop()
 
     # ------------------------------------------------------------------ #
     def handle(
@@ -155,7 +166,7 @@ class WebAPI:
             return error_response(
                 exc.code, exc.message, exc.status, details=exc.details or None
             )
-        except (ApiError, ProjectStoreError, TaskStoreError) as exc:
+        except (ApiError, ProjectStoreError, TaskStoreError, ScheduleError, ArtifactError) as exc:
             return error_response(exc.code, exc.message, exc.status)
         except Exception as exc:  # noqa: BLE001 - 兜底：异常不得穿透到 handler 线程
             return error_response("internal_error", f"{type(exc).__name__}: {exc}")
@@ -178,7 +189,7 @@ class WebAPI:
         segments = [part for part in path.strip("/").split("/") if part]
         if not segments or segments[0] != "api":
             return
-        if len(segments) >= 2 and segments[1] == "auth":
+        if len(segments) >= 2 and segments[1] in ("auth", "share", "hooks"):
             return
         if self.auth.user_from_headers(headers) is None:
             raise ApiError("unauthorized", "需要登录", status=401)
@@ -347,6 +358,89 @@ class WebAPI:
                 if batch is None:
                     raise ApiError("not_found", "batch 不存在")
                 return json_response(batch.snapshot())
+            if head == "schedules":
+                if not rest:
+                    return json_response(
+                        {
+                            "schedules": schedules.list_schedules(
+                                self.root,
+                                include_disabled=_flag_query(query, "include_disabled"),
+                            )
+                        }
+                    )
+                if len(rest) == 1:
+                    return json_response(
+                        schedules.public_schedule(schedules.read_schedule(self.root, rest[0]))
+                    )
+                if len(rest) == 2 and rest[1] == "events":
+                    return json_response(
+                        {
+                            "events": schedules.read_events(
+                                self.root,
+                                rest[0],
+                                limit=_int_query(query, "limit", 100, maximum=500),
+                            )
+                        }
+                    )
+            if head == "artifacts":
+                if not rest:
+                    return json_response(
+                        artifacts.list_artifacts(
+                            self.root,
+                            project=_first(query, "project"),
+                            run=_first(query, "run"),
+                            type=_first(query, "type"),
+                            offset=_offset_query(query, "offset", 0),
+                            limit=_int_query(query, "limit", 50, maximum=200),
+                        )
+                    )
+                if len(rest) == 1:
+                    return json_response(
+                        artifacts.get_artifact(
+                            self.root, rest[0], project=_first(query, "project")
+                        )
+                    )
+                if len(rest) == 2 and rest[1] == "download":
+                    data, filename, mime = artifacts.download_artifact(
+                        self.root, rest[0], project=_first(query, "project")
+                    )
+                    return Response(
+                        status=200,
+                        body=data,
+                        content_type=mime,
+                        headers={
+                            "Cache-Control": "no-store",
+                            "Content-Disposition": _attachment_header(filename),
+                        },
+                    )
+            if head == "share" and rest:
+                if len(rest) == 1:
+                    body, content_type = artifacts.share_preview(self.root, rest[0])
+                    return Response(
+                        status=200,
+                        body=body,
+                        content_type=content_type,
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Robots-Tag": "noindex",
+                            "Content-Security-Policy": (
+                                "default-src 'none'; img-src 'self' data:; "
+                                "style-src 'unsafe-inline'"
+                            ),
+                        },
+                    )
+                if len(rest) == 2 and rest[1] == "raw":
+                    data, filename, mime = artifacts.share_raw(self.root, rest[0])
+                    return Response(
+                        status=200,
+                        body=data,
+                        content_type=mime,
+                        headers={
+                            "Cache-Control": "no-store",
+                            "X-Robots-Tag": "noindex",
+                            "Content-Disposition": _attachment_header(filename, inline=True),
+                        },
+                    )
         elif method == "POST":
             if head == "executions" and len(rest) == 2 and rest[1] == "cancel":
                 return json_response(
@@ -422,6 +516,38 @@ class WebAPI:
                 if len(rest) == 2 and rest[1] == "run":
                     job = service.run_task(self.jobs, self.root, rest[0], body)
                     return json_response({"job_id": job.job_id, "status": "queued"}, status=202)
+            if head == "schedules":
+                if not rest:
+                    return json_response(
+                        schedules.create_schedule(self.root, body), status=201
+                    )
+                if len(rest) == 2 and rest[1] == "run-now":
+                    result = schedules.trigger_schedule(
+                        self.root,
+                        rest[0],
+                        self.jobs,
+                        self.batches,
+                        trigger="manual",
+                        env=_schedule_env(body),
+                    )
+                    return json_response(result, status=202)
+            if head == "hooks" and len(rest) == 1:
+                schedule = schedules.find_by_webhook_token(self.root, rest[0])
+                if not schedule.get("enabled"):
+                    raise ScheduleError("conflict", "调度已禁用", status=409)
+                result = schedules.trigger_schedule(
+                    self.root,
+                    schedule["sid"],
+                    self.jobs,
+                    self.batches,
+                    trigger="webhook",
+                    env=_schedule_env(body),
+                )
+                return json_response(result, status=202)
+            if head == "artifacts" and len(rest) == 2 and rest[1] == "share":
+                return json_response(
+                    artifacts.create_share(self.root, rest[0], body), status=201
+                )
         elif method == "PATCH":
             if head == "projects":
                 if len(rest) == 1:
@@ -432,6 +558,8 @@ class WebAPI:
                     )
             if head == "tasks" and len(rest) == 1:
                 return json_response(service.update_task(self.root, rest[0], body))
+            if head == "schedules" and len(rest) == 1:
+                return json_response(schedules.update_schedule(self.root, rest[0], body))
         elif method == "DELETE":
             if head == "projects":
                 if len(rest) == 1:
@@ -449,6 +577,15 @@ class WebAPI:
                     content_type="",
                     headers={"Cache-Control": "no-store"},
                 )
+            if head == "schedules" and len(rest) == 1:
+                schedules.delete_schedule(self.root, rest[0])
+                return _no_content()
+            if head == "artifacts" and len(rest) == 2 and rest[1] == "share":
+                artifacts.revoke_all_shares(self.root, rest[0])
+                return _no_content()
+            if head == "artifacts" and len(rest) == 3 and rest[1] == "share":
+                artifacts.revoke_share(self.root, rest[0], rest[2])
+                return _no_content()
 
         raise ApiError("not_found", "接口不存在")
 
@@ -700,6 +837,27 @@ def _rev_query(raw: Any, default: int) -> int:
     if value < 0:
         raise ApiError("bad_request", "rev 必须是非负整数")
     return value
+
+
+def _attachment_header(filename: str, *, inline: bool = False) -> str:
+    """安全的 Content-Disposition：ASCII 回退 + RFC 5987 文件名。"""
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", filename or "artifact") or "artifact"
+    kind = "inline" if inline else "attachment"
+    return f"{kind}; filename=\"{safe}\"; filename*=UTF-8''{quote(filename or safe, safe='')}"
+
+
+def _schedule_env(body: Any) -> dict[str, Any]:
+    """webhook / run-now 可带 ``env`` 覆盖；非对象一律 400。"""
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise ApiError("bad_request", "请求体必须是 JSON 对象")
+    env = body.get("env")
+    if env is None:
+        return {}
+    if not isinstance(env, dict):
+        raise ApiError("bad_request", "env 必须是对象")
+    return env
 
 
 def _no_content() -> Response:

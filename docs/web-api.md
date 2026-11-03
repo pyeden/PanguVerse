@@ -671,3 +671,97 @@ P0 补齐执行中心、软归档、报告签署/作废；原子启用/停用明
 - `/api/runs` 仍返回数组；`/api/runs/query` 分页不变；认证、studio、insight、错误体不变。
 - 新增字段只在归档/签署/工作流等对象上出现；未归档任务/项目的既有列表字段集合不变。
 - 新错误码沿用统一错误体：`{"error":{"code","message"}}`；取消已结束执行与重复签署返回 409。
+
+## 9. 调度与触发（v8.0，契约 `tasks/schedule-artifacts-spec.md` §1）
+
+### 9.1 数据模型与 cron
+
+落盘 `<workspace>/.panguverse/schedules/<sid>.json`（目录 `0700`、文件 `0600`、原子写）。
+`sid` 服务端生成（`^sc-[0-9a-f]{6,12}$`），**客户端传入的 sid 一律忽略**。
+
+```json
+{
+  "sid": "sc-1a2b3c",
+  "name": "每日站点巡检",
+  "target": {"kind": "project", "project_id": "p-3f2a1c", "suite_ids": []},
+  "trigger": {"kind": "cron", "expr": "0 9 * * *", "tz": "Asia/Shanghai"},
+  "env_override": {},
+  "enabled": true,
+  "created_at": 0, "updated_at": 0,
+  "last_run_at": null, "last_batch_id": null, "last_status": null,
+  "next_run_at": 0
+}
+```
+
+- `trigger.kind` ∈ `cron|interval|webhook`；`target.kind` 目前只支持 `project`，
+  `suite_ids=[]` 表示该项目全部套件。
+- `cron` 为 **5 字段**（分 时 日 月 周），自己解析、不依赖第三方库：
+  支持 `*`、`*/n`、`a-b`、`a,b`，额外兼容 `a-b/n`；周字段 `0`/`7` 都表示周日。
+  时区默认 `Asia/Shanghai`；`next_run_at` 为 epoch 秒。
+- `interval` 用 `{"kind":"interval","minutes":30}`，最小 1 分钟。
+- `webhook` 用 `{"kind":"webhook"}` 创建；服务端生成 32 字节随机 token，
+  **只在创建/重置的响应里返回一次**（`webhook_token`）。磁盘只保存 SHA-256 与末 4 位提示，
+  详情接口不再回显原文。PATCH `{"trigger":{"kind":"webhook","reset_token":true}}` 可重置。
+- **禁止重叠**：同一 sid 的上一次 batch 仍 `queued/running` 时，本次触发只记录
+  `skipped_overlap` 事件并返回 `{"status":"skipped_overlap"}`，不排队、不产生新 batch。
+- **重启恢复**：`serve` 启动时按磁盘重算 `next_run_at`；已错过的时点不补跑，
+  只向 `<workspace>/.panguverse/schedules/events.jsonl` 追加 `missed` 事件。
+- 调度线程随 `serve` 启停（单进程 MVP，不加队列）；事件另有
+  `created/updated/deleted/triggered/trigger_failed/skipped_overlap/missed`。
+
+### 9.2 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/schedules?include_disabled=1` | 默认只列 `enabled=true` 且未归档 |
+| POST | `/api/schedules` | 201；返回含 `next_run_at`，webhook 另含一次性 `webhook_token` |
+| GET | `/api/schedules/{sid}` | 详情（不含 token 原文） |
+| PATCH | `/api/schedules/{sid}` | 改 `name/target/trigger/env_override/enabled` |
+| DELETE | `/api/schedules/{sid}` | 204；不删历史运行 |
+| GET | `/api/schedules/{sid}/events?limit=100` | 调度事件（调试用） |
+| POST | `/api/schedules/{sid}/run-now` | 202；`{schedule_id,status,batch_id,job_id,trigger}` |
+| POST | `/api/hooks/{token}` | webhook 触发；body 可带 `env` 覆盖 |
+
+- `run-now` 是不受 `enabled` 限制的显式人工触发，执行记录写
+  `meta.trigger="manual"` 与 `meta.schedule_id`；cron/interval 触发写 `schedule`，
+  webhook 写 `webhook`。响应里的 `job_id` 为该批次第一个 job。
+- webhook token 不存在 → **404**；调度 `enabled=false` → **409**。
+- `/api/hooks/*` 与 `/api/share/*` 不要求登录（其余 `/api/*` 仍受认证保护）。
+
+## 10. 任务产出物（v8.0，契约 §2）
+
+### 10.1 概念与落盘
+
+产出物 = 一次运行中值得交付的结果，不是日志。来源：
+
+1. **原子声明** `Atom.produces`：`llm_summarize → summary_md`、
+   `web_screenshot → screenshot`、`android_ui_dump → ui_tree`、
+   `web_extract_links → links`；`/api/atoms` 的 `produces` 字段可读；
+2. **报告级** AI 总结：生成 insight 时自动落为 `ai_summary`（同 run 覆盖更新）。
+
+```
+<ws>/.panguverse/artifacts/<project_id|unclassified>/<run_id>/<name>.<ext>
+<ws>/.panguverse/artifacts/<project_id|unclassified>/<run_id>/manifest.json
+```
+
+- 目录 `0700`、文件 `0600`；manifest 记录 `artifact_id/run_id/project_id/name/type/bytes/sha256/node_id/step_id/case_id/created_at`。
+- 类型按 produces 声明优先，其次内容嗅探：`markdown|image|json|xml|text|file`。
+- 同名产物按 `<name>-<seq>` 去重；单产物上限 **20MB**，超出只记元信息并标
+  `truncated=true`（下载返回 409）。
+- 收集是**旁路**：失败只写 job 阶段告警（`artifacts: warning`），运行结论不变（A7）。
+
+### 10.2 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/artifacts?project=&run=&type=&offset=&limit=` | `{total,items[]}`，按创建时间倒序 |
+| GET | `/api/artifacts/{aid}` | 元信息 + 文本类 ≤64KB 的 `content`；含 `download_url` |
+| GET | `/api/artifacts/{aid}/download` | 文件流 + `Content-Disposition` |
+| POST | `/api/artifacts/{aid}/share` | `{url_token,expires_at}`；`expires_in` 支持 `1h/1d/7d/30d` 或秒数，默认 7 天 |
+| DELETE | `/api/artifacts/{aid}/share/{token}` | 204，撤销分享 |
+| GET | `/api/share/{token}` | 只读 HTML 预览页（**未登录可访问**） |
+| GET | `/api/share/{token}/raw` | 分享文件的原始字节（图片预览用） |
+
+- 分享 token 只读、不可列目录；不存在/已撤销 → **404**，过期 → **410**。
+- `aid` 必须匹配 `^ar-[0-9a-f]{6,12}$`；文件名由服务端清洗，路径穿越、
+  跨项目 `project` 过滤不匹配、直接读取 `manifest.json` 均返回 404。
