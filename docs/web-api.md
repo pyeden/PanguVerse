@@ -768,6 +768,7 @@ webhook 触发，**不经过 project/suite/task**。项目级调度（`.panguver
 - `webhook` 创建时生成随机 token，**只在创建/重置的响应里返回一次**；
   磁盘只保存 `sha256` 与末 4 位 `token_hint`，列表/详情只回显 `token_hint`。
 - `enabled=false` 不参与定时/webhook 触发，但仍允许显式 run-now。
+- API 出口的 `env_override` 与 `env` 子树使用同一套敏感键规则打码（如 `API_TOKEN` → `***`）；磁盘文件仍按 `0600` 保存明文。
 - **禁止重叠**：同一 trigger 上次 job 仍 `queued/running` 时，本次触发只写
   `skipped_overlap` 事件并返回 `{"status":"skipped_overlap"}`，不产生新 job。
 - **重启恢复**：启动时按磁盘重算 `next_run_at`；已经错过的时点只写 `missed`，
