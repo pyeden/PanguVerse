@@ -36,7 +36,7 @@ from ..engine.result import RunResult
 from ..report import DEFAULT_FORMATS, write_all
 from ..report.json_report import conclusion as report_conclusion
 from ..spec.loader import TestSuite, load_suite
-from . import audit, insight, projects, tasks_store
+from . import audit, insight, phase_store, projects, tasks_store
 from .jobs import Job, JobManager, sanitize_message
 
 WEB_DIR = Path(__file__).resolve().parent
@@ -723,6 +723,30 @@ def _regression_task(root: Path, request: RunRequest) -> Callable[[Job], dict[st
 # --------------------------------------------------------------------------- #
 # 执行编排（与 PanguAxe.loop 同序，额外把阶段回写给 job）
 # --------------------------------------------------------------------------- #
+def _install_phase_persistence(root: Path, job: Job) -> None:
+    """job 进入终态时把 phases 原子落盘；失败只当旁路错误。"""
+    previous = job.on_finish
+
+    def on_finish(finished: Job) -> None:
+        if previous is not None:
+            with contextlib.suppress(Exception):  # 原有终态回调失败不阻断 phases 落盘
+                previous(finished)
+        with contextlib.suppress(Exception):  # 写盘失败不得改变运行结论（A7）
+            snapshot = finished.to_dict()
+            run_id = str(snapshot.get("run_id") or "")
+            if run_id:
+                phase_store.write_phases(
+                    root,
+                    run_id,
+                    job_id=str(snapshot.get("job_id") or ""),
+                    phases=snapshot.get("phases") or [],
+                    finished_at=snapshot.get("finished_at"),
+                    status=str(snapshot.get("status") or ""),
+                )
+
+    job.on_finish = on_finish
+
+
 def _execute(
     axe: PanguAxe,
     job: Job,
@@ -743,6 +767,7 @@ def _execute(
     from .executions import install_cancellation
 
     install_cancellation(axe, job)
+    _install_phase_persistence(root, job)
     job.add_phase("plan", "ok", f"{plan.size} 个用例来自 {plan.source}")
     if not plan.cases:
         job.add_phase("plan", "failed", "计划中没有任何用例")
@@ -1064,6 +1089,8 @@ def list_runs(root: Path, *, limit: int = 50) -> list[dict[str, Any]]:
                 "summary": report.get("summary"),
                 "conclusion": report.get("conclusion"),
                 "meta": report.get("meta"),
+                # 旧记录没有 phases 时为 []，供 executions 层回退/兼容。
+                "phases": report.get("phases") if isinstance(report.get("phases"), list) else [],
             }
         )
     entries.sort(key=lambda item: item.get("started_at") or 0, reverse=True)

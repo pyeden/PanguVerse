@@ -22,7 +22,7 @@ from typing import Any
 from ..core.errors import PlanError
 from ..engine.executor import Executor
 from ..engine.result import ERROR, SKIPPED, RunResult, StepResult
-from . import audit, service
+from . import audit, phase_store, service
 from .batches import (
     BATCH_DONE,
     BATCH_FAILED,
@@ -259,8 +259,16 @@ def _execution_meta(root: Path, run_id: str) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    # phases 单独落盘：优先磁盘快照，缺失时保留 execution.json 自带字段（若有）。
+    stored = phase_store.read_phases(root, run_id)
+    if stored:
+        data["phases"] = stored
+    elif not isinstance(data.get("phases"), list):
+        data["phases"] = []
+    return data
 
 
 def _as_int(value: Any) -> int:
@@ -296,6 +304,14 @@ def _disk_row(root: Path, run: dict[str, Any]) -> dict[str, Any]:
     meta = run.get("meta") if isinstance(run.get("meta"), dict) else {}
     config = meta.get("run_config") if isinstance(meta.get("run_config"), dict) else {}
     execution = _execution_meta(root, run_id)
+    phases = execution.get("phases")
+    if not isinstance(phases, list) or not phases:
+        # 旧记录兼容：没有 sidecar 或 sidecar 为空时回退 report.phases。
+        report_phases = run.get("phases")
+        if isinstance(report_phases, list) and report_phases:
+            phases = report_phases
+    if not isinstance(phases, list):
+        phases = []
     summary = run.get("summary") if isinstance(run.get("summary"), dict) else {}
     run_status = str(run.get("status") or "done")
     status = str(execution.get("status") or run_status)
@@ -323,7 +339,7 @@ def _disk_row(root: Path, run: dict[str, Any]) -> dict[str, Any]:
         "error": execution.get("error") or "",
         "conclusion": run.get("conclusion"),
         "summary": summary,
-        "phases": [],
+        "phases": phases,
         "cancellable": False,
     }
 
