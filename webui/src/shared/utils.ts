@@ -219,6 +219,7 @@ export function classForStatus(status: string): string {
     skipped: 'dim',
     none: 'dim',
     partial: 'warn',
+    warning: 'warn',
   }
   return map[status] || 'dim'
 }
@@ -246,6 +247,7 @@ export function statusLabel(status: string | undefined): string {
     deprecated: '已归档',
     cancelled: '已取消',
     cancelling: '取消中',
+    warning: '警告',
   }
   return map[status || 'none'] || status || '未知'
 }

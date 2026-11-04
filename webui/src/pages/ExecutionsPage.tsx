@@ -501,7 +501,11 @@ function ExecutionDetail({ execution, onCancel }: { execution: Execution; onCanc
           {(execution.phases || []).map((phase, index) => (
             <div className="timeline-row" key={`${phase.name}-${index}`}>
               <span className={`timeline-dot tone-${classForStatus(phase.status)}`} />
-              <div><strong>{phase.name}</strong><span>{phase.detail || statusLabel(phase.status)}</span></div>
+              <div>
+                <strong>{phase.name}</strong>
+                {phase.status === 'warning' ? <Badge tone="warn" className="phase-warn-badge"><Icon name="warning" size={10} />警告</Badge> : null}
+                <span>{phase.detail || statusLabel(phase.status)}</span>
+              </div>
             </div>
           ))}
           {!execution.phases?.length ? <p className="muted">没有阶段详情（已完成的历史 run 可能未持久化阶段）。</p> : null}

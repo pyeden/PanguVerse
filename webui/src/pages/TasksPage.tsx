@@ -437,7 +437,8 @@ function JobPanel({ job }: { job: Job }) {
           <div className="phase-row" key={`${phase.name}-${index}`}>
             <span className={`phase-dot tone-${classForStatus(phase.status)}`} />
             <strong>{phase.name}</strong>
-            <span>{phase.detail || phase.status}</span>
+            {phase.status === 'warning' ? <Badge tone="warn" className="phase-warn-badge"><Icon name="warning" size={10} />警告</Badge> : null}
+            <span className="phase-detail">{phase.detail || statusLabel(phase.status)}</span>
           </div>
         ))}
       </div>

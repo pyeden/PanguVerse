@@ -838,7 +838,16 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .phase-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(154,177,214,.07); font-size: 9.5px; }
 .phase-row strong { font-size: 9.5px; min-width: 70px; }
 .phase-row span:last-child { color: var(--dim); }
+.phase-row .phase-detail { min-width: 0; overflow-wrap: anywhere; }
+.phase-warn-badge { flex: 0 0 auto; }
+.phase-row .phase-warn-badge, .timeline-row .phase-warn-badge {
+  color: #ffd08c; background: rgba(247, 187, 99, 0.09); border-color: rgba(247, 187, 99, 0.21);
+}
 .phase-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--dim); flex: 0 0 auto; }
+.phase-dot.tone-ok, .timeline-dot.tone-ok { background: var(--green); }
+.phase-dot.tone-bad, .timeline-dot.tone-bad { background: var(--red); }
+.phase-dot.tone-warn, .timeline-dot.tone-warn { background: var(--amber); }
+.phase-dot.tone-run, .timeline-dot.tone-run { background: var(--blue); }
 .task-lifecycle { margin-top: 2px; }
 .lifecycle-track { display: flex; align-items: center; gap: 0; padding: 6px 3px; overflow-x: auto; }
 .lifecycle-step { display: flex; align-items: center; flex: 1; min-width: 100px; gap: 6px; position: relative; }
@@ -2013,6 +2022,10 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .run-artifact-copy strong { font-size: 10.5px; }
 .run-artifact-copy small { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; color: var(--dim); font-size: 8.5px; }
 .run-artifact-empty { display: flex; align-items: center; gap: 7px; padding: 12px; color: var(--dim); font-size: 9.5px; border: 1px dashed var(--line); border-radius: 8px; }
+.run-warning-phases { margin: 0; }
+.run-warning-phases p { color: var(--muted); margin-top: 3px; font-size: 10.5px; overflow-wrap: anywhere; }
+.run-warning-phases p .mono { color: #ffd08c; }
+.run-artifact-warning { margin-bottom: 8px; }
 
 /* ---------------------------------------------------------------- canvas viewport fit */
 .content-canvas {

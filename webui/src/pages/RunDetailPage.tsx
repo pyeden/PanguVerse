@@ -60,6 +60,14 @@ export function RunDetailPage() {
     queryFn: () => api.artifacts(new URLSearchParams({ run: rid, limit: '100' })),
     enabled: !!rid,
   })
+  // 阶段明细由执行记录提供（GET /api/executions/{run_id} 已合并内存 job.phases）；
+  // 旧报告可能没有 phases，此时回退到 report.phases，不臆造接口。
+  const executionQuery = useQuery({
+    queryKey: ['run-execution', rid],
+    queryFn: () => api.execution(rid),
+    enabled: !!rid,
+    retry: false,
+  })
 
   const generateInsight = useMutation({
     mutationFn: (refresh: boolean) => api.generateInsight(rid, refresh),
@@ -103,6 +111,17 @@ export function RunDetailPage() {
   const suiteName = report.meta?.suite || plan.meta?.suite || report.meta?.suite_name || project?.suites?.find((suite) => suite.suite_id === report.meta?.suite_id)?.name || '未归类运行'
   const workflowRef = report.workflow_ref || report.meta?.workflow_ref || plan.workflow_ref || report.meta?.published_ref || ''
   const audit: AnyRecord[] = Array.isArray(report.audit_tail) ? report.audit_tail : Array.isArray(plan.audit_tail) ? plan.audit_tail : []
+  const executionPhases: { name: string; status: string; detail?: string }[] = executionQuery.data?.phases?.length
+    ? executionQuery.data.phases
+    : Array.isArray(report.phases)
+      ? (report.phases as { name: string; status: string; detail?: string }[])
+      : []
+  const warningPhases = executionPhases.filter((phase) => phase.status === 'warning')
+  const artifactPhase = executionPhases.find((phase) => phase.name === 'artifacts')
+  const artifactWarning = artifactPhase?.status === 'warning'
+  // 后端 warning detail 可能仍以「本次运行没有产出物」开头；收集失败不是「没有声明产出」，
+  // 报告页统一去掉这个误导前缀，只保留真正的失败原因。
+  const cleanPhaseDetail = (detail?: string) => (detail || '').replace(/^本次运行没有产出物[；;]\s*/, '')
 
   const caseQuery = caseSearch.trim().toLowerCase()
   const filteredCases = cases.filter((item) => {
@@ -148,6 +167,18 @@ export function RunDetailPage() {
         <Kpi label="HTTP 请求" value={summary.http_requests ?? '—'} sub={`${summary.steps ?? 0} 个步骤`} icon="server" />
         <Kpi label="总耗时" value={formatDuration(report.duration_ms)} sub={`结论：${report.conclusion?.verdict || '—'}`} icon="clock" />
       </div>
+
+      {warningPhases.length ? (
+        <div className="notice-inline warn-note run-warning-phases" data-testid="run-warning-phases">
+          <Icon name="warning" size={15} />
+          <div>
+            <strong>执行阶段有 {warningPhases.length} 项警告</strong>
+            {warningPhases.map((phase, index) => (
+              <p key={`${phase.name}-${index}`}><span className="mono">{phase.name}</span> · {cleanPhaseDetail(phase.detail) || statusLabel(phase.status)}</p>
+            ))}
+          </div>
+        </div>
+      ) : null}
 
       <div className="report-grid">
         <div className="report-main">
@@ -195,7 +226,13 @@ export function RunDetailPage() {
                 <div><strong>产出物接口未就绪或读取失败</strong><p>接口上线后，本 run 的 summary_md / 截图会自动列在这里。</p></div>
               </div>
             ) : null}
-            {!runArtifactsQuery.isLoading && !runArtifactsQuery.error && !(runArtifactsQuery.data?.items || []).length ? (
+            {artifactWarning ? (
+              <div className="notice-inline warn-note run-artifact-warning" data-testid="run-artifact-warning">
+                <Icon name="warning" size={14} />
+                <div><strong>产物收集失败（见警告明细）</strong><p>{cleanPhaseDetail(artifactPhase?.detail) || '产物收集阶段返回 warning，运行结论不受影响。'}</p></div>
+              </div>
+            ) : null}
+            {!runArtifactsQuery.isLoading && !runArtifactsQuery.error && !(runArtifactsQuery.data?.items || []).length && !artifactWarning ? (
               <div className="run-artifact-empty"><Icon name="archive" size={18} /><span>本次运行没有产出物。节点声明 <code>produces</code> 后才会收集。</span></div>
             ) : null}
             {(runArtifactsQuery.data?.items || []).length ? (
