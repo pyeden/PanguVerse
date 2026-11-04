@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import stat
 import threading
@@ -363,3 +364,131 @@ def test_s8_disabled_schedule(web: WebClient) -> None:
     assert job["status"] == "done"
     status, run = web.get_json(f"/api/runs/{job['run_id']}")
     assert run["report"]["meta"]["trigger"] == "manual"
+
+
+# --------------------------------------------------------------------------- #
+# S9 异常隔离：同一 tick 内一个调度抛错，另一个仍必须被触发
+# --------------------------------------------------------------------------- #
+def _project_with_schedule(web: WebClient, name: str) -> tuple[str, dict[str, Any]]:
+    status, project = web.post_json("/api/projects", {"name": name, "env": {}})
+    assert status == 201, project
+    status, suite = web.post_json(
+        f"/api/projects/{project['project_id']}/suites",
+        {"name": "noop", "scenario": "noop.yaml"},
+    )
+    assert status == 201, suite
+    created = _create(
+        web,
+        project["project_id"],
+        {"kind": "interval", "minutes": 1},
+        name=name,
+    )
+    return project["project_id"], created
+
+
+def test_s9_tick_isolates_failing_schedule(web: WebClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    bad_pid, bad = _project_with_schedule(web, "坏调度")
+    _good_pid, good = _project_with_schedule(web, "好调度")
+    now = time.time()
+    for item in (bad, good):
+        _rewrite_schedule(web, item["sid"], next_run_at=now - 1.0, last_run_at=None)
+
+    # 让坏调度的项目在磁盘上消失：trigger_schedule 会抛 ProjectStoreError（非 ScheduleError）
+    assert web.delete(f"/api/projects/{bad_pid}") == 204
+
+    real_all = schedules._all_schedules
+
+    def ordered(root: Path, *, include_disabled: bool = True) -> list[dict[str, Any]]:
+        items = real_all(root, include_disabled=include_disabled)
+        return sorted(items, key=lambda item: 0 if item["sid"] == bad["sid"] else 1)
+
+    monkeypatch.setattr(schedules, "_all_schedules", ordered)
+
+    fired = web.api.scheduler.tick(now=now)
+    assert [item["schedule_id"] for item in fired] == [good["sid"]]
+    job = web.wait_job(fired[0]["job_id"])
+    assert job["status"] == "done", job
+
+    bad_detail = schedules.read_schedule(web.workspace, bad["sid"])
+    assert bad_detail["next_run_at"] is not None and bad_detail["next_run_at"] > now
+    kinds = [event["kind"] for event in _events(web, bad["sid"])]
+    assert "tick_failed" in kinds
+
+    error = web.api.scheduler.last_tick_error
+    assert error is not None
+    assert error["sid"] == bad["sid"]
+    assert error["type"] == "ProjectStoreError"
+    assert isinstance(error["at"], (int, float))
+
+
+# --------------------------------------------------------------------------- #
+# S10 持续抛错：重试频率不超过 interval，且 next_run_at 不落后于 now
+# --------------------------------------------------------------------------- #
+def test_s10_failing_schedule_retry_respects_interval(web: WebClient) -> None:
+    bad_pid, bad = _project_with_schedule(web, "长期坏调度")
+    sid = bad["sid"]
+    base = time.time()
+    _rewrite_schedule(web, sid, next_run_at=base - 0.5, last_run_at=None)
+    assert web.delete(f"/api/projects/{bad_pid}") == 204
+
+    # 模拟 tick=0.2s 的 5 秒窗口；旧代码在第一次 tick 就会把异常抛出来
+    last_now = base
+    for index in range(26):
+        last_now = base + index * 0.2
+        web.api.scheduler.tick(now=last_now)
+
+    def failed_count() -> int:
+        return sum(1 for event in _events(web, sid) if event["kind"] == "tick_failed")
+
+    assert failed_count() == 1
+
+    detail = schedules.read_schedule(web.workspace, sid)
+    assert detail["next_run_at"] is not None
+    assert detail["next_run_at"] >= last_now
+    assert detail["next_run_at"] == pytest.approx(base + 60.0, abs=0.01)
+
+    # 到期前不重试；越过 interval 后才允许下一次尝试（频率不超过 interval）
+    web.api.scheduler.tick(now=base + 59.9)
+    assert failed_count() == 1
+    web.api.scheduler.tick(now=base + 60.1)
+    assert failed_count() == 2
+    detail = schedules.read_schedule(web.workspace, sid)
+    assert detail["next_run_at"] == pytest.approx(base + 120.1, abs=0.01)
+
+
+# --------------------------------------------------------------------------- #
+# S11 /api/status 暴露 last_tick_at / last_tick_error（线程存活自检）
+# --------------------------------------------------------------------------- #
+def test_s11_status_exposes_last_tick_error(web: WebClient) -> None:
+    bad_pid, bad = _project_with_schedule(web, "状态坏调度")
+    now = time.time()
+    _rewrite_schedule(web, bad["sid"], next_run_at=now - 1.0, last_run_at=None)
+    assert web.delete(f"/api/projects/{bad_pid}") == 204
+
+    with contextlib.suppress(Exception):
+        web.api.scheduler.tick(now=now)
+
+    status, data = web.get_json("/api/status")
+    assert status == 200, data
+    assert data["last_tick_at"] == pytest.approx(now, abs=1e-6)
+    error = data["last_tick_error"]
+    assert error["sid"] == bad["sid"]
+    assert error["type"] == "ProjectStoreError"
+    assert isinstance(error["at"], (int, float))
+
+
+# --------------------------------------------------------------------------- #
+# S12 幂等键先落盘：创建批次前就写回 last_run_at，失败也不会在同一时点重复触发
+# --------------------------------------------------------------------------- #
+def test_s12_trigger_failure_records_idempotency_before_start(web: WebClient) -> None:
+    bad_pid, bad = _project_with_schedule(web, "触发失败调度")
+    now = time.time()
+    _rewrite_schedule(web, bad["sid"], next_run_at=now - 1.0, last_run_at=None)
+    assert web.delete(f"/api/projects/{bad_pid}") == 204
+
+    assert web.api.scheduler.tick(now=now) == []
+
+    detail = schedules.read_schedule(web.workspace, bad["sid"])
+    assert detail["last_run_at"] == pytest.approx(now, abs=1e-6)
+    assert detail["last_status"] == "trigger_failed"
+    assert detail["next_run_at"] is not None and detail["next_run_at"] > now

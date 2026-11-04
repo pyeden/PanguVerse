@@ -30,6 +30,7 @@ import secrets
 import tempfile
 import threading
 import time
+import traceback
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -681,6 +682,13 @@ def trigger_schedule(
         merged_env = {**(schedule.get("env_override") or {}), **(env or {})}
         if merged_env:
             payload["env"] = merged_env
+        # 幂等键先落盘：先写回 last_run_at，再创建批次。
+        # 这样即使进程在「批次已创建、结果尚未写回」之间崩溃或抛异常，
+        # 同一个到期时点也不会被下一次 tick 重复触发；tick 的 finally 还会
+        # 把 next_run_at 推过 now，形成第二道保险。
+        schedule["last_run_at"] = now
+        schedule["updated_at"] = now
+        _atomic_write(_schedule_path(root, sid), schedule)
 
     from . import service  # 局部导入：避免模块级循环
 
@@ -695,10 +703,15 @@ def trigger_schedule(
             extra_meta={"trigger": trigger, "schedule_id": sid},
         )
     except service.ApiError as exc:
+        _mark_trigger_failed(root, sid, now)
         append_event(
             root, sid, "trigger_failed", {"trigger": trigger, "message": exc.message}
         )
         raise ScheduleError(exc.code, exc.message, status=exc.status) from exc
+    except Exception:
+        # 非 ApiError 交给 tick 记录 tick_failed；这里只回写失败状态
+        _mark_trigger_failed(root, sid, now)
+        raise
 
     batch_id = str(result.get("batch_id") or "")
     job_id = None
@@ -742,6 +755,19 @@ def find_by_webhook_token(root: Path, token: str) -> dict[str, Any]:
     raise ScheduleError("not_found", "hook 不存在")
 
 
+def _mark_trigger_failed(root: Path, sid: str, now: float) -> None:
+    """触发失败时尽力回写状态（不掩盖原始异常）。"""
+    try:
+        with _LOCK:
+            fresh = read_schedule(root, sid)
+            fresh["last_status"] = "trigger_failed"
+            fresh["updated_at"] = now
+            with contextlib.suppress(OSError):
+                _atomic_write(_schedule_path(root, sid), fresh)
+    except ScheduleError:
+        return
+
+
 # --------------------------------------------------------------------------- #
 # 调度线程
 # --------------------------------------------------------------------------- #
@@ -764,6 +790,10 @@ class Scheduler:
         self.tick_seconds = max(0.05, float(tick_seconds))
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
+        #: 状态自检：最近一次 tick 的时钟值与最近一次单调度异常
+        self._state_lock = threading.Lock()
+        self.last_tick_at: float | None = None
+        self.last_tick_error: dict[str, Any] | None = None
 
     # -- 生命周期 ------------------------------------------------------ #
     def start(self) -> None:
@@ -793,6 +823,7 @@ class Scheduler:
             try:
                 self.tick()
             except Exception as exc:  # noqa: BLE001 - 调度线程必须活下去
+                self._record_tick_error("", exc, self.clock())
                 LOGGER.warning("调度 tick 失败: %s", exc)
 
     # -- 恢复 ---------------------------------------------------------- #
@@ -839,57 +870,143 @@ class Scheduler:
 
     # -- tick ---------------------------------------------------------- #
     def tick(self, *, now: float | None = None) -> list[dict[str, Any]]:
-        """检查全部到期调度；返回本次真实触发的摘要（测试可直接调用）。"""
+        """检查全部到期调度；返回本次真实触发的摘要（测试可直接调用）。
+
+        单个 schedule 的异常不会中断本轮其它调度：失败只记 ``tick_failed``，
+        并且 ``finally`` 会无条件把到期调度的 ``next_run_at`` 推过 ``now``。
+        """
         moment = self.clock() if now is None else float(now)
+        with self._state_lock:
+            self.last_tick_at = moment
         fired: list[dict[str, Any]] = []
         for schedule in _all_schedules(self.root, include_disabled=True):
-            sid = schedule["sid"]
-            trigger = schedule.get("trigger") or {}
-            if not schedule.get("enabled") or trigger.get("kind") == "webhook":
-                self._sync_status(schedule)
-                continue
-            due = schedule.get("next_run_at")
-            if not isinstance(due, (int, float)) or isinstance(due, bool):
-                schedule["next_run_at"] = compute_next_run(
-                    trigger, moment, last_run=schedule.get("last_run_at")
-                )
-                self._persist(schedule)
-                self._sync_status(schedule)
-                continue
-            if float(due) > moment:
-                self._sync_status(schedule)
-                continue
-            lateness = moment - float(due)
-            if lateness > MISSED_GRACE_SECONDS:
-                # 进程可能刚睡醒/刚恢复：不补跑，只记 missed 并推到下一个时点
-                append_event(
-                    self.root, sid, "missed", {"due_at": due, "checked_at": moment}
-                )
-            else:
-                try:
-                    result = trigger_schedule(
-                        self.root,
-                        sid,
-                        self.jobs,
-                        self.batches,
-                        trigger="schedule",
-                        now=moment,
-                    )
-                    fired.append(result)
-                except ScheduleError as exc:
-                    append_event(
-                        self.root,
-                        sid,
-                        "trigger_failed",
-                        {"trigger": "schedule", "message": exc.message},
-                    )
-            fresh = read_schedule(self.root, sid)
-            fresh["next_run_at"] = compute_next_run(
-                fresh.get("trigger") or trigger, moment, last_run=fresh.get("last_run_at")
-            )
-            self._persist(fresh)
-            self._sync_status(fresh)
+            sid = str(schedule.get("sid") or "")
+            try:
+                self._tick_one(schedule, moment, fired)
+            except Exception as exc:  # noqa: BLE001 - 单调度失败必须隔离
+                self._record_tick_error(sid, exc, moment)
+            finally:
+                if sid:
+                    self._advance_if_due(sid, moment)
         return fired
+
+    def _tick_one(
+        self, schedule: dict[str, Any], moment: float, fired: list[dict[str, Any]]
+    ) -> None:
+        sid = schedule["sid"]
+        trigger = schedule.get("trigger") or {}
+        if not schedule.get("enabled") or trigger.get("kind") == "webhook":
+            self._sync_status(schedule)
+            return
+        due = schedule.get("next_run_at")
+        if not isinstance(due, (int, float)) or isinstance(due, bool):
+            schedule["next_run_at"] = compute_next_run(
+                trigger, moment, last_run=schedule.get("last_run_at")
+            )
+            self._persist(schedule)
+            self._sync_status(schedule)
+            return
+        if float(due) > moment:
+            self._sync_status(schedule)
+            return
+        if moment - float(due) > MISSED_GRACE_SECONDS:
+            # 进程可能刚睡醒/刚恢复：不补跑，只记 missed 并推到下一个时点
+            append_event(self.root, sid, "missed", {"due_at": due, "checked_at": moment})
+            return
+        try:
+            result = trigger_schedule(
+                self.root,
+                sid,
+                self.jobs,
+                self.batches,
+                trigger="schedule",
+                now=moment,
+            )
+            fired.append(result)
+        except ScheduleError as exc:
+            append_event(
+                self.root,
+                sid,
+                "trigger_failed",
+                {"trigger": "schedule", "message": exc.message},
+            )
+
+    def _advance_if_due(self, sid: str, moment: float) -> None:
+        """``finally`` 里调用：到期调度的 ``next_run_at`` 至少要越过 ``now``。
+
+        等价于 ``max(now, due) + interval``（cron 从 ``max(now, due)`` 找下一格），
+        既避免异常时同一时点每 tick 重试，也避免 ``next_run_at`` 落后于当前时间。
+        """
+        try:
+            fresh = read_schedule(self.root, sid)
+        except ScheduleError:
+            return
+        trigger = fresh.get("trigger") or {}
+        if not fresh.get("enabled") or trigger.get("kind") == "webhook":
+            return
+        due = fresh.get("next_run_at")
+        if isinstance(due, bool) or not isinstance(due, (int, float)):
+            # trigger 损坏、连 due 都算不出来：兜底 60 秒后再试，避免 1 秒风暴
+            fresh["next_run_at"] = moment + 60.0
+            self._persist(fresh)
+            return
+        due_at = float(due)
+        if due_at > moment:
+            return  # 已经推进过，本轮不再重复推
+        base = max(float(moment), due_at)
+        try:
+            if trigger.get("kind") == "interval":
+                step = int(trigger.get("minutes") or 0) * 60
+                if step <= 0:
+                    raise ScheduleError("bad_request", "interval.minutes 必须 >= 1")
+                upcoming: float | None = base + step
+            else:
+                upcoming = compute_next_run(trigger, base, last_run=None)
+            if upcoming is None:
+                raise ScheduleError("bad_request", "trigger 无法计算下一次运行")
+        except Exception as exc:  # noqa: BLE001 - 推进失败也必须防止重试风暴
+            LOGGER.warning("调度 %s 的 next_run_at 无法推进: %s", sid, exc)
+            upcoming = base + 60.0
+        fresh["next_run_at"] = float(upcoming)
+        self._persist(fresh)
+
+    def _record_tick_error(self, sid: str, exc: Exception, moment: float) -> None:
+        trace = traceback.format_exc()
+        entry = {
+            "sid": sid or None,
+            "type": type(exc).__name__,
+            "message": str(exc),
+            "at": float(moment),
+            "traceback": trace[-4000:],
+        }
+        with self._state_lock:
+            self.last_tick_error = entry
+        LOGGER.error("调度 %s 执行失败: %s", sid or "<unknown>", exc, exc_info=True)
+        if not sid:
+            return
+        with contextlib.suppress(Exception):
+            append_event(
+                self.root,
+                sid,
+                "tick_failed",
+                {
+                    "trigger": "schedule",
+                    "type": entry["type"],
+                    "message": entry["message"],
+                    "traceback": entry["traceback"],
+                },
+            )
+
+    def status_snapshot(self) -> dict[str, Any]:
+        """``/api/status`` 用的调度线程观测字段（加锁读取）。"""
+        with self._state_lock:
+            return {
+                "scheduler_running": self.running,
+                "last_tick_at": self.last_tick_at,
+                "last_tick_error": (
+                    dict(self.last_tick_error) if self.last_tick_error else None
+                ),
+            }
 
     def _sync_status(self, schedule: dict[str, Any]) -> None:
         """把内存批次状态回写到 ``last_status``（尽力而为）。"""

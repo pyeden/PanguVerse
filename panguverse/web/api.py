@@ -220,7 +220,10 @@ class WebAPI:
 
         if method == "GET":
             if head == "status" and not rest:
-                return json_response(service.status_payload(self.root))
+                payload = service.status_payload(self.root)
+                # 调度线程自检：last_tick_at / last_tick_error 由 Scheduler 维护
+                payload.update(self.scheduler.status_snapshot())
+                return json_response(payload)
             if head == "atoms" and not rest:
                 return json_response(
                     service.list_atoms(
