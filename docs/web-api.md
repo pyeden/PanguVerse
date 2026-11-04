@@ -736,6 +736,59 @@ P0 补齐执行中心、软归档、报告签署/作废；原子启用/停用明
 - webhook token 不存在 → **404**；调度 `enabled=false` → **409**。
 - `/api/hooks/*` 与 `/api/share/*` 不要求登录（其余 `/api/*` 仍受认证保护）。
 
+### 9.3 Workflow 级触发器（M1）
+
+已发布 workflow（`workflow_ref = w-xxxx@N`）可以直接被手动、cron/interval 或
+webhook 触发，**不经过 project/suite/task**。项目级调度（`.panguverse/schedules/`）
+与 workflow 触发器（`.panguverse/triggers/`）两套存储并存，由同一个调度线程扫描。
+
+落盘：`<workspace>/.panguverse/triggers/<trigger_id>.json`（目录 `0700`、文件 `0600`、
+原子写），事件追加到 `<workspace>/.panguverse/triggers/events.jsonl`。
+
+```json
+{
+  "trigger_id": "tr-1a2b3c4d",
+  "workflow_ref": "w-8f3a1c@3",
+  "wid": "w-8f3a1c",
+  "rev": 3,
+  "kind": "schedule",
+  "enabled": true,
+  "schedule": {"cron": "0 9 * * *", "tz": "Asia/Shanghai"},
+  "env_override": {},
+  "last_run_at": null, "last_status": null, "last_job_id": null,
+  "next_run_at": 0, "created_at": 0, "updated_at": 0
+}
+```
+
+- `trigger_id` 由服务端生成（`^tr-[0-9a-f]{8}$`），客户端传值一律忽略。
+- `workflow_ref` 必须通过 `studio.load_published` 校验，且必须属于 URL 里的 `wid`。
+- `kind` ∈ `schedule|webhook|manual`。`schedule` 必须且只能给
+  `schedule({cron,tz})` 或 `interval({minutes})` 之一；cron 复用 §9.1 的 5 字段解析，
+  不引入第三方库。
+- `webhook` 创建时生成随机 token，**只在创建/重置的响应里返回一次**；
+  磁盘只保存 `sha256` 与末 4 位 `token_hint`，列表/详情只回显 `token_hint`。
+- `enabled=false` 不参与定时/webhook 触发，但仍允许显式 run-now。
+- **禁止重叠**：同一 trigger 上次 job 仍 `queued/running` 时，本次触发只写
+  `skipped_overlap` 事件并返回 `{"status":"skipped_overlap"}`，不产生新 job。
+- **重启恢复**：启动时按磁盘重算 `next_run_at`；已经错过的时点只写 `missed`，
+  不补跑。
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/api/studio/{wid}/triggers` | `{triggers:[...]}`；不含 token 原文/哈希 |
+| POST | `/api/studio/{wid}/triggers` | 201；body `{workflow_ref,kind,schedule?|interval?,env_override?}`；webhook 另含一次性 `webhook.token` |
+| PATCH | `/api/triggers/{tid}` | 200；`{enabled?,schedule?,interval?,env_override?,regenerate_token?}`；重置 token 时返回一次新 `webhook.token` |
+| DELETE | `/api/triggers/{tid}` | 204；只删 trigger，保留历史 run/execution |
+| POST | `/api/triggers/{tid}/run` | 202；`{trigger_id,job_id,status:"queued",trigger:"manual"}` |
+| POST | `/api/hooks/workflow/{token}` | 202；body `{env?,payload?}`，`payload` 原样写入 trigger 事件（按 §3 规则打码） |
+
+- webhook token 无效 → **404**；trigger `enabled=false` → **409**。
+- `/api/hooks/workflow/*` 与其他 `/api/hooks/*` 一样不要求登录。
+- 归因：job/execution 记录 `mode="workflow"`、
+  `trigger ∈ manual|schedule|webhook`、`workflow_ref`、`trigger_id`。
+  `execution.json` 顶层含这些字段，报告 `meta` 与 `meta.run_config` 同样携带；
+  `/api/runs/{id}` 可据此回溯到具体触发器。
+
 ## 10. 任务产出物（v8.0，契约 §2）
 
 ### 10.1 概念与落盘

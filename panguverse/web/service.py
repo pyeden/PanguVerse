@@ -422,6 +422,7 @@ def submit_run(
     *,
     on_finish: Callable[[Job], None] | None = None,
     trigger: str | None = None,
+    extra_meta: dict[str, Any] | None = None,
 ) -> Job:
     request = parse_run_request(payload)
     if request.mode == "demo":
@@ -434,7 +435,9 @@ def submit_run(
     if request.mode == "workflow":
         return jobs.submit(
             "workflow",
-            _workflow_task(root, request, trigger=trigger),
+            _workflow_task(
+                root, request, trigger=trigger, extra_meta=extra_meta
+            ),
             on_finish=on_finish,
         )
     return jobs.submit("regression", _regression_task(root, request), on_finish=on_finish)
@@ -628,6 +631,7 @@ def _workflow_task(
         request_env = dict(request.env)
         axe = build_axe(root, enable_llm=False)
         trigger_name = trigger or ("manual" if attribution is None else "task")
+        trigger_id = (extra_meta or {}).get("trigger_id")
         return _execute(
             axe,
             job,
@@ -647,9 +651,15 @@ def _workflow_task(
                 "no_llm": True,
                 "uses_mock": False,
                 "trigger": trigger_name,
+                "trigger_id": trigger_id,
             },
             attribution=attribution,
-            extra_meta={"workflow_ref": request.workflow_ref, **(extra_meta or {})},
+            extra_meta={
+                "workflow_ref": request.workflow_ref,
+                "trigger_id": trigger_id,
+                "trigger": trigger_name,
+                **(extra_meta or {}),
+            },
         )
 
     return task
@@ -965,6 +975,8 @@ def _write_execution_record(
             or config.get("workflow_ref"),
             "schedule_id": (extra_meta or {}).get("schedule_id")
             or config.get("schedule_id"),
+            "trigger_id": (extra_meta or {}).get("trigger_id")
+            or config.get("trigger_id"),
             "created_at": time.time(),
         }
         path = directory / "execution.json"

@@ -38,6 +38,7 @@ import type {
   Workflow,
 } from '../shared/types'
 import { Icon } from '../components/Icon'
+import { TriggerPanel, WorkflowRunsPanel } from '../components/TriggerPanel'
 import {
   Badge,
   Button,
@@ -228,10 +229,21 @@ export function StudioCanvasPage({ wid }: { wid: string }) {
   )
 }
 
+type StudioTab = 'canvas' | 'triggers' | 'runs'
+
 function StudioCanvasInner({ wid }: { wid: string }) {
   const route = useRoute()
   const queryClient = useQueryClient()
   const { push } = useToast()
+  const tabParam = route.query.get('tab')
+  const tab: StudioTab = tabParam === 'triggers' || tabParam === 'runs' ? tabParam : 'canvas'
+  const setTab = (next: StudioTab) => {
+    const params = new URLSearchParams(route.query)
+    if (next === 'canvas') params.delete('tab')
+    else params.set('tab', next)
+    const qs = params.toString()
+    navigate(`/studio/${wid}${qs ? `?${qs}` : ''}`, { replace: true })
+  }
   const [mock, setMock] = useState(isStudioMock())
   const [nodes, setNodes] = useState<AtomFlowNode[]>([])
   const [edges, setEdges] = useState<Edge[]>([])
@@ -984,6 +996,22 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         </div>
       </div>
 
+      <nav className="studio-tabs" aria-label="流程视图" data-testid="studio-tabs">
+        <button type="button" className={tab === 'canvas' ? 'is-active' : ''} aria-current={tab === 'canvas' ? 'page' : undefined} onClick={() => setTab('canvas')}>
+          <Icon name="flow" size={14} />Canvas
+        </button>
+        <button type="button" className={tab === 'triggers' ? 'is-active' : ''} aria-current={tab === 'triggers' ? 'page' : undefined} onClick={() => setTab('triggers')}>
+          <Icon name="clock" size={14} />Triggers
+        </button>
+        <button type="button" className={tab === 'runs' ? 'is-active' : ''} aria-current={tab === 'runs' ? 'page' : undefined} onClick={() => setTab('runs')}>
+          <Icon name="history" size={14} />Runs
+        </button>
+        <span className="studio-tabs-hint">
+          {workflow.published_ref ? <><Icon name="git" size={12} /><code>{workflow.published_ref}</code></> : '尚未发布'}
+        </span>
+      </nav>
+
+      {tab === 'canvas' ? (
       <div
         className={`studio-workbench ${debugOpen ? 'is-debug-open' : 'is-debug-closed'} ${debugResizing ? 'is-resizing' : ''} ${nodeRailCollapsed ? 'is-node-collapsed' : ''}`}
         style={{ '--debug-w': debugOpen ? `${debugWidth}px` : '44px', '--props-w': nodeRailCollapsed ? '38px' : '300px' } as CSSProperties}
@@ -1551,6 +1579,15 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         </aside>
         )}
       </div>
+      ) : tab === 'triggers' ? (
+        <div className="studio-tab-panel">
+          <TriggerPanel wid={wid} workflowRef={workflow.published_ref || ''} />
+        </div>
+      ) : (
+        <div className="studio-tab-panel">
+          <WorkflowRunsPanel wid={wid} workflowRef={workflow.published_ref || ''} />
+        </div>
+      )}
 
       <Modal
         open={addOpen}

@@ -201,6 +201,55 @@ export interface ScheduleRunResult {
   batch_id: string
 }
 
+export type TriggerKind = 'schedule' | 'interval' | 'webhook'
+
+export interface TriggerSchedule {
+  cron: string
+  tz?: string
+}
+
+export interface TriggerInterval {
+  minutes: number
+}
+
+export interface WorkflowTrigger {
+  trigger_id: string
+  workflow_ref: string
+  kind: TriggerKind | string
+  enabled: boolean
+  schedule?: TriggerSchedule
+  interval?: TriggerInterval
+  webhook?: { token_hint?: string }
+  next_run_at?: number | string | null
+  last_status?: string | null
+  last_job_id?: string | null
+  env_override?: AnyRecord
+  created_at?: number
+  updated_at?: number
+}
+
+export interface WorkflowTriggerCreate {
+  workflow_ref: string
+  kind: TriggerKind
+  schedule?: TriggerSchedule
+  interval?: TriggerInterval
+  env_override?: AnyRecord
+}
+
+export interface WorkflowTriggerPatch {
+  enabled?: boolean
+  schedule?: TriggerSchedule
+  interval?: TriggerInterval
+  env_override?: AnyRecord
+  regenerate_token?: boolean
+}
+
+export interface WorkflowTriggerResult {
+  trigger: WorkflowTrigger
+  /** Webhook token in plaintext. Only returned on create / regenerate. */
+  token?: string
+}
+
 export interface Artifact {
   artifact_id: string
   run_id: string

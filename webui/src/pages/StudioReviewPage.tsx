@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { studioApi, isStudioMock, onStudioMockChange, normalizeDiff } from '../shared/api'
+import { api, studioApi, isStudioMock, onStudioMockChange, normalizeDiff } from '../shared/api'
 import { navigate, href, useRoute } from '../shared/router'
 import { formatTime, pretty, relativeTime } from '../shared/utils'
-import type { AnyRecord, DiffItem, Risk, StudioDiff } from '../shared/types'
+import type { AnyRecord, DiffItem, Risk, StudioDiff, TriggerKind } from '../shared/types'
 import { Icon } from '../components/Icon'
+import { TriggerPanel } from '../components/TriggerPanel'
 import {
   Badge,
   Button,
@@ -32,6 +33,8 @@ export function StudioReviewPage({ wid }: { wid: string }) {
   const [expandedItem, setExpandedItem] = useState<DiffItem | null>(null)
   const [localPublishedRef, setLocalPublishedRef] = useState('')
   const [proposal, setProposal] = useState<AnyRecord | null>(null)
+  const [publishedTaskId, setPublishedTaskId] = useState('')
+  const [createSignal, setCreateSignal] = useState<{ kind: TriggerKind; seq: number } | null>(null)
   const workflowQuery = useQuery({ queryKey: ['studio-workflow', wid], queryFn: () => studioApi.getWorkflow(wid), enabled: !!wid })
   const workflow = workflowQuery.data
   const requestedBase = Number(route.query.get('base') || 0)
@@ -88,6 +91,14 @@ export function StudioReviewPage({ wid }: { wid: string }) {
   const publishedRef = localPublishedRef || workflow?.published_ref || ''
   const displayState = publishedRef ? 'published' : state
   const reviewedRev = rev
+  const publishedTasksQuery = useQuery({
+    queryKey: ['tasks', 'workflow-ref', publishedRef],
+    queryFn: () => api.tasks(),
+    enabled: !!publishedRef && !publishedTaskId,
+  })
+  const runnableTaskId = publishedTaskId
+    || (publishedTasksQuery.data || []).find((task) => task.workflow_ref === publishedRef)?.task_id
+    || ''
 
   const setState = useMutation({
     mutationFn: ({ to, text }: { to: 'review' | 'approved' | 'rejected'; text: string }) => studioApi.setState(wid, to, text, requiredRisks.map((risk, index) => risk.id || `risk-${index}`)),
@@ -114,21 +125,28 @@ export function StudioReviewPage({ wid }: { wid: string }) {
     mutationFn: () => studioApi.publish(wid, reviewedRev, message.trim()),
     onSuccess: (result) => {
       setLocalPublishedRef(result.workflow_ref)
+      if (result.task?.task_id) setPublishedTaskId(result.task.task_id)
       queryClient.invalidateQueries({ queryKey: ['studio-workflow', wid] })
-      const tasksRefresh = queryClient.invalidateQueries({ queryKey: ['tasks'] })
+      queryClient.invalidateQueries({ queryKey: ['tasks'] })
       queryClient.invalidateQueries({ queryKey: ['studio-drafts'] })
-      const taskId = result.task?.task_id
-      if (taskId) {
-        // 新任务已由后端创建；等任务列表刷新后再进入详情，避免详情页找不到任务。
-        push('已发布并已创建任务', 'ok')
-        void tasksRefresh.finally(() => navigate(`/tasks?focus=${encodeURIComponent(taskId)}`))
-      } else {
-        // 旧服务 / mock 未返回 task：保留成功横幅与手动创建入口。
-        push(`已发布：${result.workflow_ref}`, 'ok')
-      }
+      // 留在发布页，让用户直接立即运行或创建触发器；旧服务 / mock 没有 task 时仍保留「去任务」入口。
+      push(result.task?.task_id ? '已发布并已创建任务' : `已发布：${result.workflow_ref}`, 'ok')
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
+
+  const runPublished = useMutation({
+    mutationFn: (taskId: string) => api.runTask(taskId, {}),
+    onSuccess: (result) => {
+      push(`已开始运行 · ${result.job_id}`, 'ok')
+      navigate(`/executions?job=${encodeURIComponent(result.job_id)}`)
+    },
+    onError: (error: Error) => push(error.message, 'error'),
+  })
+
+  const requestCreate = (kind: TriggerKind) => {
+    setCreateSignal((current) => ({ kind, seq: (current?.seq || 0) + 1 }))
+  }
 
   const approveNote = () => {
     const ackText = requiredRisks.map((risk, index) => risk.id || `risk-${index}`).join(', ')
@@ -187,11 +205,44 @@ export function StudioReviewPage({ wid }: { wid: string }) {
       </div>
 
       {publishedRef ? (
-        <div className="publish-success">
-          <span className="publish-success-icon"><Icon name="check" size={22} /></span>
-          <div><strong>流程已发布为 {publishedRef}</strong><p>版本不可变。任务可以绑定项目环境后运行，报告会携带该 workflow_ref 回溯到本次审阅。</p></div>
-          <Button size="sm" variant="primary" icon="tasks" onClick={() => navigate(`/tasks?published=${encodeURIComponent(publishedRef)}`)}>去任务</Button>
-        </div>
+        <>
+          <div className="publish-success">
+            <span className="publish-success-icon"><Icon name="check" size={22} /></span>
+            <div><strong>流程已发布为 {publishedRef}</strong><p>版本不可变。可立即运行，或创建触发器后无需离开本页管理；报告会携带该 workflow_ref 回溯到本次审阅。</p></div>
+            <Button size="sm" variant="ghost" icon="tasks" onClick={() => navigate(`/tasks?published=${encodeURIComponent(publishedRef)}`)}>去任务</Button>
+          </div>
+          <div className="publish-next" data-testid="publish-next-actions">
+            <div className="publish-next-head">
+              <div>
+                <span className="trigger-kicker">下一步</span>
+                <h3>立即运行或创建触发器</h3>
+              </div>
+              <div className="publish-next-actions">
+                <Button
+                  size="sm"
+                  variant="primary"
+                  icon="play"
+                  loading={runPublished.isPending}
+                  disabled={!runnableTaskId}
+                  title={runnableTaskId ? '立即运行该发布版本' : '当前后端未返回可运行对象；可创建触发器后运行'}
+                  onClick={() => runnableTaskId && runPublished.mutate(runnableTaskId)}
+                >立即运行</Button>
+                <Button size="sm" variant="ghost" icon="clock" onClick={() => requestCreate('schedule')}>创建定时</Button>
+                <Button size="sm" variant="ghost" icon="link" onClick={() => requestCreate('webhook')}>创建 Webhook</Button>
+              </div>
+            </div>
+            {!runnableTaskId && !publishedTasksQuery.isLoading ? (
+              <p className="publish-next-hint">当前服务没有返回可运行对象；创建触发器后可在触发器行内「立即运行」。</p>
+            ) : null}
+            <TriggerPanel
+              wid={wid}
+              workflowRef={publishedRef}
+              compact
+              showCreateActions={false}
+              createSignal={createSignal}
+            />
+          </div>
+        </>
       ) : null}
 
       <div className="review-layout">

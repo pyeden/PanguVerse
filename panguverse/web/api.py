@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
 from ..report import html_report, junit
-from . import artifacts, executions, reports, schedules, service, studio
+from . import artifacts, executions, reports, schedules, service, studio, triggers
 from .artifacts import ArtifactError
 from .auth import AuthManager, build_cookie
 from .batches import BatchManager
@@ -534,6 +534,29 @@ class WebAPI:
                         env=_schedule_env(body),
                     )
                     return json_response(result, status=202)
+            if head == "triggers" and len(rest) == 2 and rest[1] == "run":
+                result = triggers.run_trigger(
+                    self.root,
+                    rest[0],
+                    self.jobs,
+                    trigger="manual",
+                    env=_schedule_env(body),
+                )
+                return json_response(result, status=202)
+            if head == "hooks" and len(rest) == 2 and rest[0] == "workflow":
+                trigger = triggers.find_by_token(self.root, rest[1])
+                if not trigger.get("enabled"):
+                    raise ScheduleError("conflict", "触发器已禁用", status=409)
+                payload = body.get("payload") if isinstance(body, dict) else None
+                result = triggers.run_trigger(
+                    self.root,
+                    trigger["trigger_id"],
+                    self.jobs,
+                    trigger="webhook",
+                    env=_schedule_env(body),
+                    payload=payload,
+                )
+                return json_response(result, status=202)
             if head == "hooks" and len(rest) == 1:
                 schedule = schedules.find_by_webhook_token(self.root, rest[0])
                 if not schedule.get("enabled"):
@@ -563,6 +586,8 @@ class WebAPI:
                 return json_response(service.update_task(self.root, rest[0], body))
             if head == "schedules" and len(rest) == 1:
                 return json_response(schedules.update_schedule(self.root, rest[0], body))
+            if head == "triggers" and len(rest) == 1:
+                return json_response(triggers.update_trigger(self.root, rest[0], body))
         elif method == "DELETE":
             if head == "projects":
                 if len(rest) == 1:
@@ -582,6 +607,9 @@ class WebAPI:
                 )
             if head == "schedules" and len(rest) == 1:
                 schedules.delete_schedule(self.root, rest[0])
+                return _no_content()
+            if head == "triggers" and len(rest) == 1:
+                triggers.delete_trigger(self.root, rest[0])
                 return _no_content()
             if head == "artifacts" and len(rest) == 2 and rest[1] == "share":
                 artifacts.revoke_all_shares(self.root, rest[0])
@@ -638,6 +666,18 @@ class WebAPI:
                         status=_first(query, "status"),
                         domain_pack=_first(query, "domain_pack"),
                     )
+                )
+            raise ApiError("not_found", "接口不存在")
+
+        if len(rest) == 2 and rest[1] == "triggers":
+            wid = rest[0]
+            if method == "GET":
+                return json_response(
+                    {"triggers": triggers.list_triggers(self.root, wid)}
+                )
+            if method == "POST":
+                return json_response(
+                    triggers.create_trigger(self.root, wid, body), status=201
                 )
             raise ApiError("not_found", "接口不存在")
 

@@ -9,7 +9,9 @@
 - **禁止重叠**：同一 sid 的上一次 batch 仍在 ``queued/running`` 时，
   本次触发只记录 ``skipped_overlap`` 事件，不产生新 batch；
 - **重启不补跑**：启动时从磁盘恢复并按当前时间重算 ``next_run_at``，
-  已错过的时点只写 ``missed`` 事件。
+  已错过的时点只写 ``missed`` 事件；
+- **两套存储**：项目级调度（``schedules/``）与 workflow 级触发器
+  （``triggers/``，见 :mod:`panguverse.web.triggers`）由同一个调度线程扫描。
 
 落盘：``<workspace>/.panguverse/schedules/<sid>.json``（目录 0700、文件 0600、原子写），
 事件追加到 ``<workspace>/.panguverse/schedules/events.jsonl``。
@@ -857,6 +859,16 @@ class Scheduler:
                     )
             schedule["next_run_at"] = upcoming
             self._persist(schedule)
+        # 两套存储统一扫描：workflow 级触发器在同一次恢复里重算，不补跑
+        self._recover_workflow_triggers(now=moment)
+
+    def _recover_workflow_triggers(self, *, now: float) -> None:
+        from . import triggers as triggers_mod  # 局部导入：避免模块级循环
+
+        try:
+            triggers_mod.recover(self.root, now=now)
+        except Exception as exc:  # noqa: BLE001 - 触发器恢复失败不能阻断项目调度
+            LOGGER.warning("workflow 触发器恢复失败: %s", exc)
 
     def _persist(self, schedule: dict[str, Any]) -> None:
         with _LOCK:
@@ -888,6 +900,13 @@ class Scheduler:
             finally:
                 if sid:
                     self._advance_if_due(sid, moment)
+        # workflow 级触发器：自己负责到期判定、重叠与 next_run_at 推进
+        try:
+            from . import triggers as triggers_mod
+
+            fired.extend(triggers_mod.tick(self.root, self.jobs, now=moment))
+        except Exception as exc:  # noqa: BLE001 - 单套存储失败不拖垮另一套
+            self._record_tick_error("", exc, moment)
         return fired
 
     def _tick_one(
@@ -1027,6 +1046,18 @@ class Scheduler:
             for item in _all_schedules(self.root, include_disabled=False)
             if isinstance(item.get("next_run_at"), (int, float))
         ]
+        try:
+            from . import triggers as triggers_mod
+
+            nexts.extend(
+                float(item["next_run_at"])
+                for item in triggers_mod._all_triggers(self.root, include_disabled=False)
+                if item.get("kind") == "schedule"
+                and isinstance(item.get("next_run_at"), (int, float))
+                and not isinstance(item.get("next_run_at"), bool)
+            )
+        except Exception:  # noqa: BLE001 - 状态展示尽力而为
+            pass
         if not nexts:
             return None
         return max(0.0, min(nexts) - float(self.clock()))

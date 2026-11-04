@@ -33,6 +33,10 @@ import type {
   Artifact,
   ArtifactPageData,
   ArtifactShare,
+  WorkflowTrigger,
+  WorkflowTriggerCreate,
+  WorkflowTriggerPatch,
+  WorkflowTriggerResult,
 } from './types'
 
 export class ApiError extends Error {
@@ -394,6 +398,43 @@ function encode(value: string): string {
   return encodeURIComponent(value)
 }
 
+function normalizeTrigger(payload: AnyRecord): WorkflowTrigger {
+  const record = (payload?.trigger && typeof payload.trigger === 'object' ? payload.trigger : payload) as AnyRecord
+  const rawSchedule = record?.schedule && typeof record.schedule === 'object' ? record.schedule as AnyRecord : null
+  const rawInterval = record?.interval && typeof record.interval === 'object' ? record.interval as AnyRecord : null
+  const rawWebhook = record?.webhook && typeof record.webhook === 'object' ? record.webhook as AnyRecord : null
+  return {
+    ...record,
+    trigger_id: String(record?.trigger_id || record?.id || record?.tid || ''),
+    workflow_ref: String(record?.workflow_ref || record?.ref || ''),
+    kind: String(record?.kind || record?.type || ''),
+    enabled: record?.enabled !== false,
+    schedule: rawSchedule
+      ? { cron: String(rawSchedule.cron ?? rawSchedule.expr ?? ''), tz: rawSchedule.tz ? String(rawSchedule.tz) : undefined }
+      : undefined,
+    interval: rawInterval
+      ? { minutes: Number(rawInterval.minutes ?? rawInterval.min ?? 0) }
+      : undefined,
+    webhook: rawWebhook
+      ? { token_hint: rawWebhook.token_hint ? String(rawWebhook.token_hint) : undefined }
+      : undefined,
+    next_run_at: record?.next_run_at ?? null,
+    last_status: record?.last_status ?? null,
+    last_job_id: record?.last_job_id ?? null,
+  } as WorkflowTrigger
+}
+
+function triggerResult(payload: AnyRecord): WorkflowTriggerResult {
+  const record = (payload?.trigger && typeof payload.trigger === 'object' ? payload.trigger : payload) as AnyRecord
+  const rawWebhook = record?.webhook && typeof record.webhook === 'object' ? record.webhook as AnyRecord : null
+  const payloadWebhook = payload?.webhook && typeof payload.webhook === 'object' ? payload.webhook as AnyRecord : null
+  const token = rawWebhook?.token || payloadWebhook?.token || payload?.token
+  return {
+    trigger: normalizeTrigger(record || {}),
+    token: token ? String(token) : undefined,
+  }
+}
+
 export const studioApi = {
   async listDrafts(): Promise<Workflow[]> {
     const mode = await ensureStudioMode()
@@ -626,6 +667,45 @@ export const studioApi = {
         return mockPublish(wid, rev, message)
       },
     )
+  },
+
+  /* Workflow triggers ------------------------------------------------------ */
+
+  async listTriggers(wid: string): Promise<WorkflowTrigger[]> {
+    const payload = await request<AnyRecord>(`api/studio/${encode(wid)}/triggers`)
+    const items = Array.isArray(payload) ? payload : payload.triggers || payload.items || []
+    return (items as AnyRecord[]).map(normalizeTrigger)
+  },
+
+  async createTrigger(wid: string, body: WorkflowTriggerCreate): Promise<WorkflowTriggerResult> {
+    const payload = await request<AnyRecord>(`api/studio/${encode(wid)}/triggers`, {
+      method: 'POST',
+      body,
+    })
+    return triggerResult(payload)
+  },
+
+  async updateTrigger(tid: string, body: WorkflowTriggerPatch): Promise<WorkflowTriggerResult> {
+    const payload = await request<AnyRecord>(`api/triggers/${encode(tid)}`, {
+      method: 'PATCH',
+      body,
+    })
+    return triggerResult(payload)
+  },
+
+  async deleteTrigger(tid: string): Promise<null> {
+    return request<null>(`api/triggers/${encode(tid)}`, { method: 'DELETE' })
+  },
+
+  async runTrigger(tid: string): Promise<{ job_id: string; status: string }> {
+    return request<{ job_id: string; status: string }>(`api/triggers/${encode(tid)}/run`, {
+      method: 'POST',
+      body: {},
+    })
+  },
+
+  async regenerateTriggerToken(tid: string): Promise<WorkflowTriggerResult> {
+    return this.updateTrigger(tid, { regenerate_token: true })
   },
 }
 

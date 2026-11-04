@@ -220,6 +220,8 @@ export function classForStatus(status: string): string {
     none: 'dim',
     partial: 'warn',
     warning: 'warn',
+    skipped_overlap: 'warn',
+    trigger_failed: 'bad',
   }
   return map[status] || 'dim'
 }
@@ -248,6 +250,8 @@ export function statusLabel(status: string | undefined): string {
     cancelled: '已取消',
     cancelling: '取消中',
     warning: '警告',
+    skipped_overlap: '已跳过',
+    trigger_failed: '触发失败',
   }
   return map[status || 'none'] || status || '未知'
 }
