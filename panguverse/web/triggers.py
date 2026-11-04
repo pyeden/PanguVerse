@@ -152,9 +152,25 @@ def list_triggers(root: Path, wid: str) -> list[dict[str, Any]]:
     return [public_trigger(item) for item in ordered]
 
 
+def _mask_env_override(value: Any) -> Any:
+    """API 出口复用 env 子树的敏感键打码规则（磁盘文件保持明文）。"""
+    if not isinstance(value, dict):
+        return value
+    try:
+        from .api import mask_env_payload  # 运行时局部导入，避免模块级循环
+
+        masked = mask_env_payload({"env": value})
+        result = masked.get("env") if isinstance(masked, dict) else None
+        return result if isinstance(result, dict) else value
+    except Exception:  # noqa: BLE001 - 打码失败不能阻断响应
+        return value
+
+
 def public_trigger(trigger: dict[str, Any], *, webhook_token: str | None = None) -> dict[str, Any]:
     """对外安全视图：去掉 token 哈希，只留提示；创建/重置时附带一次原文。"""
     data = json.loads(json.dumps(trigger, ensure_ascii=False, default=str))
+    if isinstance(data.get("env_override"), dict):
+        data["env_override"] = _mask_env_override(data["env_override"])
     if data.get("kind") == "webhook":
         webhook = data.get("webhook") if isinstance(data.get("webhook"), dict) else {}
         hint = str(webhook.get("token_hint") or "")
@@ -539,87 +555,127 @@ def run_trigger(
     payload: Any = None,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """真正启动一次 workflow job；``trigger`` ∈ ``manual|schedule|webhook``。"""
+    """真正启动一次 workflow job；``trigger`` ∈ ``manual|schedule|webhook``。
+
+    「活跃检查 → 预留 → 提交 job → 回写 last_job_id」全程持有模块锁，保证并发
+    run-now / webhook 只有一个能穿过；后到者返回 ``skipped_overlap``。
+    对 manual/webhook 额外比较请求进入时间与上次 ``last_run_at``：同一并发波次
+    里即使前一个 job 已经飞快跑完，后到请求也不会再起一个 job。调度 tick 的
+    语义保持原样（只看上次 job 是否仍活跃）。
+    """
     if trigger not in ("manual", "schedule", "webhook"):
         raise _error("bad_request", f"trigger 非法: {trigger!r}")
-    moment = time.time() if now is None else float(now)
+    request_started = time.time()
+    moment = request_started if now is None else float(now)
+    from . import service  # 局部导入：避免模块级循环
+
     with _LOCK:
         item = read_trigger(root, tid)
         if not item.get("enabled") and trigger != "manual":
             raise _error("conflict", "触发器已禁用", status=409)
         if _job_active(jobs, item.get("last_job_id")):
-            append_event(
-                root,
-                tid,
-                "skipped_overlap",
-                {"job_id": item.get("last_job_id"), "trigger": trigger},
-            )
-            item["last_status"] = "skipped_overlap"
-            item["updated_at"] = moment
-            schedules._atomic_write(_trigger_path(root, tid), item)
-            return {
-                "trigger_id": tid,
-                "status": "skipped_overlap",
-                "job_id": None,
-                "trigger": trigger,
-            }
+            return _skip_overlap(root, tid, item, trigger, moment, reason="running")
+        previous_last_run = item.get("last_run_at")
+        if (
+            trigger != "schedule"
+            and now is None
+            and _is_epoch(previous_last_run)
+            and float(previous_last_run) >= request_started
+        ):
+            # 同一并发波次：后到请求的进入时间不晚于前一次提交时间
+            return _skip_overlap(root, tid, item, trigger, moment, reason="concurrent")
+
         merged_env = {**(item.get("env_override") or {}), **(env or {})}
-        # 先落 last_run_at：即使提交后进程崩溃，同一时点也不会重复触发
+        # 预留：先落 last_run_at/last_status，崩溃重启后按 interrupted 处理
         item["last_run_at"] = moment
-        item["last_status"] = "queued"
+        item["last_status"] = "submitting"
         item["updated_at"] = moment
         schedules._atomic_write(_trigger_path(root, tid), item)
         workflow_ref = item["workflow_ref"]
 
-    from . import service  # 局部导入：避免模块级循环
+        try:
+            job = service.submit_run(
+                jobs,
+                root,
+                {"mode": "workflow", "workflow_ref": workflow_ref, "env": merged_env},
+                trigger=trigger,
+                extra_meta={"workflow_ref": workflow_ref, "trigger_id": tid},
+                on_finish=lambda finished: _mark_finished(root, tid, finished),
+            )
+        except service.ApiError as exc:
+            # 清理预留，避免一次失败把后续触发永久挡住
+            item["last_run_at"] = previous_last_run
+            item["last_status"] = "trigger_failed"
+            item["updated_at"] = time.time()
+            schedules._atomic_write(_trigger_path(root, tid), item)
+            append_event(
+                root, tid, "trigger_failed", {"trigger": trigger, "message": exc.message}
+            )
+            raise _error(exc.code, exc.message, status=exc.status) from exc
+        except Exception as exc:
+            item["last_run_at"] = previous_last_run
+            item["last_status"] = "trigger_failed"
+            item["updated_at"] = time.time()
+            schedules._atomic_write(_trigger_path(root, tid), item)
+            append_event(
+                root,
+                tid,
+                "trigger_failed",
+                {"trigger": trigger, "message": type(exc).__name__},
+            )
+            raise
 
-    try:
-        job = service.submit_run(
-            jobs,
-            root,
-            {"mode": "workflow", "workflow_ref": workflow_ref, "env": merged_env},
-            trigger=trigger,
-            extra_meta={"workflow_ref": workflow_ref, "trigger_id": tid},
-            on_finish=lambda finished: _mark_finished(root, tid, finished),
-        )
-    except service.ApiError as exc:
-        _mark_status(root, tid, "trigger_failed")
-        append_event(
-            root, tid, "trigger_failed", {"trigger": trigger, "message": exc.message}
-        )
-        raise _error(exc.code, exc.message, status=exc.status) from exc
-    except Exception as exc:
-        _mark_status(root, tid, "trigger_failed")
-        append_event(
-            root,
-            tid,
-            "trigger_failed",
-            {"trigger": trigger, "message": type(exc).__name__},
-        )
-        raise
-
-    with _LOCK:
-        item = read_trigger(root, tid)
-        item["last_run_at"] = moment
         item["last_job_id"] = job.job_id
         item["last_status"] = str(job.status or "queued")
         item["updated_at"] = moment
         schedules._atomic_write(_trigger_path(root, tid), item)
 
-    detail: dict[str, Any] = {
-        "trigger": trigger,
-        "job_id": job.job_id,
-        "workflow_ref": workflow_ref,
-    }
-    if env:
-        detail["env"] = env
-    if payload is not None:
-        detail["payload"] = payload
-    append_event(root, tid, "triggered", detail)
+        detail: dict[str, Any] = {
+            "trigger": trigger,
+            "job_id": job.job_id,
+            "workflow_ref": workflow_ref,
+        }
+        if env:
+            detail["env"] = env
+        if payload is not None:
+            detail["payload"] = payload
+        append_event(root, tid, "triggered", detail)
+        job_id = job.job_id
+
     return {
         "trigger_id": tid,
-        "job_id": job.job_id,
+        "job_id": job_id,
         "status": "queued",
+        "trigger": trigger,
+    }
+
+
+def _is_epoch(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _skip_overlap(
+    root: Path,
+    tid: str,
+    item: dict[str, Any],
+    trigger: str,
+    moment: float,
+    *,
+    reason: str,
+) -> dict[str, Any]:
+    append_event(
+        root,
+        tid,
+        "skipped_overlap",
+        {"job_id": item.get("last_job_id"), "trigger": trigger, "reason": reason},
+    )
+    item["last_status"] = "skipped_overlap"
+    item["updated_at"] = moment
+    schedules._atomic_write(_trigger_path(root, tid), item)
+    return {
+        "trigger_id": tid,
+        "status": "skipped_overlap",
+        "job_id": None,
         "trigger": trigger,
     }
 
@@ -641,17 +697,6 @@ def _mark_finished(root: Path, tid: str, job: Any) -> None:
         return
 
 
-def _mark_status(root: Path, tid: str, status: str) -> None:
-    try:
-        with _LOCK:
-            item = read_trigger(root, tid)
-            item["last_status"] = status
-            item["updated_at"] = time.time()
-            schedules._atomic_write(_trigger_path(root, tid), item)
-    except ScheduleError:
-        return
-
-
 # --------------------------------------------------------------------------- #
 # 调度线程集成
 # --------------------------------------------------------------------------- #
@@ -660,6 +705,10 @@ def recover(root: Path, *, now: float | None = None) -> None:
     moment = time.time() if now is None else float(now)
     for trigger in _all_triggers(root):
         tid = trigger["trigger_id"]
+        if trigger.get("last_status") == "submitting":
+            # 提交前崩溃：清掉预留，避免误判为一直有任务在跑
+            trigger["last_status"] = "interrupted"
+            _persist(root, trigger)
         if trigger.get("kind") != "schedule":
             if trigger.get("next_run_at") is not None:
                 trigger["next_run_at"] = None

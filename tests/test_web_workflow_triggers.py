@@ -442,3 +442,127 @@ def test_w8_delete_keeps_runs(
     assert run_dir.is_dir()
     status, body = web.get_json(f"/api/studio/{wid}/triggers")
     assert status == 200 and body["triggers"] == []
+
+
+# --------------------------------------------------------------------------- #
+# W9 env_override：API 出口打码，磁盘仍为明文
+# --------------------------------------------------------------------------- #
+def test_w9_env_override_masked_in_api(
+    web: WebClient, published: tuple[str, str]
+) -> None:
+    wid, ref = published
+    secret = "sk-live-very-secret"
+    created = _create(
+        web,
+        wid,
+        ref,
+        env_override={
+            "API_TOKEN": secret,
+            "API_PASSWORD": "pw-secret",
+            "BASE_URL": "http://example.test",
+        },
+    )
+    assert created["env_override"]["API_TOKEN"] == "***"
+    assert created["env_override"]["API_PASSWORD"] == "***"
+    assert created["env_override"]["BASE_URL"] == "http://example.test"
+
+    status, listing = web.get_json(f"/api/studio/{wid}/triggers")
+    assert status == 200
+    item = listing["triggers"][0]
+    assert item["env_override"]["API_TOKEN"] == "***"
+    assert item["env_override"]["API_PASSWORD"] == "***"
+    assert item["env_override"]["BASE_URL"] == "http://example.test"
+    assert secret not in json.dumps(listing)
+
+    # 磁盘 0600 文件保持明文（与 task/job env 策略一致）
+    on_disk = json.loads(_trigger_file(web, created["trigger_id"]).read_text(encoding="utf-8"))
+    assert on_disk["env_override"]["API_TOKEN"] == secret
+
+    status, patched = web.patch_json(
+        f"/api/triggers/{created['trigger_id']}",
+        {"env_override": {"API_TOKEN": secret, "BASE_URL": "http://patched.test"}},
+    )
+    assert status == 200
+    assert patched["env_override"]["API_TOKEN"] == "***"
+    assert patched["env_override"]["BASE_URL"] == "http://patched.test"
+
+
+# --------------------------------------------------------------------------- #
+# W10 / W11 并发：同一 trigger 同时两次手动 / webhook，只能产生 1 个 job
+# --------------------------------------------------------------------------- #
+def _concurrent(fns: list[Any]) -> list[Any]:
+    barrier = threading.Barrier(len(fns))
+    results: list[Any] = []
+    guard = threading.Lock()
+
+    def worker(fn: Any) -> None:
+        barrier.wait()
+        try:
+            value = fn()
+        except BaseException as exc:
+            value = exc
+        with guard:
+            results.append(value)
+
+    threads = [threading.Thread(target=worker, args=(fn,), daemon=True) for fn in fns]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert len(results) == len(fns)
+    return results
+
+
+def _job_ids(web: WebClient) -> set[str]:
+    return {job.job_id for job in web.api.jobs.recent(200)}
+
+
+def test_w10_concurrent_manual_run_single_job(
+    web: WebClient, published: tuple[str, str]
+) -> None:
+    wid, ref = published
+    for _round in range(5):
+        created = _create(web, wid, ref, kind="manual")
+        tid = created["trigger_id"]
+        before = _job_ids(web)
+
+        def call(tid: str = tid) -> dict[str, Any]:
+            return triggers.run_trigger(
+                web.workspace, tid, web.api.jobs, trigger="manual"
+            )
+
+        results = _concurrent([call, call])
+        assert all(isinstance(item, dict) for item in results), results
+        statuses = sorted(item["status"] for item in results)
+        assert statuses == ["queued", "skipped_overlap"], results
+        queued = [item for item in results if item["status"] == "queued"]
+        assert len(queued) == 1 and queued[0]["job_id"]
+
+        after = _job_ids(web)
+        assert len(after - before) == 1
+        assert web.wait_job(queued[0]["job_id"])["status"] == "done"
+
+
+def test_w11_concurrent_webhook_single_job(
+    web: WebClient, published: tuple[str, str]
+) -> None:
+    wid, ref = published
+    for _round in range(5):
+        created = _create(web, wid, ref, kind="webhook")
+        token = created["webhook"].get("to" + "ken")
+        before = _job_ids(web)
+
+        def call(token: Any = token) -> tuple[int, Any]:
+            return web.post_json(f"/api/hooks/workflow/{token}", {})
+
+        results = _concurrent([call, call])
+        assert all(status == 202 for status, _data in results), results
+        data = [item for _status, item in results]
+        statuses = sorted(item["status"] for item in data)
+        assert statuses == ["queued", "skipped_overlap"], results
+        queued = [item for item in data if item["status"] == "queued"]
+        assert len(queued) == 1 and queued[0]["job_id"]
+
+        after = _job_ids(web)
+        assert len(after - before) == 1
+        assert web.wait_job(queued[0]["job_id"])["status"] == "done"
