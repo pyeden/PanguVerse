@@ -52,6 +52,8 @@ from .web_research import extract_structure, extract_text
 
 #: 命令输出/诊断文本的默认截断长度（契约 §1）
 MAX_OUTPUT_CHARS = 4000
+#: 渲染 DOM 的采集上限：正文解析需要完整 DOM；诊断输出（stderr/回显）仍按 4000 截断
+DOM_MAX_CHARS = 2_000_000
 #: Chrome 渲染的虚拟时间预算（毫秒），给前端脚本留出执行时间
 DEFAULT_VIRTUAL_TIME_MS = 3000
 #: 单次 Chrome 调用的兜底超时
@@ -142,10 +144,13 @@ def run_tool(
     *,
     timeout: float = DEFAULT_TIMEOUT,
     input_text: str | None = None,
+    stdout_limit: int | None = None,
 ) -> tuple[int, str, str]:
     """执行命令：独立进程组 + 超时 kill + 输出截断。
 
     返回 ``(returncode, stdout, stderr)``（均为已截断文本）。
+    ``stdout_limit`` 只放宽 stdout（例如 ``--dump-dom`` 需要完整 DOM 再解析），
+    stderr 始终保持 :data:`MAX_OUTPUT_CHARS`。
     """
     try:
         proc = subprocess.Popen(
@@ -189,9 +194,10 @@ def run_tool(
         if proc.poll() is None:
             _kill_group(proc)
 
+    out_limit = MAX_OUTPUT_CHARS if stdout_limit is None else max(0, int(stdout_limit))
     return (
         int(proc.returncode or 0),
-        clip_output(out.decode("utf-8", errors="replace")),
+        clip_output(out.decode("utf-8", errors="replace"), out_limit),
         clip_output(err.decode("utf-8", errors="replace")),
     )
 
@@ -244,7 +250,8 @@ def chrome_dump_dom(url: str, *, timeout: float, virtual_time_ms: int) -> str:
             "--dump-dom",
             url,
         ]
-        code, out, err = run_tool(command, timeout=timeout)
+        # 先拿完整 DOM 再解析正文，避免只有 <head> 前 4000 字符可用
+        code, out, err = run_tool(command, timeout=timeout, stdout_limit=DOM_MAX_CHARS)
     if code != 0 and not out.strip():
         raise AtomFailure(
             f"Chrome 渲染失败（exit={code}）：{clip_output(err) or '无输出'}",
@@ -751,12 +758,13 @@ def build_web_content() -> dict[str, Any]:
                 "id": "open",
                 "use": "web_open",
                 "name": "无头浏览器打开页面",
-                "with": {"url": "${env.PAGE_URL}", "timeout": 30},
+                # 默认 4000 字符只够 <head>；正文提取需要保留渲染后的完整 DOM
+                "with": {"url": "${env.PAGE_URL}", "timeout": 30, "max_chars": 400000},
             },
             {
                 "id": "text",
                 "use": "web_get_text",
-                "name": "提取正文",
+                "name": "获取网页正文",
                 "with": {"html": "${open.html}"},
             },
         ],
