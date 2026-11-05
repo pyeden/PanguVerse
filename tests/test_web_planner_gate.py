@@ -88,7 +88,12 @@ def page_url():
 # --------------------------------------------------------------------------- #
 # T1：首页任务能正确表达
 # --------------------------------------------------------------------------- #
-def test_t1_homepage_intent_produces_web_research_graph(api: WebAPI) -> None:
+def test_t1_homepage_intent_produces_web_research_graph(
+    api: WebAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 未配置 LLM：计划只保留「抓取 → 正文 → 状态码断言」，不能生成必失败的 summary 节点
+    monkeypatch.delenv("PANGUVERSE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     status, body = call(
         api,
         "POST",
@@ -104,10 +109,11 @@ def test_t1_homepage_intent_produces_web_research_graph(api: WebAPI) -> None:
     assert body["capability_gaps"] == []
 
     nodes = body["graph"]["nodes"]
-    assert 4 <= len(nodes) <= 6
+    assert 3 <= len(nodes) <= 6
     atoms = [node["atom"] for node in nodes]
-    for required in ("http_get_page", "html_extract_structure", "llm_summarize"):
+    for required in ("http_get_page", "html_extract_text", "assert_json"):
         assert required in atoms
+    assert "llm_summarize" not in atoms
     assert not {"create_order", "pay_order"} & set(atoms)
     assert body["validation"]["ok"] is True
     assert body["validation"]["coverage"]["ratio"] >= 0.6
@@ -120,6 +126,78 @@ def test_t1_homepage_intent_produces_web_research_graph(api: WebAPI) -> None:
     assert full["plan_source"] == body["plan_source"]
     assert full["confidence"] == body["confidence"]
     assert full["domain_pack"] == "web_research"
+
+
+def test_web_report_keeps_summary_when_llm_configured(
+    api: WebAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """配置了 LLM 时仍允许追加总结节点（不发起真实调用）。"""
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": HOME_INTENT})
+    assert status == 201, body
+    atoms = [node["atom"] for node in body["graph"]["nodes"]]
+    assert "llm_summarize" in atoms
+
+
+# --------------------------------------------------------------------------- #
+# 领域包白名单 / 缺少输入 / 单节点调试（工作台验收 2026-11-05）
+# --------------------------------------------------------------------------- #
+def test_registered_domain_pack_is_accepted(api: WebAPI, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P0-1：注册表里存在的 web_browser 必须能建草案。"""
+    monkeypatch.delenv("PANGUVERSE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    intent = "打开百度网页，获取今天的实时热点新闻 https://top.baidu.com/board?tab=realtime"
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": intent, "domain_pack": "web_browser"})
+    assert status == 201, body
+    assert body["domain_pack"] == "web_browser"
+    atoms = [node["atom"] for node in body["graph"]["nodes"]]
+    assert "web_open" in atoms
+    assert "llm_summarize" not in atoms
+
+
+def test_unknown_domain_pack_still_rejected(api: WebAPI) -> None:
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": "备份配置文件", "domain_pack": "nope"})
+    assert status == 400
+    assert body["error"]["code"] == "bad_request"
+
+
+def test_missing_url_is_missing_inputs_not_capability_gap(
+    api: WebAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """P0-2：缺 URL 不是能力缺口，missing_atoms 不能列出已存在原子。"""
+    monkeypatch.delenv("PANGUVERSE_API_KEY", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    status, body = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "打开百度网页，获取今天的实时热点新闻"},
+    )
+    assert status == 422, body
+    error = body["error"]
+    assert error["code"] == "missing_inputs"
+    assert error["missing_inputs"] == ["url"]
+    assert error["missing_atoms"] == []
+    registry = default_registry()
+    assert all(not registry.has(name) for name in error["missing_atoms"])
+    assert "graph" not in body
+
+
+def test_only_mode_upstream_dependency_has_clear_error(api: WebAPI) -> None:
+    """P1-1：only 模式引用上游变量时给出 from_start 提示，而不是 TemplateError。"""
+    intent = "打开百度网页，获取今天的实时热点新闻 https://top.baidu.com/board?tab=realtime"
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": intent, "domain_pack": "web_browser"})
+    assert status == 201, body
+    wid = body["wid"]
+    text_node = next(node for node in body["graph"]["nodes"] if node["atom"] == "web_get_text")
+    status, debug = call(
+        api, "POST", f"/api/studio/{wid}/debug", {"node_id": text_node["id"], "mode": "only"}
+    )
+    assert status == 400, debug
+    error = debug["error"]
+    assert error["code"] == "bad_request"
+    assert "from_start" in error["message"]
+    assert error["depends_on"]
 
 
 @pytest.mark.parametrize(
@@ -338,7 +416,12 @@ def test_debug_when_false_reason_code(api: WebAPI, page_url: str) -> None:
     assert result["summary"]["by_reason"]["when_false"] == 1
 
 
-def test_debug_missing_input_reason_code(api: WebAPI, page_url: str) -> None:
+def test_debug_missing_input_reason_code(
+    api: WebAPI, page_url: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 该用例验证「上游被跳过 → 下游缺输入」；需要 LLM 已配置才会生成 summarize 节点，
+    # 但规划走模板路径，不会发起真实调用。
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     status, draft = call(
         api, "POST", "/api/studio/drafts", {"intent": f"打开 {page_url} 首页取文本并给布局报告"}
     )
@@ -360,9 +443,13 @@ def test_debug_missing_input_reason_code(api: WebAPI, page_url: str) -> None:
     assert result["summary"]["by_reason"]["missing_input"] == 1
 
 
-def test_debug_upstream_failed_reason_code(api: WebAPI) -> None:
+def test_debug_upstream_failed_reason_code(
+    api: WebAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
     import socket
 
+    # 同上：仅为了让计划包含 summarize 这个「最下游节点」
+    monkeypatch.setenv("OPENAI_API_KEY", "test-key")
     sock = socket.socket()
     sock.bind(("127.0.0.1", 0))
     port = sock.getsockname()[1]
@@ -391,15 +478,17 @@ def test_debug_upstream_failed_reason_code(api: WebAPI) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# T6：无密钥硬失败（不产出占位）
+# T6：无 LLM 时不生成总结节点，from_start 必须全绿
 # --------------------------------------------------------------------------- #
-def test_t6_llm_summarize_fails_with_missing_llm(
+def test_t6_no_llm_draft_skips_summary_and_debug_passes(
     api: WebAPI, page_url: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("PANGUVERSE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     status, draft = call(api, "POST", "/api/studio/drafts", {"intent": f"打开 {page_url} 首页取文本并给布局报告"})
     assert status == 201, draft
+    atoms = [node["atom"] for node in draft["graph"]["nodes"]]
+    assert "llm_summarize" not in atoms
     wid = draft["wid"]
     last = draft["graph"]["nodes"][-1]["id"]
     status, started = call(
@@ -408,11 +497,10 @@ def test_t6_llm_summarize_fails_with_missing_llm(
     assert status == 202
     result = wait_debug(api, started["session_id"])
     failures = [item for item in result["all_nodes"] if item["status"] == "failed"]
-    assert failures
-    assert any(item["reason"] == "missing_llm" for item in failures)
-    summarize = [item for item in result["all_nodes"] if item["node_id"] == "summarize"][-1]
-    assert summarize["status"] == "failed" and summarize["reason"] == "missing_llm"
-    assert "summary_md" not in (summarize.get("outputs") or {})
+    assert failures == []
+    assert result["status"] == "ok"
+    assert result["summary"]["passed"] == len(draft["graph"]["nodes"])
+    assert [item for item in result["all_nodes"] if item["node_id"] == "summarize"] == []
 
 
 # --------------------------------------------------------------------------- #

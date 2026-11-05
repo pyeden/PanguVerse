@@ -233,7 +233,8 @@ _ACTION_ATOMS: dict[str, dict[str, tuple[str, ...]]] = {
 
 _WEB_ACTION_WORDS: dict[str, tuple[str, ...]] = {
     "fetch": ("打开", "访问", "抓取", "爬取", "获取", "下载", "请求", "首页", "网页", "页面", "url"),
-    "text": ("取文本", "提取文本", "文本内容", "正文", "文字", "内容", "文本"),
+    # 「获取内容/新闻/热点」也是正文提取目标：只靠「取文本」会漏掉真实用户的说法
+    "text": ("取文本", "提取文本", "文本内容", "正文", "文字", "内容", "文本", "新闻", "热点", "信息"),
     "structure": ("布局", "结构", "版面", "标题", "链接", "导航", "区块", "目录"),
     "summary": ("报告", "总结", "摘要", "分析", "汇总", "建议"),
 }
@@ -258,7 +259,7 @@ _API_ACTION_WORDS: dict[str, tuple[str, ...]] = {
 
 _WEB_BROWSER_ACTION_WORDS: dict[str, tuple[str, ...]] = {
     "open": ("打开网页", "打开页面", "访问网页", "打开", "访问", "抓取页面"),
-    "text": ("取文本", "提取正文", "页面文本", "文本内容", "正文"),
+    "text": ("取文本", "提取正文", "页面文本", "文本内容", "正文", "内容", "新闻", "热点", "信息"),
     "links": ("链接", "取链接", "提取链接", "href"),
     "screenshot": ("截图", "截屏", "screenshot"),
     "wait": ("等待文本", "等待出现", "动态加载", "wait for"),
@@ -382,6 +383,8 @@ class IntentAnalysis:
     actions: list[str] = field(default_factory=list)
     requested_atoms: list[str] = field(default_factory=list)
     missing_atoms: list[str] = field(default_factory=list)
+    #: 缺少的是**输入**（如目标 URL），不是原子能力
+    missing_inputs: list[str] = field(default_factory=list)
     suggestions: list[str] = field(default_factory=list)
     terms: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
@@ -397,6 +400,7 @@ class IntentAnalysis:
             "actions": list(self.actions),
             "requested_atoms": list(self.requested_atoms),
             "missing_atoms": list(self.missing_atoms),
+            "missing_inputs": list(self.missing_inputs),
             "suggestions": list(self.suggestions),
         }
 
@@ -504,6 +508,14 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
         score = len(domain_hits) + len(actions) * 2
         if best is None or score > best[0]:
             best = (score, domain, actions)
+    if best is None and domain_pack:
+        # 显式选择领域包时领域词不一定出现（「打开百度网页」没有「浏览器」），
+        # 仍要按该包的动作词表识别动作，否则会退化成整包模板乱配。
+        explicit_actions = [
+            action for action, words in _action_words(domain_pack).items() if _hits(text, words)
+        ]
+        if explicit_actions:
+            best = (0, domain_pack, explicit_actions)
     if best is not None:
         _score, domain, actions = best
         analysis.domain = domain
@@ -543,17 +555,22 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
                 terms.append(word)
     analysis.terms = terms
 
-    if analysis.domain == "web_research" and "fetch" in analysis.actions and not analysis.url:
-        if "http_get_page" not in analysis.missing_atoms:
-            analysis.missing_atoms.insert(0, "http_get_page")
+    # 缺 URL 是**输入缺失**，不是能力缺口：原子都存在，只是没有目标地址。
+    # 绝不能把已有原子（http_get_page / web_open）写进 missing_atoms。
+    needs_url = bool(
+        (
+            analysis.domain == "web_research"
+            and {"fetch", "text", "structure", "summary"} & set(analysis.actions)
+        )
+        or (
+            analysis.domain == "web_browser"
+            and {"open", "text", "screenshot", "wait"} & set(analysis.actions)
+        )
+    )
+    if needs_url and not analysis.url:
+        analysis.missing_inputs = ["url"]
         analysis.suggestions.append("请提供目标网页 URL（如 https://example.com）")
         analysis.assumptions.append("需要提供目标网页 URL")
-    if (
-        analysis.domain == "web_browser"
-        and not analysis.url
-        and ("open" in analysis.actions or "screenshot" in analysis.actions)
-    ):
-        analysis.assumptions.append("需要提供目标网页 URL（env.PAGE_URL）")
     return analysis
 
 
@@ -707,13 +724,45 @@ def _template_named(templates: Iterable[Any], name: str) -> Any | None:
     return None
 
 
-def _build_web_spec(intent: str, analysis: IntentAnalysis) -> dict[str, Any]:
+def _build_web_spec(
+    intent: str, analysis: IntentAnalysis, *, llm_ready: bool = True
+) -> dict[str, Any]:
     from ..packs.web_research import build_web_page_report
 
     spec = build_web_page_report()
+    if not llm_ready:
+        # 没有 LLM 时 summary 节点必然 missing_llm；结构分析只为报告服务，一并去掉。
+        # 留下「抓取 → 正文 → 状态码断言」，from_start 才能全绿。
+        spec["steps"] = [
+            step
+            for step in spec.get("steps") or []
+            if step.get("use") not in {"llm_summarize", "html_extract_structure"}
+        ]
+        spec["name"] = "网页正文提取"
+        spec["description"] = "抓取页面并提取正文（未配置 LLM，不生成总结节点）"
     if analysis.url:
         for step in spec.get("steps") or []:
             if step.get("id") == "fetch_page":
+                step.setdefault("with", {})["url"] = analysis.url
+    return spec
+
+
+def _build_web_browser_spec(analysis: IntentAnalysis) -> dict[str, Any]:
+    """把 web_browser 动作组合成「打开 → 取正文/链接/截图」模板。"""
+    from ..packs import web_browser as browser_pack
+
+    actions = set(analysis.actions)
+    if "links" in actions:
+        spec = browser_pack.build_web_links()
+    elif "screenshot" in actions:
+        spec = browser_pack.build_web_screenshot_plan()
+    elif "wait" in actions:
+        spec = browser_pack.build_web_wait_text()
+    else:
+        spec = browser_pack.build_web_content()
+    if analysis.url:
+        for step in spec.get("steps") or []:
+            if step.get("use") in {"web_open", "web_screenshot", "web_wait_for_text"}:
                 step.setdefault("with", {})["url"] = analysis.url
     return spec
 
@@ -809,6 +858,7 @@ def _build_rule_plan(
     domain: str,
     analysis: IntentAnalysis,
     explicit_domain: bool,
+    llm_ready: bool = True,
 ) -> TestPlan:
     from ..spec.loader import expand_case_spec
 
@@ -835,8 +885,26 @@ def _build_rule_plan(
             meta={"template": "ios_sim_actions", "llm_used": False},
         )
 
+    if domain == "web_browser" and analysis.actions:
+        spec = expand_case_spec(_build_web_browser_spec(analysis), registry=registry)
+        from ..core.molecule import Molecule
+
+        return TestPlan(
+            cases=[Molecule.from_spec(spec, source="template")],
+            source="template",
+            planner="template",
+            intent=intent,
+            env={},
+            notes=[f"浏览器模板：{spec.get('name') or 'web_browser'}"],
+            meta={"template": spec.get("id"), "llm_used": False},
+        )
+
     if domain == "web_research":
-        specs = [expand_case_spec(_build_web_spec(intent, analysis), registry=registry)]
+        specs = [
+            expand_case_spec(
+                _build_web_spec(intent, analysis, llm_ready=llm_ready), registry=registry
+            )
+        ]
         from ..core.molecule import Molecule
 
         plan = TestPlan(
@@ -845,7 +913,10 @@ def _build_rule_plan(
             planner="template",
             intent=intent,
             env={},
-            notes=["网页研究模板：抓取 → 正文 → 结构 → LLM 报告"],
+            notes=[
+                "网页研究模板：抓取 → 正文 → 状态码断言"
+                + (" → 结构 → LLM 报告" if llm_ready else "（未配置 LLM，跳过总结）")
+            ],
             meta={"template": "web_page_report", "llm_used": False},
         )
         return plan
@@ -970,6 +1041,17 @@ def plan_draft(
                 "intent": intent,
             },
         )
+    if analysis.missing_inputs:
+        raise PlanGateError(
+            "missing_inputs",
+            "缺少输入：目标网页 URL",
+            details={
+                "missing_inputs": list(analysis.missing_inputs),
+                "missing_atoms": [],
+                "suggestions": list(analysis.suggestions),
+                "intent": intent,
+            },
+        )
     if analysis.domain == "web_research" and not analysis.actions:
         code, missing, suggestions = _mapping_gap(
             analysis,
@@ -980,22 +1062,13 @@ def plan_draft(
             "意图没有命中网页研究动作，不能套用 web_research 模板",
             details={"missing_atoms": missing, "suggestions": suggestions, "intent": intent},
         )
-    if analysis.domain == "web_research" and not analysis.url:
-        raise PlanGateError(
-            "capability_gap",
-            "网页任务缺少目标 URL",
-            details={
-                "missing_atoms": ["http_get_page"],
-                "suggestions": ["在意图中给出 https://... 地址"],
-                "intent": intent,
-            },
-        )
 
     planner = "template" if not explicit else "rules"
     plan_source = "template" if not explicit else "rules"
     confidence = 0.45 if analysis.domain == "web_research" else 0.4
+    llm_ready = bool(llm_client is not None and getattr(llm_client, "available", False))
     plan: TestPlan | None = None
-    if allow_llm and llm_client is not None and getattr(llm_client, "available", False):
+    if allow_llm and llm_ready:
         plan = _llm_draft(registry, intent=intent, client=llm_client, env=env)
         planner = "llm"
         plan.planner = "llm"
@@ -1013,6 +1086,7 @@ def plan_draft(
             domain=analysis.domain or domain_pack,
             analysis=analysis,
             explicit_domain=explicit,
+            llm_ready=llm_ready,
         )
 
     if plan.planner:

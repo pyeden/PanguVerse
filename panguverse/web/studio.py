@@ -639,7 +639,9 @@ def _clean_domain_pack(value: Any) -> str:
     domain = value.strip()
     if not domain:
         return ""
-    allowed = {"api_testing", "local_fs", "core", "web_research"}
+    # 白名单必须跟注册表同步：硬编码会让实际存在的 web_browser/android_adb/ios_sim
+    # 在工作台里可选、却无法创建草案（P0-1）。
+    allowed = {str(getattr(pack, "name", "") or "") for pack in _registry().packs()}
     if domain not in allowed:
         raise StudioError("bad_request", f"未知的领域包: {domain}")
     return domain
@@ -1723,6 +1725,32 @@ def _select_nodes(
     return nodes[index:]
 
 
+def _upstream_refs(
+    nodes: list[dict[str, Any]], edges: list[dict[str, Any]], node_id: str
+) -> list[str]:
+    """返回 ``node_id`` 引用的上游变量名（来自数据边或参数里的模板根）。"""
+    refs: list[str] = []
+    owners: dict[str, str] = {}
+    for node in nodes:
+        nid = str(node.get("id") or "")
+        owners[nid] = nid
+        for name in node.get("capture") or {}:
+            owners[str(name)] = nid
+    for edge in edges or []:
+        if str(edge.get("to")) != node_id or str(edge.get("kind")) != "data":
+            continue
+        label = str(edge.get("via") or edge.get("from") or "")
+        if label and label not in refs:
+            refs.append(label)
+    node = next((item for item in nodes if str(item.get("id")) == node_id), None)
+    if node is not None:
+        for root in template_roots(node.get("params") or {}):
+            owner = owners.get(root)
+            if owner and owner != node_id and root not in refs:
+                refs.append(root)
+    return refs
+
+
 _DEBUG_SID_RE = re.compile(r"^dbg-(w-[0-9a-f]{6,12})-([0-9a-f]{8})$")
 DEBUG_REASONS = (
     "when_false",
@@ -2285,6 +2313,20 @@ def debug_workflow(root: Path, wid: str, payload: Any, *, actor: str = "local") 
     revision = read_revision(root, wid, rev)
     nodes = list(revision.get("nodes") or [])
     selected = _select_nodes_payload(nodes, node_id, mode)
+    if mode == "only":
+        # 单节点调试只跑选中节点，上游 capture 不会产生值；提前说清楚原因，
+        # 不要让执行线程抛 TemplateError 让用户猜。
+        deps = _upstream_refs(nodes, list(revision.get("edges") or []), node_id)
+        if deps:
+            names = "、".join(deps)
+            raise StudioError(
+                "bad_request",
+                f"该节点依赖上游输出（{names}），请用 from_start 调试",
+                details={
+                    "depends_on": deps,
+                    "suggested_mode": "from_start",
+                },
+            )
     effective_env = _debug_env(root, data)
     if not selected:
         raise StudioError("bad_request", "调试没有选中任何可执行步骤")

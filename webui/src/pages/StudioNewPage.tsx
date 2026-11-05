@@ -35,13 +35,23 @@ const quickPrompts: Record<string, { title: string; text: string }[]> = {
   ],
 }
 
+const missingInputLabels: Record<string, string> = {
+  url: '目标网页 URL',
+}
+
 export function StudioNewPage() {
   const { push } = useToast()
   const [intent, setIntent] = useState('')
   const [pack, setPack] = useState('api_testing')
   const [excluded, setExcluded] = useState<string[]>([])
   const [mock, setMock] = useState(isStudioMock())
-  const [planError, setPlanError] = useState<{ message: string; missing: string[]; suggestions: string[] } | null>(null)
+  const [planError, setPlanError] = useState<{
+    code: string
+    message: string
+    missing: string[]
+    missingInputs: string[]
+    suggestions: string[]
+  } | null>(null)
   const atomsQuery = useQuery({ queryKey: ['atoms'], queryFn: api.atoms, staleTime: 60_000 })
   const packsQuery = useQuery({ queryKey: ['packs'], queryFn: api.packs, staleTime: 60_000 })
   const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: studioApi.listDrafts })
@@ -85,9 +95,17 @@ export function StudioNewPage() {
       if (error instanceof ApiError) {
         const raw = (error.data?.error && typeof error.data.error === 'object' ? error.data.error : error.data) as AnyRecord | undefined
         const missing = Array.isArray(raw?.missing_atoms) ? raw!.missing_atoms.map(String) : []
+        const missingInputs = Array.isArray(raw?.missing_inputs) ? raw!.missing_inputs.map(String) : []
         const suggestions = Array.isArray(raw?.suggestions) ? raw!.suggestions.map(String) : []
-        if (error.status === 422 || error.code === 'capability_gap' || missing.length) {
-          setPlanError({ message: error.message, missing, suggestions })
+        const code = String(raw?.code || error.code || '')
+        if (
+          error.status === 422 ||
+          code === 'capability_gap' ||
+          code === 'missing_inputs' ||
+          missing.length ||
+          missingInputs.length
+        ) {
+          setPlanError({ code, message: error.message, missing, missingInputs, suggestions })
           return
         }
       }
@@ -115,15 +133,25 @@ export function StudioNewPage() {
         <div className="capability-gap-panel" data-testid="plan-gap-panel">
           <span className="gap-panel-icon"><Icon name="warning" size={17} /></span>
           <div className="gap-panel-body">
-            <strong>没有生成流程：能力缺口（422 {planError.missing.length ? `· 缺少 ${planError.missing.length} 个原子` : ''}）</strong>
+            {planError.code === 'missing_inputs' ? (
+              <strong>没有生成流程：缺少输入（422）</strong>
+            ) : (
+              <strong>没有生成流程：能力缺口（422 {planError.missing.length ? `· 缺少 ${planError.missing.length} 个原子` : ''}）</strong>
+            )}
             <p>{planError.message}</p>
+            {planError.missingInputs.length ? (
+              <div className="gap-panel-row" data-testid="plan-gap-missing-inputs">
+                <span>缺少输入</span>
+                {planError.missingInputs.map((key) => <code key={key}>{missingInputLabels[key] || key}</code>)}
+              </div>
+            ) : null}
             {planError.missing.length ? (
               <div className="gap-panel-row"><span>缺失原子</span>{planError.missing.map((atom) => <code key={atom}>{atom}</code>)}</div>
             ) : null}
             {planError.suggestions.length ? (
               <ul className="gap-panel-suggestions">{planError.suggestions.map((item) => <li key={item}>{item}</li>)}</ul>
             ) : null}
-            <small>不会产出占位图。请调整意图、补齐原子，或更换领域包。</small>
+            <small>{planError.code === 'missing_inputs' ? '补齐输入后重新生成即可，原子能力已经具备。' : '不会产出占位图。请调整意图、补齐原子，或更换领域包。'}</small>
           </div>
           <button type="button" className="gap-panel-close" onClick={() => setPlanError(null)} aria-label="关闭能力缺口提示"><Icon name="close" size={13} /></button>
         </div>
