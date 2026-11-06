@@ -393,6 +393,9 @@ class IntentAnalysis:
     suggestions: list[str] = field(default_factory=list)
     terms: list[str] = field(default_factory=list)
     assumptions: list[str] = field(default_factory=list)
+    #: 显式 domain_pack 与意图明显矛盾时被忽略，改用意图路由。
+    domain_pack_ignored: bool = False
+    domain_pack_message: str = ""
 
     @property
     def hit(self) -> bool:
@@ -409,6 +412,8 @@ class IntentAnalysis:
             "missing_atoms": list(self.missing_atoms),
             "missing_inputs": list(self.missing_inputs),
             "suggestions": list(self.suggestions),
+            "domain_pack_ignored": self.domain_pack_ignored,
+            "domain_pack_message": self.domain_pack_message,
         }
 
 
@@ -469,6 +474,45 @@ def _action_words(domain: str) -> dict[str, tuple[str, ...]]:
     return _API_ACTION_WORDS
 
 
+def _auto_candidates(text: str) -> list[str]:
+    """按意图自动路由时的候选领域顺序（设备域优先）。"""
+    device_hits = [domain for domain in _DEVICE_DOMAINS if _domain_hits(text, domain)]
+    if "ios_sim" in device_hits and "android_adb" in device_hits and not _hits(
+        text, _IOS_STRONG_HINTS
+    ):
+        # 「安卓模拟器」里的「模拟器」不是 iOS
+        device_hits.remove("ios_sim")
+    return device_hits or [
+        "web_browser",
+        "web_research",
+        "android_adb",
+        "ios_sim",
+        "local_fs",
+        "api_testing",
+    ]
+
+
+def _score_domains(
+    text: str, candidates: Iterable[str]
+) -> tuple[tuple[int, str, list[str]] | None, tuple[int, str] | None]:
+    """对候选域做「领域词 + 动作词」打分，返回 (best, fallback)。"""
+    best: tuple[int, str, list[str]] | None = None
+    fallback: tuple[int, str] | None = None
+    for domain in candidates:
+        domain_hits = _domain_hits(text, domain)
+        if not domain_hits:
+            continue
+        actions = [action for action, words in _action_words(domain).items() if _hits(text, words)]
+        if not actions:
+            if fallback is None or len(domain_hits) > fallback[0]:
+                fallback = (len(domain_hits), domain)
+            continue
+        score = len(domain_hits) + len(actions) * 2
+        if best is None or score > best[0]:
+            best = (score, domain, actions)
+    return best, fallback
+
+
 def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     """把意图拆成「领域 + 动作 + 缺失能力」，**不做任何兜底补全**。
 
@@ -496,43 +540,33 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     # 先做领域 + 动作路由（新领域靠词表和动作词参与同一套打分）
     # 设备域优先：同时出现「iOS/模拟器」和「网页/浏览器」时走设备域，
     # 不能把「在 iOS 模拟器上打开网页并截图」抢去 web_browser。
-    if domain_pack:
-        candidates = [domain_pack]
-    else:
-        device_hits = [domain for domain in _DEVICE_DOMAINS if _domain_hits(text, domain)]
-        if "ios_sim" in device_hits and "android_adb" in device_hits and not _hits(text, _IOS_STRONG_HINTS):
-            # 「安卓模拟器」里的「模拟器」不是 iOS
-            device_hits.remove("ios_sim")
-        candidates = device_hits or [
-            "web_browser",
-            "web_research",
-            "android_adb",
-            "ios_sim",
-            "local_fs",
-            "api_testing",
-        ]
     best: tuple[int, str, list[str]] | None = None
     fallback: tuple[int, str] | None = None
-    for domain in candidates:
-        domain_hits = _domain_hits(text, domain)
-        if not domain_hits:
-            continue
-        actions = [action for action, words in _action_words(domain).items() if _hits(text, words)]
-        if not actions:
-            if fallback is None or len(domain_hits) > fallback[0]:
-                fallback = (len(domain_hits), domain)
-            continue
-        score = len(domain_hits) + len(actions) * 2
-        if best is None or score > best[0]:
-            best = (score, domain, actions)
-    if best is None and resolution is not None and not domain_pack:
+    ignored_pack = ""
+    if domain_pack:
+        explicit_domain_hits = _domain_hits(text, domain_pack)
+        explicit_actions = [
+            action for action, words in _action_words(domain_pack).items() if _hits(text, words)
+        ]
+        if not explicit_domain_hits and not explicit_actions:
+            # 护栏：显式包与意图完全无关（领域词、动作词都零命中），
+            # 而自动路由能明确命中另一个域 → 忽略包，按意图路由。
+            auto_best, auto_fallback = _score_domains(text, _auto_candidates(text))
+            if auto_best is not None:
+                ignored_pack = domain_pack
+                best, fallback = auto_best, auto_fallback
+        if not ignored_pack:
+            best, fallback = _score_domains(text, [domain_pack])
+    else:
+        best, fallback = _score_domains(text, _auto_candidates(text))
+    if best is None and resolution is not None and (not domain_pack or ignored_pack):
         # 站点别名也是领域线索：已知站点名天然说明目标是网页。
         # 只在其他领域都没命中时兜底，避免「百度搜索接口」这类句子被抢到网页域。
         alias_actions = [
             action for action, words in _WEB_ACTION_WORDS.items() if _hits(text, words)
         ]
         best = (1 + len(alias_actions) * 2, "web_research", alias_actions)
-    if best is None and domain_pack:
+    if best is None and domain_pack and not ignored_pack:
         # 显式选择领域包时领域词不一定出现（「打开百度网页」没有「浏览器」），
         # 仍要按该包的动作词表识别动作，否则会退化成整包模板乱配。
         explicit_actions = [
@@ -555,6 +589,17 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
         analysis.domain = fallback[1]
     elif domain_pack:
         analysis.domain = domain_pack
+
+    if ignored_pack:
+        analysis.domain_pack_ignored = True
+        analysis.domain_pack_message = (
+            f"显式领域包 {ignored_pack} 与意图不匹配（领域词与动作词均未命中），"
+            f"已按意图自动路由到 {analysis.domain or '可用领域'}"
+        )
+        analysis.assumptions.append(
+            f"已忽略显式领域包 {ignored_pack}：它与意图不匹配；当前按意图路由到 "
+            f"{analysis.domain or '可用领域'}"
+        )
 
     # 缺失动作：按**已路由到的领域**查表，避免把 iOS/安卓点击误判成浏览器点击
     missing: list[str] = []
@@ -1045,7 +1090,8 @@ def plan_draft(
 ) -> DraftPlan:
     """产出一份「诚实」的草稿计划；不理解时抛 :class:`PlanGateError`。"""
     analysis = analyze_intent(intent, domain_pack=domain_pack)
-    explicit = bool(domain_pack)
+    # 护栏命中的显式包不能被当作「用户确认过的领域」：按意图路由生成。
+    explicit = bool(domain_pack) and not analysis.domain_pack_ignored
 
     if not explicit and not analysis.hit:
         code, missing, suggestions = _mapping_gap(
@@ -1138,6 +1184,12 @@ def plan_draft(
         )
 
     assumptions = list(analysis.assumptions)
+    # 模板自带的假设（例如 /api/health 只是模板默认端点，未对目标服务验证）
+    for case in plan.cases:
+        for item in case.meta.get("assumptions") or ():
+            text_item = str(item)
+            if text_item and text_item not in assumptions:
+                assumptions.append(text_item)
     for step in (step for case in plan.cases for step in case.steps):
         for key in re.findall(r"\$\{env\.([A-Za-z_][A-Za-z0-9_]*)", str(step.with_)):
             if key not in assumptions and not (env and key in env):

@@ -697,7 +697,11 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     # 按原子输入端口自动填入所有带 url 的必填端口，不针对具体原子写特判。
     # 站点别名只服务网页域：非网页域既不改写节点参数，也不对外暴露误导性的 url 字段。
     analysis = dict(bundle.analysis or {})
+    ignored_pack = bool(analysis.get("domain_pack_ignored"))
+    pack_message = str(analysis.get("domain_pack_message") or "")
     routed_domain = str(analysis.get("domain") or domain_pack or "")
+    # 显式包被护栏忽略时，落库/回显必须使用实际路由到的领域，而不是用户误选的包。
+    effective_pack = routed_domain if ignored_pack else (domain_pack or routed_domain)
     if routed_domain not in _WEB_DOMAINS:
         for key in ("url", "url_source", "site"):
             analysis[key] = ""
@@ -715,12 +719,38 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     )
     param_gaps = param_fill.audit_param_gaps(graph["nodes"], _registry())
     env_inputs = param_fill.audit_env_inputs(graph["nodes"], _registry())
+    # 已被站点别名/显式 URL 填掉的环境占位符不再重复声明「需要 XXX」，
+    # 只保留图中仍然真实存在的 env 依赖。
+    remaining_env: set[str] = set()
+
+    def _collect_env(value: Any) -> None:
+        if isinstance(value, str):
+            remaining_env.update(re.findall(r"\$\{env\.([A-Za-z_][A-Za-z0-9_]*)", value))
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                _collect_env(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                _collect_env(item)
+
+    for node in graph["nodes"]:
+        _collect_env(node.get("params") or {})
+    assumptions = [
+        item
+        for item in bundle.assumptions
+        if not (
+            (match := re.fullmatch(r"需要 ([A-Za-z_][A-Za-z0-9_]*)", item))
+            and match.group(1) not in remaining_env
+        )
+    ]
     param_audit = {
         "url": resolved_url,
         "url_source": url_source,
         "autofilled": autofilled,
         "param_gaps": param_gaps,
         "env_inputs": env_inputs,
+        # 模板假设（如 /api/health 只是模板默认端点）与草案响应保持同一份
+        "assumptions": assumptions,
     }
 
     wid = new_wid()
@@ -731,11 +761,11 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "wid": wid,
         "name": name,
         "intent": intent,
-        "domain_pack": domain_pack or bundle.analysis.get("domain") or "",
+        "domain_pack": effective_pack or bundle.analysis.get("domain") or "",
         "planner": bundle.planner,
         "plan_source": bundle.plan_source,
         "confidence": bundle.confidence,
-        "assumptions": list(bundle.assumptions),
+        "assumptions": assumptions,
         "capability_gaps": list(bundle.capability_gaps),
         "param_audit": param_audit,
         "state": "draft",
@@ -760,7 +790,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "planner": bundle.planner,
         "plan_source": bundle.plan_source,
         "confidence": bundle.confidence,
-        "assumptions": list(bundle.assumptions),
+        "assumptions": assumptions,
         "capability_gaps": list(bundle.capability_gaps),
         "param_audit": param_audit,
         "env_schema": env_schema,
@@ -790,7 +820,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         edges=graph["edges"],
         intent=intent,
         env_schema=env_schema,
-        assumptions=bundle.assumptions,
+        assumptions=assumptions,
         available_env=None,
         domain_pack=workflow["domain_pack"],
     )
@@ -800,10 +830,13 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "state": "draft",
         # 成功响应必须回显实际路由到的领域包（模板路径取 analysis.domain）
         "domain_pack": workflow["domain_pack"],
+        "domain_pack_ignored": ignored_pack,
+        "domain_pack_message": pack_message,
+        "message": pack_message,
         "planner": bundle.planner,
         "plan_source": bundle.plan_source,
         "confidence": bundle.confidence,
-        "assumptions": list(bundle.assumptions),
+        "assumptions": assumptions,
         "capability_gaps": list(bundle.capability_gaps),
         "analysis": analysis,
         "url": resolved_url,
@@ -1307,17 +1340,42 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
     base_rev = int(workflow.get("current_rev") or 0)
     revision = read_revision(root, wid, base_rev)
 
+    stored_pack = str(workflow.get("domain_pack") or "")
+    workflow_intent = str(workflow.get("intent") or "")
+    guard = planner_gate.analyze_intent(
+        f"{workflow_intent} {instruction}".strip(), domain_pack=stored_pack
+    )
+    ignored_pack = bool(guard.domain_pack_ignored)
+    effective_pack = "" if ignored_pack else stored_pack
+    # 历史错配的工作流：若新指令本身表达不了域，回退用库内原始意图重排，
+    # 避免「重新规划」这类指令退化成默认模板组。
+    plan_intent = instruction
+    if ignored_pack and not planner_gate.analyze_intent(instruction).hit:
+        plan_intent = workflow_intent or instruction
+
+    exclude = _clean_exclude(data.get("exclude_atoms"))
+    from . import service
+
+    if not service.llm_enabled() and "llm_summarize" not in exclude:
+        exclude.append("llm_summarize")
     plan = _build_plan(
         root,
-        intent=instruction,
-        domain_pack=str(workflow.get("domain_pack") or ""),
-        exclude_atoms=_clean_exclude(data.get("exclude_atoms")),
+        intent=plan_intent,
+        domain_pack=effective_pack,
+        exclude_atoms=exclude,
     )
     proposed = graph_from_plan(
         plan,
         origin="ai",
         locked=[str(node.get("id")) for node in revision.get("nodes") or [] if node.get("locked")],
     )
+    if guard.url and str(guard.domain or "") in _WEB_DOMAINS:
+        param_fill.fill_url_params(
+            proposed["nodes"],
+            _registry(),
+            guard.url,
+            source=guard.url_source or "site_alias",
+        )
     conflicts = _locked_conflicts(revision.get("nodes") or [], proposed["nodes"])
     if conflicts:
         raise StudioError(
@@ -1339,6 +1397,9 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
             "proposed_rev": None,
             "diff": diff,
             "locked_nodes": [],
+            "domain_pack": effective_pack or guard.domain or "",
+            "domain_pack_ignored": ignored_pack,
+            "domain_pack_message": guard.domain_pack_message,
         }
 
     proposed_rev = base_rev + 1
@@ -1363,6 +1424,9 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         "diff": diff,
         "locked_nodes": [],
         "graph": proposed,
+        "domain_pack": effective_pack or guard.domain or "",
+        "domain_pack_ignored": ignored_pack,
+        "domain_pack_message": guard.domain_pack_message,
     }
 
 

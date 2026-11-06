@@ -445,7 +445,7 @@ export const studioApi = {
     return (items as AnyRecord[]).map((item) => normalizeWorkflow(item))
   },
 
-  async createDraft(body: { intent: string; domain_pack: string; exclude_atoms?: string[] }): Promise<Workflow> {
+  async createDraft(body: { intent: string; domain_pack?: string; exclude_atoms?: string[] }): Promise<Workflow> {
     return realOrMock(
       async () => {
         const payload = await request<AnyRecord>('api/studio/drafts', { method: 'POST', body })

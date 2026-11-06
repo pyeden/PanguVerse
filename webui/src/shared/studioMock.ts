@@ -349,15 +349,16 @@ export async function mockListWorkflows(): Promise<Workflow[]> {
     .map((workflow) => normalize(workflow))
 }
 
-export async function mockCreateDraft(body: { intent: string; domain_pack: string; exclude_atoms?: string[] }): Promise<Workflow> {
+export async function mockCreateDraft(body: { intent: string; domain_pack?: string; exclude_atoms?: string[] }): Promise<Workflow> {
   const store = load()
-  const graph = graphFor(body.intent, body.domain_pack, body.exclude_atoms || [])
+  const pack = body.domain_pack || 'auto'
+  const graph = graphFor(body.intent, pack, body.exclude_atoms || [])
   const wid = uid('w')
   const workflow: StoredWorkflow = {
     wid,
     name: body.intent.trim().slice(0, 28) || '未命名流程',
     intent: body.intent,
-    domain_pack: body.domain_pack,
+    domain_pack: pack,
     state: 'draft',
     current_rev: 1,
     published_ref: '',

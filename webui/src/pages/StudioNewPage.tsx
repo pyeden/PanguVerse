@@ -17,7 +17,14 @@ import {
   useToast,
 } from '../components/ui'
 
+const AUTO_PACK = 'auto'
+
 const quickPrompts: Record<string, { title: string; text: string }[]> = {
+  auto: [
+    { title: '百度热搜', text: '打开百度网站，提取今天的热点新闻' },
+    { title: '健康检查', text: '调用健康检查接口，确认返回 200，并断言响应体包含 status=ok。' },
+    { title: '配置巡检', text: '检查配置目录中的必要文件是否存在，并读取 JSON 校验 version 字段。' },
+  ],
   api_testing: [
     { title: '登录与订单', text: '登录系统，获取访问令牌，拉取订单列表，并确认返回中至少包含一条订单。' },
     { title: '健康检查', text: '调用健康检查接口，确认返回 200，并断言响应体包含 status=ok。' },
@@ -42,7 +49,7 @@ const missingInputLabels: Record<string, string> = {
 export function StudioNewPage() {
   const { push } = useToast()
   const [intent, setIntent] = useState('')
-  const [pack, setPack] = useState('api_testing')
+  const [pack, setPack] = useState(AUTO_PACK)
   const [excluded, setExcluded] = useState<string[]>([])
   const [mock, setMock] = useState(isStudioMock())
   const [planError, setPlanError] = useState<{
@@ -63,17 +70,23 @@ export function StudioNewPage() {
 
   useEffect(() => {
     if (!packs.length) return
-    if (!packs.some((item) => item.name === pack)) setPack(packs[0].name)
+    if (pack !== AUTO_PACK && !packs.some((item) => item.name === pack)) setPack(AUTO_PACK)
   }, [packs, pack])
 
   const recommended = useMemo(() => {
     const inPack = atoms.filter((atom) => atom.pack === pack)
-    const pool = inPack.length ? inPack : atoms.filter((atom) => pack === 'local_fs' ? atom.domain === 'fs' : atom.domain === 'api')
-    const preferred = pack === 'local_fs'
-      ? ['fs_read_text', 'fs_write_json', 'fs_exists', 'assert_file_exists', 'fs_list']
-      : pack === 'web_research'
-        ? ['http_get_page', 'html_extract_text', 'html_extract_structure', 'llm_summarize']
-        : ['http_request', 'assert_status', 'json_get', 'assert_body_contains', 'assert_json']
+    const pool = pack === AUTO_PACK
+      ? atoms
+      : inPack.length
+        ? inPack
+        : atoms.filter((atom) => pack === 'local_fs' ? atom.domain === 'fs' : atom.domain === 'api')
+    const preferred = pack === AUTO_PACK
+      ? ['http_get_page', 'html_extract_text', 'web_open', 'web_get_text', 'http_request', 'assert_json', 'fs_read_json']
+      : pack === 'local_fs'
+        ? ['fs_read_text', 'fs_write_json', 'fs_exists', 'assert_file_exists', 'fs_list']
+        : pack === 'web_research'
+          ? ['http_get_page', 'html_extract_text', 'html_extract_structure', 'llm_summarize']
+          : ['http_request', 'assert_status', 'json_get', 'assert_body_contains', 'assert_json']
     return [...pool].sort((a, b) => {
       const ai = preferred.indexOf(a.name)
       const bi = preferred.indexOf(b.name)
@@ -85,7 +98,8 @@ export function StudioNewPage() {
   const activeRecommended = recommended.filter((atom) => !excluded.includes(atom.name))
 
   const create = useMutation({
-    mutationFn: () => studioApi.createDraft({ intent: intent.trim(), domain_pack: pack, exclude_atoms: excluded }),
+    // 自动识别时不传 domain_pack，由后端按意图路由；只有用户显式选包才传。
+    mutationFn: () => studioApi.createDraft({ intent: intent.trim(), domain_pack: pack === AUTO_PACK ? undefined : pack, exclude_atoms: excluded }),
     onSuccess: (workflow) => {
       setPlanError(null)
       push(`已生成 rev ${workflow.current_rev ?? 0} · ${workflow.graph?.nodes?.length || 0} 个节点`, 'ok')
@@ -190,6 +204,12 @@ export function StudioNewPage() {
             <div className="intent-section-head"><strong>领域包</strong><span>决定 AI 的能力边界与意图模板</span></div>
             <div className="pack-choice-grid">
               {packsQuery.isLoading ? <Loading label="读取领域包…" /> : null}
+              <button key={AUTO_PACK} type="button" className={`pack-choice ${pack === AUTO_PACK ? 'is-active' : ''}`} onClick={() => { setPack(AUTO_PACK); setExcluded([]) }}>
+                <span className="pack-choice-icon"><Icon name="spark" size={19} /></span>
+                <span className="pack-choice-copy"><strong>自动识别（推荐）</strong><small>按意图自动选择领域，不强迫套用固定包</small></span>
+                <span className="pack-choice-count">全能力</span>
+                {pack === AUTO_PACK ? <span className="pack-choice-check"><Icon name="check" size={12} /></span> : null}
+              </button>
               {packs.map((item) => (
                 <button key={item.name} type="button" className={`pack-choice ${pack === item.name ? 'is-active' : ''}`} onClick={() => { setPack(item.name); setExcluded([]) }}>
                   <span className="pack-choice-icon"><Icon name={item.name.includes('fs') ? 'file' : 'server'} size={19} /></span>
@@ -228,7 +248,7 @@ export function StudioNewPage() {
             <div><span className="preselect-kicker"><Icon name="spark" size={13} /> AI 预选</span><h2>建议原子组合</h2></div>
             <Badge tone="cyan">{activeRecommended.length} 个</Badge>
           </div>
-          <p className="preselect-desc">{selectedPack ? selectedPack.description : '根据领域包推荐可用原子。'}</p>
+          <p className="preselect-desc">{pack === AUTO_PACK ? '按意图自动识别领域；不强迫套用任何领域包。' : selectedPack ? selectedPack.description : '根据领域包推荐可用原子。'}</p>
           <div className="preselect-list">
             {atomsQuery.isLoading ? <Loading label="读取原子…" /> : null}
             {activeRecommended.map((atom, index) => (

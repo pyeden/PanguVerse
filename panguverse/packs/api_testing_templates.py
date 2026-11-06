@@ -74,7 +74,13 @@ def build_health_check() -> dict[str, Any]:
         "id": "health_check",
         "name": "健康检查：服务存活且响应够快",
         "tags": ["smoke", "health", "rules"],
-        "description": "GET /api/health，断言 200 / status=ok / 耗时上限",
+        "description": "GET /api/health（模板默认端点，未验证），断言 200 / status=ok / 耗时上限",
+        "meta": {
+            "assumptions": [
+                "模板假设：GET ${env.BASE_URL}/api/health 是模板默认端点，未对目标服务验证；"
+                "若目标状态端点不同（例如 /api/status），请替换 url 后再运行。"
+            ]
+        },
         "steps": [
             {
                 "id": "health",
