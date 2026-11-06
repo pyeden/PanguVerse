@@ -967,6 +967,24 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               <h1>{workflow.name || '未命名流程'}</h1>
               <StatusBadge status={state} />
               {mock ? <Badge tone="warn">演示</Badge> : null}
+              {workflow.origin === 'explore' ? (
+                <a
+                  className="badge badge-violet explore-origin-chip"
+                  href={href(`/studio/explore/${workflow.explore_id || ''}`)}
+                  title="该流程由探索成功后固化，参数来自真实调用值"
+                  data-testid="canvas-explore-origin"
+                >
+                  <Icon name="bolt" size={11} />来自探索 {workflow.explore_id || 'eid 未知'}
+                </a>
+              ) : null}
+              {Array.isArray(workflow.pending_atoms) && workflow.pending_atoms.length ? (
+                <Badge tone="warn" className="pending-atoms-chip" data-testid="canvas-pending-atoms">
+                  待封装脚本 {workflow.pending_atoms.length}
+                </Badge>
+              ) : null}
+              {workflow.replay_status === 'replay_failed' ? (
+                <Badge tone="bad" data-testid="canvas-replay-failed">重放未通过</Badge>
+              ) : null}
               <span className="rev-chip mono">rev {currentRev}</span>
             </div>
             <p>{workflow.intent || '未记录意图'} <span>·</span> {workflow.domain_pack || '未标注领域包'} <span>·</span> {workflow.wid}</p>

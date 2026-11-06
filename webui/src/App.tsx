@@ -17,6 +17,7 @@ import { ReportsPage } from './pages/ReportsPage'
 import { SchedulesPage } from './pages/SchedulesPage'
 import { ArtifactsPage } from './pages/ArtifactsPage'
 import { StudioNewPage } from './pages/StudioNewPage'
+import { StudioExplorePage } from './pages/StudioExplorePage'
 import { StudioCanvasPage } from './pages/StudioCanvasPage'
 import { StudioReviewPage } from './pages/StudioReviewPage'
 
@@ -139,6 +140,7 @@ function RoutedPage({ route }: { route: Route }) {
   if (first === 'artifacts') return <ArtifactsPage />
   if (first === 'studio') {
     if (!parts[1] || parts[1] === 'new') return <StudioNewPage />
+    if (parts[1] === 'explore') return <StudioExplorePage eid={parts[2]} key={parts[2] || 'explore-new'} />
     if (parts[2] === 'review') return <StudioReviewPage wid={parts[1]} key={`${parts[1]}-review`} />
     return <StudioCanvasPage wid={parts[1]} key={parts[1]} />
   }
@@ -176,7 +178,7 @@ function NotFound({ route }: { route: Route }) {
 
 function pageTitle(route: Route): string {
   const first = route.parts[0] || 'projects'
-  if (first === 'studio') return route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '流程画布' : '新建流程'
+  if (first === 'studio') return route.parts[1] === 'explore' ? (route.parts[2] ? '探索回看' : '探索') : route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '流程画布' : '新建流程'
   if (first === 'p') {
     const page = route.parts[2]
     return page === 'run' ? '运行' : page === 'history' ? '项目历史' : page === 'settings' ? '项目设置' : route.parts[2] === 'runs' ? '运行报告' : '项目概览'

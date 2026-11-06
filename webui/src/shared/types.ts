@@ -537,5 +537,118 @@ export interface Workflow {
   audit_tail?: AnyRecord[]
   created_at?: number
   updated_at?: number
+  origin?: 'ai' | 'human' | 'explore' | string
+  explore_id?: string
+  pending_atoms?: string[]
+  replay_status?: string
+  replay?: AnyRecord
+  [key: string]: any
+}
+
+/* -------------------------------------------------------------------------- */
+/* Explore-first (先跑通再固化)                                                */
+/* -------------------------------------------------------------------------- */
+
+export type ExploreCheckType = 'text_contains' | 'status_code' | 'regex' | 'file_exists' | string
+
+export interface ExploreCheckSpec {
+  id?: string
+  type: ExploreCheckType
+  value?: string
+  equals?: number | string
+  pattern?: string
+  path?: string
+  step?: number | string
+  step_id?: string
+  artifact?: string
+  [key: string]: any
+}
+
+export interface ExploreCheck {
+  id: string
+  type: ExploreCheckType
+  spec?: ExploreCheckSpec
+  ok: boolean
+  evidence?: string
+}
+
+export interface ExploreArtifact {
+  path: string
+  bytes?: number
+  content_type?: string
+}
+
+export interface ExploreEvent {
+  seq: number
+  ts: number
+  type: 'thought' | 'tool_call' | 'tool_result' | 'script' | 'verify' | 'end' | string
+  [key: string]: any
+}
+
+export interface ExploreSummary {
+  steps?: number
+  tool_calls?: number
+  scripts?: number
+  duration_ms?: number
+  reason?: string
+  verdict?: string
+  [key: string]: any
+}
+
+export interface ExploreSession {
+  eid: string
+  cursor?: number
+  status: string
+  done?: boolean
+  intent?: string
+  success_criteria?: unknown
+  criteria?: ExploreCheckSpec[]
+  summary?: ExploreSummary
+  checks?: ExploreCheck[]
+  verdict?: string
+  artifacts?: ExploreArtifact[]
+  events?: ExploreEvent[]
+  error?: { code?: string; message?: string; [key: string]: any } | AnyRecord
+  model?: string
+  created_at?: number
+  finished_at?: number
+  [key: string]: any
+}
+
+export interface ExploreHistoryItem {
+  eid: string
+  intent: string
+  status: string
+  verdict?: string
+  created_at?: number
+  finished_at?: number
+  summary?: ExploreSummary
+}
+
+export interface ExploreStartResult {
+  eid: string
+  status: string
+  cursor?: number
+}
+
+export interface ExploreReplay {
+  status?: string
+  checks?: ExploreCheck[]
+  errors?: AnyRecord[]
+  duration_ms?: number
+  [key: string]: any
+}
+
+export interface ExploreCrystallizeResult {
+  wid: string
+  rev?: number
+  explore_id?: string
+  atoms_created?: string[]
+  pending_atoms?: string[]
+  replay?: ExploreReplay
+  validation?: Validation | AnyRecord
+  graph?: { nodes?: AnyRecord[]; edges?: AnyRecord[] }
+  state?: string
+  replay_status?: string
   [key: string]: any
 }

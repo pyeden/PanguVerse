@@ -37,6 +37,10 @@ import type {
   WorkflowTriggerCreate,
   WorkflowTriggerPatch,
   WorkflowTriggerResult,
+  ExploreSession,
+  ExploreHistoryItem,
+  ExploreStartResult,
+  ExploreCrystallizeResult,
 } from './types'
 
 export class ApiError extends Error {
@@ -932,6 +936,46 @@ export function normalizeDiff(payload: AnyRecord): StudioDiff {
 
 function unwrapSchedule(payload: AnyRecord): Schedule {
   return (payload?.schedule || payload) as Schedule
+}
+
+/* -------------------------------------------------------------------------- */
+/* Explore-first：先跑通，再固化                                              */
+/* -------------------------------------------------------------------------- */
+
+export const exploreApi = {
+  /** POST /api/studio/explore —— 启动一次探索（无 LLM 时后端 503）。 */
+  start: (body: {
+    intent: string
+    success_criteria?: unknown[]
+    domain_pack?: string
+    allow_scripts?: boolean
+    max_steps?: number
+  }) => request<ExploreStartResult>('api/studio/explore', { method: 'POST', body }),
+
+  /** GET /api/studio/explore/{eid}?cursor=N —— 增量事件。 */
+  get: (eid: string, cursor = 0) =>
+    request<ExploreSession>(
+      `api/studio/explore/${encodeURIComponent(eid)}?cursor=${encodeURIComponent(String(cursor))}`,
+    ),
+
+  /** GET /api/studio/explore —— 历史探索。 */
+  list: async (limit = 30): Promise<ExploreHistoryItem[]> => {
+    const payload = await request<{ sessions?: ExploreHistoryItem[] }>(
+      `api/studio/explore?limit=${encodeURIComponent(String(limit))}`,
+    )
+    return Array.isArray(payload.sessions) ? payload.sessions : []
+  },
+
+  /** POST /api/studio/explore/{eid}/crystallize —— 固化为普通 studio 草稿。 */
+  crystallize: (eid: string, body: { name?: string; include_scripts?: boolean } = {}) =>
+    request<ExploreCrystallizeResult>(
+      `api/studio/explore/${encodeURIComponent(eid)}/crystallize`,
+      { method: 'POST', body },
+    ),
+
+  /** 产物原始 URL（只读）；图片直接作为 src，HTML 仅做沙箱预览。 */
+  artifactUrl: (eid: string, path: string) =>
+    `api/studio/explore/${encodeURIComponent(eid)}/artifact?path=${encodeURIComponent(path)}`,
 }
 
 export function errorHint(error: unknown): string {

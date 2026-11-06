@@ -9,6 +9,7 @@ import { Badge, IconButton, StatusBadge } from './ui'
 
 const navItems: { id: string; label: string; href: string; icon: IconName; hint?: string }[] = [
   { id: 'studio', label: '工作台', href: '/studio/new', icon: 'spark', hint: '造流程' },
+  { id: 'explore', label: '探索', href: '/studio/explore', icon: 'bolt', hint: '先跑' },
   { id: 'projects', label: '项目', href: '/projects', icon: 'projects', hint: '域' },
   { id: 'atoms', label: '原子', href: '/atoms', icon: 'atoms', hint: '料' },
   { id: 'tasks', label: '任务', href: '/tasks', icon: 'tasks', hint: '活' },
@@ -20,13 +21,14 @@ const navItems: { id: string; label: string; href: string; icon: IconName; hint?
 ]
 
 function isCanvasRoute(route: Route): boolean {
-  return route.parts[0] === 'studio' && !!route.parts[1] && route.parts[1] !== 'new' && route.parts[2] !== 'review'
+  return route.parts[0] === 'studio' && !!route.parts[1] && route.parts[1] !== 'new' && route.parts[1] !== 'explore' && route.parts[2] !== 'review'
 }
 
 function navActive(route: Route): string {
   const first = route.parts[0] || 'projects'
   if (first === 'p') return 'projects'
-  if (first === 'studio' || first === 'platform') return 'studio'
+  if (first === 'studio') return route.parts[1] === 'explore' ? 'explore' : 'studio'
+  if (first === 'platform') return 'studio'
   return first
 }
 
@@ -42,6 +44,7 @@ function crumbs(route: Route, projects: Project[]): { label: string; href?: stri
   if (first === 'artifacts') return [{ label: '产出物' }]
   if (first === 'studio') {
     if (route.parts[1] === 'new') return [{ label: '工作台' }, { label: '新建流程' }]
+    if (route.parts[1] === 'explore') return [{ label: '工作台', href: '/studio/new' }, { label: '探索' }, ...(route.parts[2] ? [{ label: '回看' }] : [])]
     if (route.parts[2] === 'review') return [{ label: '工作台', href: '/studio/new' }, { label: '流程', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
     return [{ label: '工作台', href: '/studio/new' }, { label: '画布' }]
   }
