@@ -21,6 +21,7 @@ from typing import Any
 from ..axe.plan import PlanRequest, TestPlan
 from ..axe.planner import LLMPlanner, RuleBasedPlanner
 from ..core.errors import PlanError
+from .site_aliases import resolve_site_url
 
 URL_RE = re.compile(r"https?://[^\s，。；、）)\]}>\"']+", re.IGNORECASE)
 
@@ -380,6 +381,10 @@ class IntentAnalysis:
     intent: str
     domain: str = ""
     url: str = ""
+    #: URL 来源：``explicit``（用户原句里的 URL）或 ``site_alias``（站点别名表解析）。
+    url_source: str = ""
+    #: 站点别名命中时的站点 key（如 ``baidu``），未命中为空。
+    site: str = ""
     actions: list[str] = field(default_factory=list)
     requested_atoms: list[str] = field(default_factory=list)
     missing_atoms: list[str] = field(default_factory=list)
@@ -397,6 +402,8 @@ class IntentAnalysis:
         return {
             "domain": self.domain,
             "url": self.url,
+            "url_source": self.url_source,
+            "site": self.site,
             "actions": list(self.actions),
             "requested_atoms": list(self.requested_atoms),
             "missing_atoms": list(self.missing_atoms),
@@ -475,6 +482,15 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     analysis = IntentAnalysis(intent=text)
     urls = [match.group(0).rstrip(".,;:!?") for match in URL_RE.finditer(text)]
     analysis.url = urls[0] if urls else ""
+    if analysis.url:
+        # 显式 URL 永远优先；站点别名只在没有显式 URL 时参与解析。
+        analysis.url_source = "explicit"
+    else:
+        resolution = resolve_site_url(text)
+        if resolution is not None:
+            analysis.url = resolution.url
+            analysis.url_source = resolution.source
+            analysis.site = resolution.site
 
     # 先做领域 + 动作路由（新领域靠词表和动作词参与同一套打分）
     # 设备域优先：同时出现「iOS/模拟器」和「网页/浏览器」时走设备域，
@@ -740,7 +756,9 @@ def _build_web_spec(
         ]
         spec["name"] = "网页正文提取"
         spec["description"] = "抓取页面并提取正文（未配置 LLM，不生成总结节点）"
-    if analysis.url:
+    # 显式 URL 沿用旧行为直接注入（plan_draft 的调用方可能不经过工作台自动填充层）；
+    # 站点别名解析出的 URL 交给 studio 的通用自动填充层处理，保持单一职责。
+    if analysis.url and analysis.url_source == "explicit":
         for step in spec.get("steps") or []:
             if step.get("id") == "fetch_page":
                 step.setdefault("with", {})["url"] = analysis.url
@@ -760,7 +778,7 @@ def _build_web_browser_spec(analysis: IntentAnalysis) -> dict[str, Any]:
         spec = browser_pack.build_web_wait_text()
     else:
         spec = browser_pack.build_web_content()
-    if analysis.url:
+    if analysis.url and analysis.url_source == "explicit":
         for step in spec.get("steps") or []:
             if step.get("use") in {"web_open", "web_screenshot", "web_wait_for_text"}:
                 step.setdefault("with", {})["url"] = analysis.url
@@ -1049,6 +1067,8 @@ def plan_draft(
                 "missing_inputs": list(analysis.missing_inputs),
                 "missing_atoms": [],
                 "suggestions": list(analysis.suggestions),
+                "autofilled": [],
+                "param_gaps": [],
                 "intent": intent,
             },
         )

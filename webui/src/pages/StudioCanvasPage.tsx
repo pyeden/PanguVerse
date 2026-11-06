@@ -949,6 +949,10 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const confidence = Number.isFinite(confidenceValue) ? confidenceValue : null
   const assumptions = (workflow.assumptions || storedProvenance?.assumptions || []).map(String)
   const capabilityGaps = gapItems(workflow.capability_gaps || storedProvenance?.capability_gaps || validation.capability_gaps || [])
+  type ParamAuditEntry = { node_id?: string; atom?: string; param?: string; value?: string; source?: string; reason?: string }
+  const paramAudit = (workflow.param_audit || {}) as { autofilled?: ParamAuditEntry[]; param_gaps?: ParamAuditEntry[] }
+  const autofilled = Array.isArray(paramAudit.autofilled) ? paramAudit.autofilled : []
+  const paramGaps = Array.isArray(paramAudit.param_gaps) ? paramAudit.param_gaps : []
   const coverage = validation.coverage || null
   const missingEnv = validation.missing_env || []
   const selectedUpstreamBlocked = debugStep && debugStep.status === 'failed' ? upstreamBlockedFor(debugStep.node_id) : []
@@ -1306,6 +1310,22 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 {assumptions.map((item) => <code key={item}>{item}</code>)}
               </span>
             ) : <span className="plan-assumptions muted">没有待确认假设</span>}
+            {autofilled.length ? (
+              <span className="plan-assumptions" data-testid="param-autofilled" title="生成阶段按原子输入端口自动填入的 URL">
+                <Icon name="check" size={12} /> 已自动填写
+                {autofilled.slice(0, 3).map((item, index) => (
+                  <code key={`${item.node_id}-${item.param}-${index}`}>{item.param}={item.value}</code>
+                ))}
+              </span>
+            ) : null}
+            {paramGaps.length ? (
+              <span className="plan-assumptions plan-gaps" data-testid="param-gaps" title="必填端口缺失或仍是未解析的环境变量">
+                <Icon name="warning" size={12} /> 参数缺口
+                {paramGaps.slice(0, 3).map((item, index) => (
+                  <code key={`${item.node_id}-${item.param}-${index}`}>{item.param}{item.reason === 'unresolved_env' ? '=env' : ''}</code>
+                ))}
+              </span>
+            ) : null}
           </div>
           {capabilityGaps.length ? (
             <div className="capability-gap-bar" data-testid="capability-gap-bar">

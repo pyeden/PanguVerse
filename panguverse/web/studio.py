@@ -36,7 +36,7 @@ from ..core.contract import failure_is_retryable
 from ..core.errors import AtomFailure, PanguError, StepFailure
 from ..core.molecule import Step
 from ..core.redact import mask_obj
-from . import planner_gate, projects
+from . import param_fill, planner_gate, projects
 from .graph import (
     apply_graph_diff,
     diff_graphs,
@@ -691,6 +691,29 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     for node in graph["nodes"]:
         _helper_node(node)
 
+    # 生成阶段就做一次「参数可用性」审计：显式 URL / 站点别名解析出的 URL
+    # 按原子输入端口自动填入所有带 url 的必填端口，不针对具体原子写特判。
+    analysis = dict(bundle.analysis or {})
+    resolved_url = str(analysis.get("url") or "").strip()
+    url_source = str(analysis.get("url_source") or "")
+    autofilled = (
+        param_fill.fill_url_params(
+            graph["nodes"],
+            _registry(),
+            resolved_url,
+            source=url_source or "explicit",
+        )
+        if resolved_url
+        else []
+    )
+    param_gaps = param_fill.audit_param_gaps(graph["nodes"], _registry())
+    param_audit = {
+        "url": resolved_url,
+        "url_source": url_source,
+        "autofilled": autofilled,
+        "param_gaps": param_gaps,
+    }
+
     wid = new_wid()
     env_schema = _env_schema(graph["nodes"])
     name = str(plan.cases[0].name or intent)[:80]
@@ -705,6 +728,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "confidence": bundle.confidence,
         "assumptions": list(bundle.assumptions),
         "capability_gaps": list(bundle.capability_gaps),
+        "param_audit": param_audit,
         "state": "draft",
         "current_rev": 0,
         "locked": [],
@@ -729,6 +753,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "confidence": bundle.confidence,
         "assumptions": list(bundle.assumptions),
         "capability_gaps": list(bundle.capability_gaps),
+        "param_audit": param_audit,
         "env_schema": env_schema,
         "nodes": graph["nodes"],
         "edges": graph["edges"],
@@ -772,6 +797,11 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "assumptions": list(bundle.assumptions),
         "capability_gaps": list(bundle.capability_gaps),
         "analysis": bundle.analysis,
+        "url": resolved_url,
+        "url_source": url_source,
+        "autofilled": autofilled,
+        "param_gaps": param_gaps,
+        "param_audit": param_audit,
         "graph": graph,
         "validation": validation,
     }
@@ -849,6 +879,9 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
         "assumptions": list(revision.get("assumptions") or workflow.get("assumptions") or []),
         "capability_gaps": list(
             revision.get("capability_gaps") or workflow.get("capability_gaps") or []
+        ),
+        "param_audit": dict(
+            revision.get("param_audit") or workflow.get("param_audit") or {}
         ),
         "state": workflow.get("state"),
         "current_rev": workflow.get("current_rev"),

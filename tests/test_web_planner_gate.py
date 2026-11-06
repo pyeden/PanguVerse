@@ -167,20 +167,90 @@ def test_missing_url_is_missing_inputs_not_capability_gap(
     """P0-2：缺 URL 不是能力缺口，missing_atoms 不能列出已存在原子。"""
     monkeypatch.delenv("PANGUVERSE_API_KEY", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    # 用未知站点验证 missing_inputs 契约；已知站点（百度）现在会被别名表解析成 URL。
     status, body = call(
         api,
         "POST",
         "/api/studio/drafts",
-        {"intent": "打开百度网页，获取今天的实时热点新闻"},
+        {"intent": "打开某某公司网页，获取今天的实时热点新闻"},
     )
     assert status == 422, body
     error = body["error"]
     assert error["code"] == "missing_inputs"
     assert error["missing_inputs"] == ["url"]
     assert error["missing_atoms"] == []
+    assert error["autofilled"] == []
+    assert error["param_gaps"] == []
     registry = default_registry()
     assert all(not registry.has(name) for name in error["missing_atoms"])
     assert "graph" not in body
+
+
+def test_site_alias_resolves_baidu_hotnews(api: WebAPI) -> None:
+    # 站点别名是数据表：百度 + 热点 → top.baidu，且显式 URL 优先。
+    from panguverse.web import planner_gate
+
+    analysis = planner_gate.analyze_intent("打开百度网站，提取今天的热点新闻")
+    assert analysis.url == "https://top.baidu.com/board?tab=realtime"
+    assert analysis.url_source == "site_alias"
+    assert analysis.site == "baidu"
+    assert analysis.missing_inputs == []
+
+    plain = planner_gate.analyze_intent("打开百度网站看看")
+    assert plain.url == "https://www.baidu.com"
+
+    explicit = planner_gate.analyze_intent(
+        "打开百度网站 https://example.com/hot 提取热点新闻"
+    )
+    assert explicit.url == "https://example.com/hot"
+    assert explicit.url_source == "explicit"
+
+    unknown = planner_gate.analyze_intent("打开某某公司网站，提取热点新闻")
+    assert unknown.url == ""
+    assert unknown.url_source == ""
+    assert unknown.missing_inputs == ["url"]
+
+
+def test_create_draft_autofills_every_url_port(api: WebAPI) -> None:
+    # 自动填充按端口契约生效，不针对具体原子；审计同时给出 autofilled / param_gaps。
+    intent = "打开百度网站，提取今天的热点新闻"
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": intent})
+    assert status == 201, body
+    assert body["url"] == "https://top.baidu.com/board?tab=realtime"
+    assert body["url_source"] == "site_alias"
+    assert body["autofilled"], body
+    assert body["param_gaps"] == [], body
+    for node in body["graph"]["nodes"]:
+        if "url" in node["params"]:
+            assert node["params"]["url"] == body["url"]
+    assert all(item["source"] == "site_alias" for item in body["autofilled"])
+    assert body["validation"]["ok"] is True
+
+    # 显式 URL 覆盖站点默认值，并记 source=explicit
+    status, explicit = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "打开百度网站 https://example.com/hot 提取热点新闻"},
+    )
+    assert status == 201, explicit
+    assert explicit["url"] == "https://example.com/hot"
+    assert explicit["url_source"] == "explicit"
+    assert all(item["source"] == "explicit" for item in explicit["autofilled"])
+
+
+def test_create_draft_autofills_web_browser_url_params(api: WebAPI) -> None:
+    intent = "打开百度网站，提取今天的热点新闻"
+    status, body = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": intent, "domain_pack": "web_browser"},
+    )
+    assert status == 201, body
+    open_node = next(node for node in body["graph"]["nodes"] if node["atom"] == "web_open")
+    assert open_node["params"]["url"] == "https://top.baidu.com/board?tab=realtime"
+    assert any(item["atom"] == "web_open" and item["param"] == "url" for item in body["autofilled"])
 
 
 def test_only_mode_upstream_dependency_has_clear_error(api: WebAPI) -> None:

@@ -670,3 +670,46 @@ def test_published_workflow_binds_project_and_run_traces_ref(
     ).is_file()
     loaded = studio.load_published(api.root, ref)
     assert loaded["revision"]["rev"] == 0
+
+
+def test_param_fill_is_port_contract_driven() -> None:
+    """自动填充只看原子输入端口，不认具体原子名；新增 url 端口自动纳入。"""
+    from panguverse.core.atom import Atom
+    from panguverse.core.registry import AtomRegistry
+    from panguverse.web import param_fill
+
+    registry = AtomRegistry("test")
+    registry.register(
+        Atom(
+            name="fake_fetch",
+            fn=lambda **_: None,
+            inputs={"target_url": "string", "method?": "string"},
+            required=("target_url",),
+        )
+    )
+    nodes = [{"id": "n1", "atom": "fake_fetch", "params": {"target_url": "${env.PAGE_URL}"}}]
+    records = param_fill.fill_url_params(
+        nodes, registry, "https://example.test/hot", source="site_alias"
+    )
+    assert nodes[0]["params"]["target_url"] == "https://example.test/hot"
+    assert records == [
+        {
+            "node_id": "n1",
+            "atom": "fake_fetch",
+            "param": "target_url",
+            "value": "https://example.test/hot",
+            "source": "site_alias",
+            "previous": "${env.PAGE_URL}",
+        }
+    ]
+    assert param_fill.audit_param_gaps(nodes, registry) == []
+
+    # 占位符 + 路径的组合不能被网页 URL 覆盖；它仍是参数缺口（未解析 env）。
+    composite = [{"id": "n2", "atom": "fake_fetch", "params": {"target_url": "${env.BASE_URL}/api"}}]
+    assert param_fill.fill_url_params(composite, registry, "https://example.test/hot") == []
+    assert composite[0]["params"]["target_url"] == "${env.BASE_URL}/api"
+    gaps = param_fill.audit_param_gaps(composite, registry)
+    assert gaps and gaps[0]["reason"] == "unresolved_env"
+
+    missing = [{"id": "n3", "atom": "fake_fetch", "params": {}}]
+    assert param_fill.audit_param_gaps(missing, registry)[0]["reason"] == "missing"
