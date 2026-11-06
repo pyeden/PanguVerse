@@ -235,13 +235,18 @@ class WebAPI:
                         domain=_first(query, "domain"),
                         tag=_first(query, "tag"),
                         category=_first(query, "category"),
+                        workspace=self.root,
                     )
                 )
             if head == "packs":
                 if not rest:
-                    return json_response(service.list_packs(domain=_first(query, "domain")))
+                    return json_response(
+                        service.list_packs(
+                            domain=_first(query, "domain"), workspace=self.root
+                        )
+                    )
                 if len(rest) == 1:
-                    return json_response(service.get_pack(rest[0]))
+                    return json_response(service.get_pack(rest[0], workspace=self.root))
             if head == "scenarios" and not rest:
                 return json_response(service.list_scenarios(self.root))
             if head == "tasks":

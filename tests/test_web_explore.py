@@ -554,3 +554,172 @@ def test_replay_failure_blocks_publish(tmp_path: Path, hot_server: str) -> None:
     )
     assert status == 409, body
     assert body["error"]["code"] == "replay_failed"
+
+
+# --------------------------------------------------------------------------- #
+# P1: final checks 修复反馈 + 脚本原子固化
+# --------------------------------------------------------------------------- #
+def test_final_checks_invalid_gets_one_feedback_then_succeeds(
+    tmp_path: Path, hot_server: str
+) -> None:
+    decisions = [
+        {
+            "action": "tool",
+            "tool": "web_open",
+            "params": {"url": hot_server},
+            "thought": "打开页面",
+        },
+        {
+            "action": "final",
+            "checks": [{"id": "bad", "type": "text_contains"}],
+            "thought": "先尝试收尾（缺 value）",
+        },
+        {
+            "action": "final",
+            "checks": [{"id": "ok", "type": "text_contains", "value": "热搜", "step": 1}],
+            "thought": "补上 value 后收尾",
+        },
+    ]
+    llm = FakeLLM(decisions)
+    api = new_api(tmp_path, llm=llm, registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开百度热搜", "max_steps": 5}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert session["verdict"] == "passed"
+    assert all(item["ok"] for item in session["checks"])
+    assert "非法" in llm.prompts[2]
+    assert any(event["type"] == "feedback" for event in session["events"])
+
+
+def test_final_checks_still_invalid_fails_with_readable_reason(
+    tmp_path: Path, hot_server: str
+) -> None:
+    decisions = [
+        {
+            "action": "tool",
+            "tool": "web_open",
+            "params": {"url": hot_server},
+            "thought": "打开页面",
+        },
+        {
+            "action": "final",
+            "checks": [{"id": "bad", "type": "text_contains"}],
+            "thought": "第一次非法",
+        },
+        {
+            "action": "final",
+            "checks": [{"id": "bad", "type": "text_contains"}],
+            "thought": "仍然非法",
+        },
+    ]
+    api = new_api(tmp_path, llm=FakeLLM(decisions), registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开百度热搜", "max_steps": 5}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "failed", session
+    assert session["status"] != "error"
+    assert "final checks 连续非法" in session["summary"]["reason"]
+    assert session["error"] == {}
+
+
+def test_final_without_checks_prompts_for_checks_and_never_succeeds_silently(
+    tmp_path: Path, hot_server: str
+) -> None:
+    decisions = [
+        {
+            "action": "tool",
+            "tool": "web_open",
+            "params": {"url": hot_server},
+            "thought": "打开页面",
+        },
+        {"action": "final", "thought": "没有 checks", "checks": []},
+        {
+            "action": "final",
+            "checks": [{"id": "ok", "type": "text_contains", "value": "热搜", "step": 1}],
+            "thought": "补检查",
+        },
+    ]
+    llm = FakeLLM(decisions)
+    api = new_api(tmp_path, llm=llm, registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开百度热搜", "max_steps": 5}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert "缺少可执行 checks" in llm.prompts[2]
+
+
+def test_script_step_is_crystallized_into_workspace_atom_and_replayed(
+    tmp_path: Path,
+) -> None:
+    from panguverse.core.registry import default_registry
+    from panguverse.core.workspace_packs import load_workspace_packs
+
+    script = (
+        "import json\n"
+        "items = [{'word': '热点一'}, {'word': '热点二'}]\n"
+        "with open('input.json', 'w', encoding='utf-8') as f:\n"
+        "    json.dump({'items': items}, f, ensure_ascii=False)\n"
+        "with open('report.html', 'w', encoding='utf-8') as f:\n"
+        "    f.write('<h1>今日热点</h1>' + ''.join(i['word'] for i in items))\n"
+        "with open('report_items.json', 'w', encoding='utf-8') as f:\n"
+        "    json.dump(items, f, ensure_ascii=False)\n"
+        "print('source: input.json')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/build_report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [
+                {"id": "html", "type": "file_exists", "path": "report.html"},
+                {"id": "items", "type": "file_exists", "path": "report_items.json"},
+            ],
+            "thought": "产物已落盘",
+        },
+    ]
+    llm = FakeLLM(decisions)
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=llm, explore_registry=default_registry())
+    status, body, _ = call(
+        api,
+        "POST",
+        "/api/studio/explore",
+        {"intent": "生成热点报告", "max_steps": 4},
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+
+    status, draft, _ = call(
+        api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
+    )
+    assert status == 200, draft
+    created = draft["atoms_created"]
+    assert [item["name"] for item in created] == ["build_report"]
+    atom = created[0]
+    assert atom["effects"] == ["write"]
+    assert atom["idempotent"] is True
+    assert atom["failure_class"]
+    assert atom["outputs"]["report_html"] == "string"
+    assert atom["outputs"]["items"] == "string"
+    assert atom["output_paths"]["report_html"] == "report.html"
+    assert atom["output_paths"]["items"] == "report_items.json"
+    atom_path = Path(atom["path"])
+    assert atom_path.is_file()
+    assert root / ".panguverse" / "packs" in atom_path.parents
+    nodes = draft["graph"]["nodes"]
+    assert [node["atom"] for node in nodes] == ["build_report"]
+    assert nodes[0]["origin"] == "explore"
+    assert nodes[0]["new_atom"] is True
+    assert Path(nodes[0]["params"]["input_dir"]).parent.name == atom["pack"]
+    assert draft["pending_atoms"] == []
+    assert draft["replay"]["status"] == "passed", draft["replay"]
+    packs = load_workspace_packs(root)
+    assert any(pack.name == atom["pack"] for pack in packs)

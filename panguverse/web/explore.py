@@ -26,7 +26,8 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..axe import agent_exec
+from ..axe import agent_exec, atomize
+from ..core import workspace_packs
 from . import studio
 from .studio import StudioError
 
@@ -480,11 +481,31 @@ def crystallize(
         not_found="探索会话不存在",
         broken="探索会话文件无法解析",
     )
-    success = _read_json(
-        session_dir / "success.json",
-        not_found="探索尚未结束，不能固化",
-        broken="success.json 无法解析",
-    )
+    events = _read_events(session_dir / "trace.jsonl")
+    try:
+        success = _read_json(
+            session_dir / "success.json",
+            not_found="探索尚未结束，不能固化",
+            broken="success.json 无法解析",
+        )
+    except StudioError as exc:
+        # trace 的 end 事件可能先于 success.json 落盘（终态写入有毫秒级窗口）。
+        end = next(
+            (item for item in reversed(events) if item.get("type") == "end"), None
+        )
+        if exc.code != "not_found" or end is None:
+            raise
+        success = {
+            "verdict": end.get("verdict") or "",
+            "status": end.get("status") or "",
+            "checks": list(end.get("checks") or []),
+            "summary": dict(end.get("summary") or {}),
+        }
+        meta = dict(meta)
+        meta["verdict"] = success["verdict"]
+        meta["status"] = success["status"]
+        meta["summary"] = success["summary"]
+        meta["checks"] = success["checks"]
     if success.get("verdict") != "passed" or meta.get("verdict") != "passed":
         raise StudioError(
             "not_succeeded",
@@ -494,7 +515,6 @@ def crystallize(
         )
     if registry is None:
         registry = service.registry()
-    events = _read_events(session_dir / "trace.jsonl")
     try:
         graph = agent_exec.build_crystallized_graph(
             events,
@@ -508,7 +528,34 @@ def crystallize(
     except agent_exec.AgentExecError as exc:
         raise StudioError(exc.code, exc.message, status=exc.status, details=exc.details) from exc
 
-    draft = studio.create_draft_from_graph(
+    # P1: successful scripts become real workspace atoms; their nodes are
+    # inserted in trace order so replay executes the new atom, not the file.
+    materialized = atomize.materialize_script_atoms(
+        workspace=root,
+        session_dir=session_dir,
+        scripts=graph.get("scripts") or [],
+        eid=eid,
+        intent=str(meta.get("intent") or ""),
+    )
+    atoms_created = list(materialized.get("atoms_created") or [])
+    if materialized.get("nodes"):
+        graph = atomize.merge_script_nodes(graph, materialized["nodes"])
+        materialized_paths = {
+            str(item.get("source_script") or "") for item in atoms_created
+        }
+        graph["pending_atoms"] = [
+            item
+            for item in (graph.get("pending_atoms") or [])
+            if not (item.get("kind") == "script" and str(item.get("path") or "") in materialized_paths)
+        ]
+    # Runtime atom lookup must see the workspace pack without mutating the
+    # process-global registry (one workspace cannot pollute another).
+    registry = workspace_packs.workspace_registry(root, registry)
+    # 测试注入的轻量 registry 不参与 studio 的 plan 校验（其接口不含 packs）；
+    # 生产 registry 则必须带上本 workspace 的原子，否则新原子会被判“不存在”。
+    validation_registry = registry if hasattr(registry, "packs") else None
+
+    created = studio.create_draft_from_graph(
         root,
         intent=str(meta.get("intent") or ""),
         name=str(data.get("name") or graph.get("name") or ""),
@@ -519,6 +566,7 @@ def crystallize(
         domain_pack=str(meta.get("domain_pack") or ""),
         pending_atoms=graph["pending_atoms"],
         replay_checks=graph["checks"],
+        registry=validation_registry,
     )
     try:
         replay = agent_exec.replay_graph(
@@ -533,19 +581,20 @@ def crystallize(
             "checks": [],
             "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
         }
-    draft = studio.record_replay(root, draft["wid"], replay)
+    recorded = studio.record_replay(root, created["wid"], replay)
     return {
-        "wid": draft["wid"],
-        "rev": draft["rev"],
+        "wid": created["wid"],
+        "rev": created["rev"],
         "explore_id": eid,
-        "atoms_created": [],
+        "atoms_created": atoms_created,
         "pending_atoms": graph["pending_atoms"],
         "out_of_scope": graph.get("out_of_scope") or [],
         "route": graph.get("route") or "",
         "replay": replay,
-        "validation": draft.get("validation") or {},
+        "validation": created.get("validation") or {},
         "graph": {"nodes": graph["nodes"], "edges": graph["edges"]},
-        "state": draft.get("state") or "draft",
+        "state": recorded.get("state") or created.get("state") or "draft",
+        "replay_status": recorded.get("replay_status") or "",
     }
 
 

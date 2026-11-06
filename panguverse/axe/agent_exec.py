@@ -646,6 +646,7 @@ class ExploreAgent:
         checks_spec = normalize_checks(success_criteria)
         feedback = ""
         saw_final = False
+        final_checks_retry_used = False
         last_checks: list[dict[str, Any]] = []
         actions_used = 0
         llm_turns = 0
@@ -698,12 +699,44 @@ class ExploreAgent:
             if action == "final":
                 saw_final = True
                 proposed = decision.get("checks")
-                specs = checks_spec or normalize_checks(proposed)
-                if not specs:
-                    raise AgentExecError(
-                        "bad_request",
-                        "成功标准必须落成可执行检查（text_contains/status_code/file_exists/regex）",
+                try:
+                    specs = checks_spec or normalize_checks(proposed)
+                except AgentExecError as exc:
+                    # LLM 的 final checks 缺字段/类型非法：给一次反馈修正，
+                    # 连续非法才以可读原因失败（不能把会话打成 error）。
+                    feedback = (
+                        f"你的 final checks 非法：{exc.message}。"
+                        "请重发 final，给出可执行检查（type + 参数）。"
                     )
+                    if final_checks_retry_used:
+                        return self._finish(
+                            "failed",
+                            checks=last_checks,
+                            summary={
+                                "reason": f"final checks 连续非法：{exc.message}",
+                                "steps": actions_used,
+                            },
+                        )
+                    final_checks_retry_used = True
+                    self.emit("feedback", {"text": feedback})
+                    continue
+                if not specs:
+                    feedback = (
+                        "final 缺少可执行 checks：请补充 text_contains/status_code/"
+                        "file_exists/regex 检查后再 final。"
+                    )
+                    if final_checks_retry_used:
+                        return self._finish(
+                            "failed",
+                            checks=last_checks,
+                            summary={
+                                "reason": "final 未提供可执行 checks（已反馈一次仍未修正）",
+                                "steps": actions_used,
+                            },
+                        )
+                    final_checks_retry_used = True
+                    self.emit("feedback", {"text": feedback})
+                    continue
                 checks_spec = specs
                 checks = self._evaluate(specs)
                 verdict = "passed" if checks and all(item["ok"] for item in checks) else "failed"
@@ -795,6 +828,7 @@ class ExploreAgent:
             "- final 的 checks 必须是确定性检查；LLM 自述不算通过。\n"
             "- 给定 criteria 一旦满足就立即 final；不要重复打开同一页面或重复落盘。\n"
             "- 没有可执行检查时不得 final。\n"
+            "- 如果 last_failure 指出 checks 非法，必须修正字段后重发 final。\n"
         )
         recent = [
             {
@@ -1151,8 +1185,13 @@ def build_crystallized_graph(
             scripts.append(event)
 
     successful = [item for item in calls if item["ok"] and item["tool"]]
-    if not successful:
-        raise AgentExecError("bad_request", "探索轨迹没有成功的原子调用可固化")
+    successful_scripts = [
+        item
+        for item in scripts
+        if item.get("ok") and int(item.get("exit_code") or 0) == 0
+    ]
+    if not successful and not successful_scripts:
+        raise AgentExecError("bad_request", "探索轨迹没有成功的原子调用或脚本可固化")
 
     analysis = route_analysis(intent, domain_pack) if registry is not None else None
     allowed = allowed_atom_names(registry, analysis) if registry is not None else None
@@ -1177,7 +1216,7 @@ def build_crystallized_graph(
                 "params": call["actual_params"],
             }
         )
-    if not kept:
+    if not kept and not successful_scripts:
         raise AgentExecError(
             "bad_request",
             f"轨迹中的原子均不属于路由域 {route or '未知'}，没有可固化节点",

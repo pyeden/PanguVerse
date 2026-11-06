@@ -97,7 +97,14 @@ def pack_registry() -> Any:
 
 
 def build_axe(root: Path, *, enable_llm: bool = True) -> PanguAxe:
-    return PanguAxe(registry=registry(), workspace=str(root), enable_llm=enable_llm)
+    from ..core.workspace_packs import workspace_registry
+
+    # 工作区 pack（探索固化产物）只在本 workspace 的运行时可见。
+    return PanguAxe(
+        registry=workspace_registry(root, registry()),
+        workspace=str(root),
+        enable_llm=enable_llm,
+    )
 
 
 def llm_enabled() -> bool:
@@ -226,9 +233,16 @@ def status_payload(root: Path) -> dict[str, Any]:
 
 
 def list_atoms(
-    *, domain: str | None = None, tag: str | None = None, category: str | None = None
+    *,
+    domain: str | None = None,
+    tag: str | None = None,
+    category: str | None = None,
+    workspace: Path | None = None,
 ) -> list[dict[str, Any]]:
-    items = registry().list(
+    from ..core.workspace_packs import workspace_registry
+
+    active = workspace_registry(workspace, registry()) if workspace is not None else registry()
+    items = active.list(
         category=category or None, tag=tag or None, domain=domain or None
     )
     return [item.spec() for item in items]
@@ -247,12 +261,27 @@ def _pack_summary(pack: AtomPack) -> dict[str, Any]:
     }
 
 
-def list_packs(*, domain: str | None = None) -> list[dict[str, Any]]:
-    return [_pack_summary(pack) for pack in pack_registry().list(domain=domain or None)]
+def list_packs(*, domain: str | None = None, workspace: Path | None = None) -> list[dict[str, Any]]:
+    packs = list(pack_registry().list(domain=domain or None))
+    if workspace is not None:
+        from ..core.workspace_packs import load_workspace_packs
+
+        existing = {pack.name for pack in packs}
+        packs.extend(
+            pack
+            for pack in load_workspace_packs(workspace)
+            if (not domain or pack.domain == domain) and pack.name not in existing
+        )
+    return [_pack_summary(pack) for pack in packs]
 
 
-def get_pack(name: str) -> dict[str, Any]:
-    for pack in pack_registry().list():
+def get_pack(name: str, *, workspace: Path | None = None) -> dict[str, Any]:
+    candidates = list(pack_registry().list())
+    if workspace is not None:
+        from ..core.workspace_packs import load_workspace_packs
+
+        candidates.extend(pack for pack in load_workspace_packs(workspace) if pack.name not in {p.name for p in candidates})
+    for pack in candidates:
         if pack.name == name:
             data = _pack_summary(pack)
             data["atoms"] = [atom.name for atom in pack.atoms]

@@ -58,6 +58,8 @@ class Atom:
     secret_inputs: tuple[str, ...] = ()
     secret_outputs: tuple[str, ...] = ()
     idempotent: bool | None = None
+    #: 失败时的中立分类（``FailureClass`` 取值）；空表示未声明。
+    failure_class: str = ""
     #: 副作用可能随入参变化（例如 HTTP 方法决定读写）时提供解析器
     effect_resolver: Callable[[Mapping[str, Any]], Iterable[str]] | None = None
     #: 哪些**输入的名字**本身就是「新建的变量名」（例如 ``set_var.name`` / ``json_get.save_as``）。
@@ -210,6 +212,8 @@ class Atom:
             data["declares_variables"] = list(self.declares_variables)
         if self.produces:
             data["produces"] = list(self.produces)
+        if self.failure_class:
+            data["failure_class"] = self.failure_class
         return data
 
     def __str__(self) -> str:  # pragma: no cover - 展示用

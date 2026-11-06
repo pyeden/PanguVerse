@@ -685,11 +685,16 @@ def validate_nodes(
     available_env: Iterable[str] | None = None,
     checks: Mapping[str, Any] | None = None,
     domain_pack: str = "",
+    registry: Any = None,
 ) -> dict[str, Any]:
     nodes = list(nodes)
     env_keys = list(env_schema) or _env_schema(nodes)
+    if registry is None:
+        from ..core.workspace_packs import workspace_registry
+
+        registry = workspace_registry(root, _registry())
     plan = plan_from_nodes(nodes, source="studio", intent=intent)
-    result = plan.check(_registry(), known_variables=set(env_keys))
+    result = plan.check(registry, known_variables=set(env_keys))
     errors = [_issue_dict(issue) for issue in result.errors]
     warnings = [_issue_dict(issue) for issue in result.warnings]
     semantic, detail = _semantic_checks(
@@ -995,6 +1000,7 @@ def create_draft_from_graph(
     domain_pack: str = "",
     pending_atoms: list[dict[str, Any]] | None = None,
     replay_checks: list[dict[str, Any]] | None = None,
+    registry: Any = None,
 ) -> dict[str, Any]:
     """Persist an explored (already executed) graph as a draft.
 
@@ -1082,6 +1088,7 @@ def create_draft_from_graph(
         assumptions=assumptions,
         available_env=None,
         domain_pack=domain_pack,
+        registry=registry,
     )
     return {
         "wid": wid,
@@ -2602,9 +2609,10 @@ class _DebugSession:
 
     # ------------------------------------------------------------------ #
     def _run(self) -> None:
+        from ..core.workspace_packs import workspace_registry
         from . import service
 
-        registry = service.registry()
+        registry = workspace_registry(self.root, service.registry())
         ctx = RunContext(env=dict(self.env), run_id=self.sid)
         passed = failed = skipped = 0
         by_reason: dict[str, int] = {}

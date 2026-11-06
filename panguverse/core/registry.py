@@ -126,6 +126,7 @@ class AtomRegistry:
 
     def extend(self, other: AtomRegistry, *, replace: bool = False) -> AtomRegistry:
         self.register_all(list(other._atoms.values()), replace=replace)
+        self._semantics.update(other._semantics)
         for pack in other.packs():
             self._packs[pack.name] = pack
         return self
