@@ -413,6 +413,17 @@ def apply_graph_diff(
     edges = [copy.deepcopy(dict(edge)) for edge in base_edges]
     applied: list[dict[str, Any]] = []
 
+    # 先剔除已接受的删除节点：diff 里的 index 是相对**目标图**的位置，
+    # 若先插入再删除，index 会把待删的旧节点也算进去（首节点被顶到中间）。
+    accepted_removed = {
+        str(change.get("id"))
+        for change in list((diff or {}).get("nodes") or [])
+        if str(change.get("change_id")) in accepted_set
+        and change.get("action") == "removed"
+    }
+    if accepted_removed:
+        nodes = [node for node in nodes if str(node.get("id")) not in accepted_removed]
+
     for change in list((diff or {}).get("nodes") or []):
         change_id = str(change.get("change_id"))
         if change_id not in accepted_set:
@@ -428,7 +439,15 @@ def apply_graph_diff(
                     break
         elif action == "added":
             node = copy.deepcopy(dict(change["after"]))
-            index = int(change.get("index") or len(nodes))
+            # index=0 是合法的插入位置：只有 "缺失/None" 才表示追加到末尾。
+            raw_index = change.get("index")
+            if raw_index is None:
+                index = len(nodes)
+            else:
+                try:
+                    index = int(raw_index)
+                except (TypeError, ValueError):
+                    index = len(nodes)
             nodes.insert(max(0, min(index, len(nodes))), node)
         applied.append(change)
 

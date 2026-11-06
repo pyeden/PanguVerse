@@ -24,6 +24,16 @@ from ..core.errors import PlanError
 from .site_aliases import resolve_site_url
 
 URL_RE = re.compile(r"https?://[^\s，。；、）)\]}>\"']+", re.IGNORECASE)
+#: 裸域名（无协议）：只认常见 TLD，避免把 config.json / v1.2 这类文件名当域名。
+BARE_DOMAIN_RE = re.compile(
+    r"(?<![\w@.:/-])"
+    r"(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+"
+    r"(?:com|cn|net|org|io|dev|co|ai|me|top|xyz|info|app|site|tech|cloud|edu|gov)"
+    r"(?:/[^\s，。；、）)\]}>\"']*)?",
+    re.IGNORECASE,
+)
+#: URL 里的 /api、/api/... 或 /api?：真实接口路径是 API 领域的证据。
+API_URL_PATH_RE = re.compile(r"/api(?:/|$|\?)", re.IGNORECASE)
 
 #: 明确「当前原子库表达不了」的网页动作 → 需要的新原子
 WEB_MISSING_ACTIONS: dict[str, tuple[str, str]] = {
@@ -456,8 +466,36 @@ def _hits(text: str, words: Iterable[str]) -> list[str]:
     return [word for word in words if _word_hit(text, word)]
 
 
+def _strip_urls(text: str) -> str:
+    """去掉 URL 后的语义文本：避免 URL 里的 ``http`` 被当成 API 动作词。"""
+    return URL_RE.sub(" ", text)
+
+
 def _domain_hits(text: str, domain: str) -> list[str]:
     return _hits(text, _DOMAIN_HINTS.get(domain, ()))
+
+
+def _action_hits(text: str, domain: str) -> list[str]:
+    """领域动作词命中。
+
+    API 域的 ``http`` / ``api`` 不能把 URL 协议或域名误当动作证据：
+    只在去掉 URL 的文本上匹配，再用 URL 里的真实 ``/api/...`` 路径补回接口证据。
+    """
+    if domain != "api_testing":
+        return [
+            action
+            for action, words in _action_words(domain).items()
+            if _hits(text, words)
+        ]
+    stripped = _strip_urls(text)
+    actions = [
+        action
+        for action, words in _action_words(domain).items()
+        if _hits(stripped, words)
+    ]
+    if API_URL_PATH_RE.search(text) and "request" not in actions:
+        actions.append("request")
+    return actions
 
 
 def _action_words(domain: str) -> dict[str, tuple[str, ...]]:
@@ -502,7 +540,7 @@ def _score_domains(
         domain_hits = _domain_hits(text, domain)
         if not domain_hits:
             continue
-        actions = [action for action, words in _action_words(domain).items() if _hits(text, words)]
+        actions = _action_hits(text, domain)
         if not actions:
             if fallback is None or len(domain_hits) > fallback[0]:
                 fallback = (len(domain_hits), domain)
@@ -510,6 +548,22 @@ def _score_domains(
         score = len(domain_hits) + len(actions) * 2
         if best is None or score > best[0]:
             best = (score, domain, actions)
+    return best, fallback
+
+
+def _route_intent(
+    text: str, analysis: IntentAnalysis
+) -> tuple[tuple[int, str, list[str]] | None, tuple[int, str] | None]:
+    """自动路由：领域+动作打分，再把 URL / 裸域名 / 站点别名当作网页证据。"""
+    best, fallback = _score_domains(text, _auto_candidates(text))
+    if best is None and analysis.url:
+        # 目标地址本身就是网页领域证据："打开 https://x" 即使没有
+        # 「网页/网站」字样，也不该被显式 api_testing 抢走。
+        web_actions = [
+            action for action, words in _WEB_ACTION_WORDS.items() if _hits(text, words)
+        ]
+        if web_actions:
+            best = (1 + len(web_actions) * 2, "web_research", web_actions)
     return best, fallback
 
 
@@ -525,11 +579,16 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     text = str(intent or "").strip()
     analysis = IntentAnalysis(intent=text)
     urls = [match.group(0).rstrip(".,;:!?") for match in URL_RE.finditer(text)]
+    bare = BARE_DOMAIN_RE.search(text) if not urls else None
     analysis.url = urls[0] if urls else ""
-    resolution = None
     if analysis.url:
         # 显式 URL 永远优先；站点别名只在没有显式 URL 时参与解析。
         analysis.url_source = "explicit"
+    elif bare is not None:
+        # 裸域名同样是显式目标：补全 https:// 后按网页处理，不再猜站点别名。
+        name = bare.group(0).rstrip(".,;:!?")
+        analysis.url = f"https://{name}"
+        analysis.url_source = "bare_domain"
     else:
         resolution = resolve_site_url(text)
         if resolution is not None:
@@ -545,35 +604,21 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     ignored_pack = ""
     if domain_pack:
         explicit_domain_hits = _domain_hits(text, domain_pack)
-        explicit_actions = [
-            action for action, words in _action_words(domain_pack).items() if _hits(text, words)
-        ]
+        explicit_actions = _action_hits(text, domain_pack)
         if not explicit_domain_hits and not explicit_actions:
             # 护栏：显式包与意图完全无关（领域词、动作词都零命中），
             # 而自动路由能明确命中另一个域 → 忽略包，按意图路由。
-            auto_best, auto_fallback = _score_domains(text, _auto_candidates(text))
-            if auto_best is not None:
+            auto_best, auto_fallback = _route_intent(text, analysis)
+            if auto_best is not None and auto_best[1] != domain_pack:
                 ignored_pack = domain_pack
                 best, fallback = auto_best, auto_fallback
         if not ignored_pack:
             best, fallback = _score_domains(text, [domain_pack])
+            if best is None and explicit_actions:
+                # 显式包领域词未命中但动作词命中时仍按该包路由。
+                best = (0, domain_pack, explicit_actions)
     else:
-        best, fallback = _score_domains(text, _auto_candidates(text))
-    if best is None and resolution is not None and (not domain_pack or ignored_pack):
-        # 站点别名也是领域线索：已知站点名天然说明目标是网页。
-        # 只在其他领域都没命中时兜底，避免「百度搜索接口」这类句子被抢到网页域。
-        alias_actions = [
-            action for action, words in _WEB_ACTION_WORDS.items() if _hits(text, words)
-        ]
-        best = (1 + len(alias_actions) * 2, "web_research", alias_actions)
-    if best is None and domain_pack and not ignored_pack:
-        # 显式选择领域包时领域词不一定出现（「打开百度网页」没有「浏览器」），
-        # 仍要按该包的动作词表识别动作，否则会退化成整包模板乱配。
-        explicit_actions = [
-            action for action, words in _action_words(domain_pack).items() if _hits(text, words)
-        ]
-        if explicit_actions:
-            best = (0, domain_pack, explicit_actions)
+        best, fallback = _route_intent(text, analysis)
     if best is not None:
         _score, domain, actions = best
         analysis.domain = domain

@@ -1346,7 +1346,10 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         f"{workflow_intent} {instruction}".strip(), domain_pack=stored_pack
     )
     ignored_pack = bool(guard.domain_pack_ignored)
+    routed_pack = str(guard.domain or "")
     effective_pack = "" if ignored_pack else stored_pack
+    #: 提案要持久化「护栏纠正后的真实领域」：apply 时不能再用库里的错配包。
+    proposal_pack = routed_pack if ignored_pack else (stored_pack or routed_pack)
     # 历史错配的工作流：若新指令本身表达不了域，回退用库内原始意图重排，
     # 避免「重新规划」这类指令退化成默认模板组。
     plan_intent = instruction
@@ -1397,7 +1400,8 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
             "proposed_rev": None,
             "diff": diff,
             "locked_nodes": [],
-            "domain_pack": effective_pack or guard.domain or "",
+            "intent": plan_intent,
+            "domain_pack": proposal_pack,
             "domain_pack_ignored": ignored_pack,
             "domain_pack_message": guard.domain_pack_message,
         }
@@ -1408,6 +1412,12 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         "base_rev": base_rev,
         "proposed_rev": proposed_rev,
         "instruction": instruction,
+        # intent/domain_pack 是护栏纠正后的**真实**规划语义：
+        # apply-diff 必须落库这两个值，而不是把 replan 指令当成新意图。
+        "intent": plan_intent,
+        "domain_pack": proposal_pack,
+        "domain_pack_ignored": ignored_pack,
+        "domain_pack_message": guard.domain_pack_message,
         "nodes": proposed["nodes"],
         "edges": proposed["edges"],
         "diff": diff,
@@ -1424,7 +1434,8 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         "diff": diff,
         "locked_nodes": [],
         "graph": proposed,
-        "domain_pack": effective_pack or guard.domain or "",
+        "intent": plan_intent,
+        "domain_pack": proposal_pack,
         "domain_pack_ignored": ignored_pack,
         "domain_pack_message": guard.domain_pack_message,
     }
@@ -1499,6 +1510,16 @@ def apply_diff(root: Path, wid: str, payload: Any, *, actor: str = "local") -> d
         dangling_ids = {str(edge.get("id")) for edge in dangling}
         edges = [edge for edge in edges if str(edge.get("id")) not in dangling_ids]
 
+    # 提案里持久化的是护栏纠正后的规划语义：apply 必须以它为准，
+    # 不能用 replan 指令（如「重新规划」）覆盖工作流的原始意图/领域。
+    proposal_pack = str(proposal.get("domain_pack") or "").strip()
+    if proposal_pack:
+        workflow["domain_pack"] = proposal_pack
+    applied_intent = (
+        str(proposal.get("intent") or "").strip()
+        or str(proposal.get("instruction") or "").strip()
+    )
+
     new_rev = _commit_revision(
         root,
         workflow,
@@ -1509,8 +1530,11 @@ def apply_diff(root: Path, wid: str, payload: Any, *, actor: str = "local") -> d
         actor=actor,
         message=f"应用 AI 建议（提案 {proposed_rev}）",
         base_rev=int(revision.get("rev") or 0),
-        audit_note=f"apply-diff proposal={proposed_rev} accepted={len(applied)}",
-        intent=str(proposal.get("instruction") or "") or None,
+        audit_note=(
+            f"apply-diff proposal={proposed_rev} accepted={len(applied)}"
+            f" intent={applied_intent} domain_pack={proposal_pack or workflow.get('domain_pack') or ''}"
+        ),
+        intent=applied_intent or None,
     )
     _append_audit(
         _workflow_dir(root, wid),

@@ -123,3 +123,120 @@ def test_replan_historical_mismatch_routes_by_intent(api: WebAPI, tmp_path: Path
     assert "http_request" not in atoms
     assert not any("/api/health" in str(node.get("params", {}).get("url", "")) for node in proposal["graph"]["nodes"])
     assert proposal["diff"]["nodes"]
+
+
+def _mismatched_workflow(api: WebAPI) -> str:
+    """造一个「库内意图是网页、库内领域包是 api_testing」的历史错配工作流。"""
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "测试健康接口，断言 200", "domain_pack": "api_testing"},
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    studio_dir = api.root / ".panguverse" / "studio" / wid
+    workflow_path = studio_dir / "workflow.json"
+    workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+    workflow["intent"] = WEB_INTENT
+    workflow["domain_pack"] = "api_testing"
+    workflow_path.write_text(json.dumps(workflow), encoding="utf-8")
+    revision_path = studio_dir / "revisions" / "0.json"
+    revision = json.loads(revision_path.read_text(encoding="utf-8"))
+    revision["intent"] = WEB_INTENT
+    revision["domain_pack"] = "api_testing"
+    revision_path.write_text(json.dumps(revision), encoding="utf-8")
+    return wid
+
+
+def test_replan_apply_end_to_end_keeps_corrected_intent_and_pack(api: WebAPI) -> None:
+    """F2：replan 全量接受后，校验/覆盖率/发布都必须基于纠正后的语义。"""
+    wid = _mismatched_workflow(api)
+
+    status, proposal = call(
+        api, "POST", f"/api/studio/{wid}/replan", {"instruction": "重新规划"}
+    )
+    assert status == 200, proposal
+    # 提案要持久化护栏纠正后的真实意图与领域，而不是 replan 指令。
+    assert proposal["intent"] == WEB_INTENT
+    assert proposal["domain_pack"] == "web_research"
+    assert proposal["domain_pack_ignored"] is True
+
+    accepted = [
+        change["change_id"]
+        for change in proposal["diff"]["nodes"] + proposal["diff"]["edges"]
+    ]
+    status, applied = call(
+        api,
+        "POST",
+        f"/api/studio/{wid}/apply-diff",
+        {"proposed_rev": proposal["proposed_rev"], "accepted": accepted},
+    )
+    assert status == 200, applied
+    # F1：index=0 的新节点必须排在首位，后续节点才引用得到 ${fetch_page}。
+    assert applied["graph"]["order"][0] == "fetch_page"
+    codes = [item["code"] for item in applied["validation"]["errors"]]
+    assert "P101" not in codes, applied["validation"]
+    assert "intent_mismatch" not in codes, applied["validation"]
+    assert applied["validation"]["coverage"]["ratio"] == 1.0
+
+    workflow = json.loads(
+        (api.root / ".panguverse" / "studio" / wid / "workflow.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    revision = json.loads(
+        (api.root / ".panguverse" / "studio" / wid / "revisions" / "1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert workflow["intent"] == WEB_INTENT
+    assert workflow["domain_pack"] == "web_research"
+    assert revision["intent"] == WEB_INTENT
+    assert revision["domain_pack"] == "web_research"
+
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/state", {"to": "approved", "risk_ack": True}
+    )
+    assert status == 200, body
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": applied["rev"], "message": "v5"}
+    )
+    assert status == 200, body
+    assert body["workflow_ref"] == f"{wid}@{applied['rev']}"
+
+
+@pytest.mark.parametrize(
+    "intent",
+    [
+        "打开 https://www.baidu.com 提取今天的热点新闻",
+        "打开 example.com 提取今天的热点新闻",
+        "打开百度，提取今天的热点新闻",
+    ],
+)
+def test_web_intent_with_url_or_alias_overrides_api_pack(api: WebAPI, intent: str) -> None:
+    """F3：URL / 裸域名 / 站点别名都是网页证据，显式 api_testing 应被忽略。"""
+    status, body = call(api, "POST", "/api/studio/drafts", {"intent": intent, "domain_pack": "api_testing"})
+    assert status == 201, body
+    assert body["domain_pack"] == "web_research"
+    assert body["domain_pack_ignored"] is True
+    atoms = atoms_of(body)
+    assert "http_get_page" in atoms
+    assert "http_request" not in atoms
+    fetch = next(node for node in body["graph"]["nodes"] if node["atom"] == "http_get_page")
+    assert str(fetch["params"]["url"]).startswith("https://")
+    assert not any("/api/health" in str(node.get("params", {}).get("url", "")) for node in body["graph"]["nodes"])
+
+
+def test_real_api_path_with_url_keeps_api_pack(api: WebAPI) -> None:
+    """/api/... 路径 + 断言仍是真实 API 意图，不能被网页护栏抢走。"""
+    status, body = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "访问 https://seres-ai.com/api/status，断言 200", "domain_pack": "api_testing"},
+    )
+    assert status == 201, body
+    assert body["domain_pack"] == "api_testing"
+    assert body["domain_pack_ignored"] is False
+    assert "http_request" in atoms_of(body)
