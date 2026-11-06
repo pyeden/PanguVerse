@@ -243,6 +243,81 @@ export function StudioCanvasPage({ wid }: { wid: string }) {
 
 type StudioTab = 'canvas' | 'triggers' | 'runs'
 
+/** 模块级空值：useQuery 尚未返回时复用同一引用，避免 memo 依赖每渲染变化。 */
+const EMPTY_ATOMS: Atom[] = []
+const EMPTY_CONTRACTS: Record<string, ExploreAtomCreated> = {}
+const EMPTY_ISSUES: ValidationIssue[] = []
+const EMPTY_RISKS: Risk[] = []
+
+function safeKey(value: unknown): string {
+  try {
+    return JSON.stringify(value)
+  } catch {
+    return ''
+  }
+}
+
+/**
+ * 节点结构指纹：等价判断只看会影响画布内容与交互的字段，
+ * 相同指纹时不 setNodes，避免 effect → setState → 重建 callback 的循环。
+ */
+function flowNodeDigest(node: AtomFlowNode): string {
+  const data = node.data
+  const studio = data.studioNode
+  return safeKey([
+    node.id,
+    node.position?.x,
+    node.position?.y,
+    Boolean(node.selected),
+    studio?.atom,
+    studio?.name,
+    studio?.origin,
+    Boolean(studio?.locked),
+    studio?.with || null,
+    studio?.capture || null,
+    isNewAtomNode(studio),
+    data.newAtomContract || null,
+    data.issues.map((issue) => [issue.node_id, issue.code, issue.message, issue.severity]),
+    data.risks.map((risk) => [risk.id, risk.kind, risk.message, risk.severity, risk.node_ids || []]),
+    data.debugStatus || '',
+    data.debugReason || '',
+    Boolean(data.debugCurrent),
+  ])
+}
+
+function sameFlowNodes(current: AtomFlowNode[], next: AtomFlowNode[]): boolean {
+  if (current === next) return true
+  if (current.length !== next.length) return false
+  for (let index = 0; index < next.length; index += 1) {
+    const left = current[index]
+    const right = next[index]
+    if (left.id !== right.id) return false
+    if (flowNodeDigest(left) !== flowNodeDigest(right)) return false
+  }
+  return true
+}
+
+function edgeDigest(edge: Edge): string {
+  const data = (edge.data || {}) as AnyRecord
+  return safeKey([edge.id, edge.source, edge.target, edge.label, data.kind, data.via])
+}
+
+function sameEdges(current: Edge[], next: Edge[]): boolean {
+  if (current === next) return true
+  if (current.length !== next.length) return false
+  for (let index = 0; index < next.length; index += 1) {
+    if (edgeDigest(current[index]) !== edgeDigest(next[index])) return false
+  }
+  return true
+}
+
+function sameRecord<T>(left: Record<string, T>, right: Record<string, T>): boolean {
+  if (left === right) return true
+  const leftKeys = Object.keys(left)
+  if (leftKeys.length !== Object.keys(right).length) return false
+  return leftKeys.every((key) => key in right && left[key] === right[key])
+}
+
 function StudioCanvasInner({ wid }: { wid: string }) {
   const route = useRoute()
   const queryClient = useQueryClient()
@@ -326,9 +401,11 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const workflowQuery = useQuery({ queryKey: ['studio-workflow', wid], queryFn: () => studioApi.getWorkflow(wid), enabled: !!wid })
   const atomsQuery = useQuery({ queryKey: ['atoms'], queryFn: api.atoms, staleTime: 60_000 })
   const workflow = workflowQuery.data
-  const atoms = atomsQuery.data || []
+  const atoms = atomsQuery.data || EMPTY_ATOMS
   const selectedNode = workflow?.graph?.nodes.find((node) => node.node_id === selectedId) || null
   const selectedAtom = atoms.find((atom) => atom.name === (selectedNode?.atom || paramAtom)) || null
+  /** 契约摘要不变时复用同一个对象，保证 buildFlowNodes 的依赖真正收敛。 */
+  const contractsRef = useRef<{ key: string; map: Record<string, ExploreAtomCreated> }>({ key: '', map: EMPTY_CONTRACTS })
   const newAtomContracts = useMemo(() => {
     const map: Record<string, ExploreAtomCreated> = { ...newAtomCache }
     ;(workflow?.graph?.nodes || []).forEach((node) => {
@@ -350,13 +427,17 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         source_script: cached.source_script || String(extra.source_script || ''),
       }
     })
+    const key = safeKey(map)
+    if (key && contractsRef.current.key === key) return contractsRef.current.map
+    contractsRef.current = { key, map }
     return map
   }, [atoms, newAtomCache, workflow])
   const selectedNewAtom = isNewAtomNode(selectedNode)
   const selectedContract = selectedNewAtom ? newAtomContracts[selectedNode?.atom || ''] || null : null
 
   useEffect(() => {
-    setNewAtomCache(readNewAtomCache(wid))
+    const next = readNewAtomCache(wid)
+    setNewAtomCache((current) => sameRecord(current, next) ? current : next)
   }, [wid])
 
   useEffect(() => onStudioMockChange(setMock), [])
@@ -455,8 +536,10 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   useEffect(() => {
     if (!workflow) return
     const currentValidation = validation
-    setNodes(buildFlowNodes(workflow, currentValidation.errors || [], currentValidation.risks || []))
-    setEdges(buildFlowEdges(workflow))
+    const nextNodes = buildFlowNodes(workflow, currentValidation.errors || EMPTY_ISSUES, currentValidation.risks || EMPTY_RISKS)
+    setNodes((current) => (sameFlowNodes(current, nextNodes) ? current : nextNodes))
+    const nextEdges = buildFlowEdges(workflow)
+    setEdges((current) => (sameEdges(current, nextEdges) ? current : nextEdges))
   }, [workflow, validation, buildFlowNodes, buildFlowEdges])
 
   useEffect(() => {
