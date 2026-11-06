@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from panguverse.axe import agent_exec
+from panguverse.axe.llm import LLMError
 from panguverse.core.atom import Atom
 from panguverse.web import studio
 from panguverse.web.api import WebAPI
@@ -305,8 +306,9 @@ def test_explore_budget_exceeded(tmp_path: Path, hot_server: str) -> None:
     )
     assert status == 202, body
     session = wait_explore(api, body["eid"])
-    assert session["status"] == "budget_exceeded"
+    assert session["status"] == "failed"
     assert session["verdict"] == "failed"
+    assert session["checks"] == []
     assert [event["type"] for event in session["events"]].count("tool_call") == 2
     status, body, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
     assert status == 409, body
@@ -385,7 +387,7 @@ def test_duplicate_tool_call_is_skipped_with_feedback(tmp_path: Path, hot_server
     )
     assert status == 202, body
     session = wait_explore(api, body["eid"])
-    assert session["status"] == "budget_exceeded"
+    assert session["status"] == "failed"
     assert len([event for event in session["events"] if event["type"] == "tool_call"]) == 1
     skipped = [
         event
@@ -872,3 +874,348 @@ def test_atomize_effect_inference_read_only() -> None:
 
     assert infer_effects("print('hi')\n") == ("read",)
     assert infer_effects("open('x.html', 'w').write('x')\n") == ("write",)
+
+
+# --------------------------------------------------------------------------- #
+# 预算收尾 / 硬去重（P1 稳定性）
+# --------------------------------------------------------------------------- #
+def test_budget_auto_finalizes_using_produced_files(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+
+    report = (
+        "with open('report.html', 'w', encoding='utf-8') as f:\n"
+        "    f.write('<h1>今日热点</h1>')\n"
+        "print('ok')\n"
+    )
+    items = (
+        "import json\n"
+        "with open('report_items.json', 'w', encoding='utf-8') as f:\n"
+        "    json.dump([{'word': '热点'}], f, ensure_ascii=False)\n"
+        "print('ok')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": report, "thought": "生成报告"},
+        {"action": "script", "path": "scripts/items.py", "code": items, "thought": "生成条目"},
+    ]
+    llm = FakeLLM(decisions)
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=llm, explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert session["summary"].get("auto_finalized") is True
+    assert session["summary"]["steps"] == 2
+    assert session["checks"] and all(item["ok"] for item in session["checks"])
+    assert any(item["type"] == "file_exists" for item in session["checks"])
+    assert "预算将尽" in llm.prompts[1]
+
+
+def test_tool_artifacts_do_not_count_as_products(
+    tmp_path: Path, hot_server: str
+) -> None:
+    decisions = [
+        {"action": "tool", "tool": "web_open", "params": {"url": hot_server + "?a=1"}, "thought": "打开"},
+        {"action": "tool", "tool": "web_open", "params": {"url": hot_server + "?b=2"}, "thought": "再打开"},
+    ]
+    api = new_api(tmp_path, llm=FakeLLM(decisions), registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "只看看网页", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "failed", session
+    assert session["checks"] == []
+    assert "没有可校验的产物文件" in session["summary"]["reason"]
+    assert not any(
+        item.get("spec", {}).get("path", "").startswith("artifacts/")
+        for item in session["checks"]
+    )
+
+
+def test_budget_exhausted_without_products_never_fakes_success(tmp_path: Path) -> None:
+    decisions = [
+        {"action": "tool", "tool": "web_open", "params": {"url": "http://127.0.0.1:1/a"}, "thought": "打开"},
+        {"action": "tool", "tool": "web_open", "params": {"url": "http://127.0.0.1:1/b"}, "thought": "再打开"},
+    ]
+    api = new_api(tmp_path, llm=FakeLLM(decisions), registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开页面", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "failed", session
+    assert session["checks"] == []
+    assert "没有可校验的产物文件" in session["summary"]["reason"]
+
+
+def test_same_script_path_sha_is_skipped_and_budget_finalizes(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+
+    code = (
+        "with open('report.html', 'w', encoding='utf-8') as f:\n"
+        "    f.write('<h1>今日热点</h1>')\n"
+        "print('ok')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": code, "thought": "生成报告"},
+        {"action": "script", "path": "scripts/report.py", "code": code, "thought": "重复执行"},
+    ]
+    llm = FakeLLM(decisions)
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=llm, explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    scripts = [event for event in session["events"] if event["type"] == "script"]
+    assert len([event for event in scripts if event.get("ok")]) == 1
+    skipped = [event for event in scripts if event.get("skipped")]
+    assert skipped and "path+sha" in skipped[0]["error"]
+    assert session["summary"]["scripts"] == 1
+    assert "预算将尽" in llm.prompts[1]
+
+
+def test_fs_list_same_root_is_deduplicated() -> None:
+    decisions = [
+        {"action": "tool", "tool": "fs_list", "params": {"path": ".", "pattern": "*"}, "thought": "列目录"},
+        {"action": "tool", "tool": "fs_list", "params": {"path": ".", "pattern": "*.py"}, "thought": "再列目录"},
+    ]
+    llm = FakeLLM(decisions)
+    root = Path("/tmp/pv-fslist-dedupe-ws")
+    if root.exists():
+        import shutil
+
+        shutil.rmtree(root)
+    root.mkdir()
+    api = WebAPI(root, explore_llm=llm)
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "列出文件", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "failed", session
+    calls = [event for event in session["events"] if event["type"] == "tool_call"]
+    assert len(calls) == 1
+    skipped = [
+        event
+        for event in session["events"]
+        if event["type"] == "tool_result" and event.get("skipped")
+    ]
+    assert skipped and "相同根目录" in skipped[0]["error"]
+    assert "预算将尽" in llm.prompts[1]
+
+
+def test_invalid_final_with_products_auto_finalizes_instead_of_failing(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+
+    code = (
+        "with open('report.html', 'w', encoding='utf-8') as f:\n"
+        "    f.write('<h1>今日热点</h1>')\n"
+        "print('ok')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": code, "thought": "生成报告"},
+        {"action": "final", "checks": [{"id": "bad", "type": "text_contains"}], "thought": "非法"},
+        {"action": "final", "checks": [{"id": "bad", "type": "text_contains"}], "thought": "仍非法"},
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=FakeLLM(decisions), explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert session["summary"].get("auto_finalized") is True
+    assert session["checks"] and all(item["ok"] for item in session["checks"])
+    assert any(item["type"] == "file_exists" for item in session["checks"])
+
+
+class _FlakyLLM(FakeLLM):
+    def __init__(self, decisions, failures: int = 1) -> None:
+        super().__init__(decisions)
+        self.failures = failures
+        self.calls = 0
+
+    def complete_json(self, system: str, user: str):
+        self.calls += 1
+        self.prompts.append(user)
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("The read operation timed out")
+        return json.loads(json.dumps(self.decisions.pop(0)))
+
+
+def test_llm_transient_failure_is_retried_not_error(tmp_path: Path, hot_server: str) -> None:
+    llm = _FlakyLLM(
+        [
+            {"action": "tool", "tool": "web_open", "params": {"url": hot_server}, "thought": "打开"},
+            {
+                "action": "final",
+                "checks": [{"id": "ok", "type": "text_contains", "value": "热搜", "step": 1}],
+                "thought": "收尾",
+            },
+        ],
+        failures=1,
+    )
+    api = new_api(tmp_path, llm=llm, registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开百度热搜", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert session["error"] == {}
+    assert any(event["type"] == "feedback" for event in session["events"])
+
+
+def test_llm_unavailable_without_products_fails_not_error(tmp_path: Path) -> None:
+    class _BrokenLLM:
+        available = True
+
+        def status(self):
+            return {"available": True, "model": "broken"}
+
+        def complete_json(self, system: str, user: str):
+            raise RuntimeError("The read operation timed out")
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=_BrokenLLM(), explore_registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开页面", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "failed", session
+    assert session["error"] == {}
+    assert "LLM 调用失败" in session["summary"]["reason"]
+
+
+# --------------------------------------------------------------------------- #
+# LLM 超时容错：精简上下文重试 + 产物优先收尾
+# --------------------------------------------------------------------------- #
+class SequencedLLM:
+    """按顺序返回决策；遇到异常对象则抛出，模拟真实 LLM 超时。"""
+
+    available = True
+
+    def __init__(self, steps: list[Any]) -> None:
+        self.steps = list(steps)
+        self.prompts: list[str] = []
+
+    def status(self) -> dict[str, Any]:
+        return {"available": True, "model": "sequenced-llm", "backend": "test"}
+
+    def complete(self, system: str, user: str) -> str:
+        self.prompts.append(user)
+        if not self.steps:
+            raise AssertionError("SequencedLLM 决策序列已耗尽")
+        step = self.steps.pop(0)
+        if isinstance(step, Exception):
+            raise step
+        return json.dumps(step, ensure_ascii=False)
+
+
+def test_llm_timeout_retried_with_slim_context_then_succeeds(
+    tmp_path: Path, hot_server: str
+) -> None:
+    llm = SequencedLLM(
+        [
+            {
+                "action": "tool",
+                "tool": "web_open",
+                "params": {"url": hot_server},
+                "thought": "打开页面",
+            },
+            LLMError("LLM 接口超时（120s）"),
+            {
+                "action": "final",
+                "checks": [{"id": "status", "type": "status_code", "equals": 200, "step": 1}],
+                "thought": "状态码已确认",
+            },
+        ]
+    )
+    api = new_api(tmp_path, llm=llm, registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开页面并确认状态", "max_steps": 6}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert len(llm.prompts) == 3
+
+    full = json.loads(llm.prompts[1])
+    slim = json.loads(llm.prompts[2])
+    assert slim["slim_context"] is True
+    assert len(slim["observations"]) == 1
+    assert all(len(json.dumps(item, ensure_ascii=False)) <= 800 for item in slim["observations"])
+    assert all(
+        len(json.dumps(item, ensure_ascii=False)) <= 1200 for item in full["observations"]
+    )
+    assert all(len(prompt.encode("utf-8")) <= 8192 for prompt in llm.prompts)
+    assert any(
+        event["type"] == "feedback" and "精简上下文重试" in event.get("text", "")
+        for event in session["events"]
+    )
+
+
+def test_llm_timeout_with_products_auto_finalizes_succeeded(tmp_path: Path) -> None:
+    code = (
+        "from pathlib import Path\n"
+        "Path('report').mkdir(exist_ok=True)\n"
+        "Path('report/hot_news_report.html').write_text('<h1>今日热点</h1>', encoding='utf-8')\n"
+        "print('ok')\n"
+    )
+    llm = SequencedLLM(
+        [
+            {"action": "script", "path": "scripts/report.py", "code": code, "thought": "生成报告"},
+            LLMError("LLM 接口超时（120s）"),
+            LLMError("LLM 接口超时（120s）"),
+        ]
+    )
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=llm, explore_registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告并保存 html", "max_steps": 12}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert session["summary"].get("auto_finalized") is True
+    assert any(
+        item["type"] == "file_exists"
+        and item.get("spec", {}).get("path") == "report/hot_news_report.html"
+        for item in session["checks"]
+    )
+    assert "已用产物文件自动收尾" in session["summary"]["reason"]
+
+
+def test_llm_timeout_without_products_fails_with_single_error_layer(tmp_path: Path) -> None:
+    llm = SequencedLLM(
+        [LLMError("LLM 接口超时（120s）"), LLMError("LLM 接口超时（120s）")]
+    )
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=llm, explore_registry=make_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "随便看看", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "failed", session
+    assert session["checks"] == []
+    reason = session["summary"]["reason"]
+    assert reason.count("LLM 调用失败") == 1
+    assert "LLMError" not in reason
+    assert "没有可校验的产物文件" in reason
+    assert session["error"] == {}

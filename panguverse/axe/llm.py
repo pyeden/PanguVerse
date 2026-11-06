@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from typing import Any
@@ -19,9 +20,50 @@ from ..http.client import is_loopback_url
 #: 回环目标必须直连（macOS 系统代理会把 127.0.0.1 也劫持走，本机 ollama 会 502）
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
+#: 真实模型偶尔在 60s 附近抖动；默认放宽到 120s，并允许环境变量覆盖。
+DEFAULT_TIMEOUT = 120.0
+DEFAULT_RETRIES = 2
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
 
 class LLMError(RuntimeError):
-    """LLM 调用失败（网络、鉴权、返回格式）。"""
+    """LLM 调用失败（网络、鉴权、返回格式）。
+
+    ``retryable`` 只表示传输层值得重试（超时/URLError/429/5xx）；
+    鉴权失败、返回格式错误不重试。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = False,
+        status: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+        self.status = status
 
 
 class LLMClient:
@@ -34,7 +76,9 @@ class LLMClient:
         model: str | None = None,
         api_key: str | None = None,
         base_url: str | None = None,
-        timeout: float = 60.0,
+        timeout: float | None = None,
+        retries: int | None = None,
+        retry_backoff: float = 1.0,
         max_tokens: int = 4096,
     ) -> None:
         self.backend = (backend or os.getenv("PANGUVERSE_AI_BACKEND") or "").strip().lower()
@@ -50,7 +94,18 @@ class LLMClient:
         )
         if not self.backend:
             self.backend = "anthropic" if "anthropic" in self.base_url else "openai"
-        self.timeout = timeout
+        self.timeout = (
+            float(timeout)
+            if timeout is not None
+            else _env_float("PANGUVERSE_LLM_TIMEOUT", DEFAULT_TIMEOUT)
+        )
+        self.retries = max(
+            0,
+            int(retries)
+            if retries is not None
+            else _env_int("PANGUVERSE_LLM_RETRIES", DEFAULT_RETRIES),
+        )
+        self.retry_backoff = max(0.0, float(retry_backoff))
         self.max_tokens = max_tokens
         self.calls = 0
         self.last_error = ""
@@ -67,6 +122,8 @@ class LLMClient:
             "model": self.model,
             "base_url": self.base_url,
             "reason": "" if self.available else "未配置 PANGUVERSE_API_KEY / OPENAI_API_KEY",
+            "timeout": self.timeout,
+            "retries": self.retries,
             "last_error": self.last_error,
         }
 
@@ -75,15 +132,29 @@ class LLMClient:
         if not self.available:
             raise LLMError("未配置 LLM 密钥（PANGUVERSE_API_KEY / OPENAI_API_KEY）")
         self.calls += 1
-        try:
-            if self.backend == "anthropic":
-                return self._call_anthropic(system, user, temperature)
-            return self._call_openai(system, user, temperature)
-        except LLMError:
-            raise
-        except Exception as exc:
-            self.last_error = str(exc)
-            raise LLMError(f"LLM 调用失败: {exc}") from exc
+        attempts = self.retries + 1
+        last_error: LLMError | None = None
+        for attempt in range(attempts):
+            try:
+                if self.backend == "anthropic":
+                    result = self._call_anthropic(system, user, temperature)
+                else:
+                    result = self._call_openai(system, user, temperature)
+                self.last_error = ""
+                return result
+            except LLMError as exc:
+                last_error = exc
+                self.last_error = str(exc)
+                if not exc.retryable or attempt + 1 >= attempts:
+                    # 错误只在传输层包装一次；这里不再加 "LLM 调用失败" 前缀。
+                    raise
+                delay = self.retry_backoff * (2**attempt)
+                if delay > 0:
+                    time.sleep(delay)
+            except Exception as exc:
+                self.last_error = f"{type(exc).__name__}: {exc}"
+                raise LLMError(f"{type(exc).__name__}: {exc}") from exc
+        raise last_error or LLMError("未知错误")
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         """要求返回 JSON 对象；解析失败会抛出 LLMError。"""
@@ -156,10 +227,20 @@ class LLMClient:
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else ""
             self.last_error = f"HTTP {exc.code}: {detail[:300]}"
-            raise LLMError(f"LLM 接口返回 HTTP {exc.code}: {detail[:300]}") from exc
-        except urllib.error.URLError as exc:
-            self.last_error = str(exc.reason)
-            raise LLMError(f"LLM 接口不可达: {exc.reason}") from exc
+            retryable = exc.code == 429 or 500 <= exc.code < 600
+            raise LLMError(
+                f"LLM 接口返回 HTTP {exc.code}: {detail[:300]}",
+                retryable=retryable,
+                status=exc.code,
+            ) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            reason = getattr(exc, "reason", exc)
+            self.last_error = f"timeout/url error: {reason}"
+            if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
+                message = f"LLM 接口超时（{self.timeout:.0f}s）"
+            else:
+                message = f"LLM 接口不可达: {reason}"
+            raise LLMError(message, retryable=True) from exc
         try:
             return json.loads(body)
         except ValueError as exc:

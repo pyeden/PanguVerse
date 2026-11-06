@@ -14,13 +14,15 @@ the sandbox executable in isolation and easy to unit test.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import re
 import subprocess
 import sys
 import time
+from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any
 
 from ..core.context import MISSING, RunContext, split_path, walk_path
 
@@ -32,6 +34,11 @@ DEFAULT_SCRIPT_TIMEOUT = 60.0
 MAX_SCRIPT_TIMEOUT = 120.0
 MAX_THOUGHT = 2_000
 MAX_EVIDENCE = 500
+MAX_PROMPT_OBSERVATION = 1_200
+MAX_PROMPT_OBSERVATIONS = 6
+MAX_PROMPT_SLIM_OBSERVATIONS = 3
+MAX_PROMPT_SLIM_OBSERVATION = 800
+MAX_PROMPT_BYTES = 8 * 1024
 
 _FULL_STEP_REF_RE = re.compile(r"^\$\{step(\d+)\.([^}]+)\}$")
 _FULL_LAST_REF_RE = re.compile(r"^\$\{last\.([^}]+)\}$")
@@ -73,6 +80,15 @@ def _clip(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + f"\n...[truncated {len(value) - limit} chars]"
+
+
+def _llm_failure_message(message: Any) -> str:
+    """LLM 失败原因只保留一层前缀，避免 ``LLMError: LLM 调用失败`` 套娃。"""
+    text = str(message or "").strip()
+    for prefix in ("LLM 调用失败：", "LLM 调用失败:", "LLMError:"):
+        while text.startswith(prefix):
+            text = text[len(prefix) :].strip()
+    return f"LLM 调用失败：{text or '未知错误'}"
 
 
 def _safe_tool_fragment(value: str) -> str:
@@ -244,7 +260,12 @@ def normalize_checks(raw: Any) -> list[dict[str, Any]]:
             "type": kind,
         }
         if kind == "text_contains":
-            spec["value"] = str(data.get("value") or "")
+            raw_value = data.get("value")
+            for alias in ("text", "contains", "needle", "expected", "match"):
+                if not raw_value and data.get(alias) not in (None, ""):
+                    raw_value = data.get(alias)
+                    break
+            spec["value"] = str(raw_value or "")
             if not spec["value"]:
                 raise AgentExecError("bad_request", "text_contains 缺少 value")
         elif kind == "regex":
@@ -643,6 +664,8 @@ class ExploreAgent:
         self.pending_feedback = ""
         self.last_tool_sig = ""
         self.repeat_count = 0
+        self.seen_tool_keys: set[str] = set()
+        self.seen_script_keys: set[str] = set()
         self.started = self.clock()
 
     # ------------------------------------------------------------------ #
@@ -664,6 +687,7 @@ class ExploreAgent:
             )
             self.tool_names = {entry["name"] for entry in self.catalog}
         checks_spec = normalize_checks(success_criteria)
+        has_user_criteria = bool(checks_spec)
         feedback = ""
         saw_final = False
         final_checks_retry_used = False
@@ -673,24 +697,35 @@ class ExploreAgent:
         while actions_used < self.max_steps:
             llm_turns += 1
             if llm_turns > self.max_steps + 6:
-                return self._finish(
-                    "budget_exceeded",
-                    checks=last_checks,
-                    summary={
-                        "reason": f"LLM 回合超限（>{self.max_steps + 6}），停止以避免空转",
-                        "steps": actions_used,
-                    },
+                return self._auto_finalize(
+                    actions_used=actions_used,
+                    checks_spec=checks_spec,
+                    given_criteria=has_user_criteria,
+                    last_checks=last_checks,
+                    reason=f"LLM 回合超限（>{self.max_steps + 6}）",
                 )
             if self.clock() - self.started >= self.total_timeout:
-                return self._finish(
-                    "budget_exceeded",
-                    checks=last_checks,
-                    summary={
-                        "reason": f"总时长超过 {self.total_timeout:.0f}s",
-                        "steps": actions_used,
-                    },
+                return self._auto_finalize(
+                    actions_used=actions_used,
+                    checks_spec=checks_spec,
+                    given_criteria=has_user_criteria,
+                    last_checks=last_checks,
+                    reason=f"总时长超过 {self.total_timeout:.0f}s",
                 )
-            decision = self._decide(intent, checks_spec, actions_used + 1, feedback)
+            try:
+                decision = self._decide(intent, checks_spec, actions_used + 1, feedback)
+            except AgentExecError as exc:
+                if exc.code not in {"llm_error", "llm_invalid"}:
+                    raise
+                # _decide 已用精简上下文重试过一次；仍失败时不能把会话打成
+                # error：有真实产物就按 file_exists 收尾，没有才 failed。
+                return self._auto_finalize(
+                    actions_used=actions_used,
+                    checks_spec=checks_spec,
+                    given_criteria=has_user_criteria,
+                    last_checks=last_checks,
+                    reason=_llm_failure_message(exc.message),
+                )
             action = str(decision.get("action") or "").strip()
             thought = str(decision.get("thought") or "").strip()
             if thought:
@@ -729,6 +764,18 @@ class ExploreAgent:
                         "请重发 final，给出可执行检查（type + 参数）。"
                     )
                     if final_checks_retry_used:
+                        if not has_user_criteria:
+                            # The model failed twice on schema, but real files may
+                            # still prove completion.  Close on those files; if
+                            # there are none, this still returns failed.
+                            return self._auto_finalize(
+                                actions_used=actions_used,
+                                checks_spec=checks_spec,
+                                given_criteria=has_user_criteria,
+                                last_checks=last_checks,
+                                reason=f"final checks 连续非法：{exc.message}",
+                                saw_final=True,
+                            )
                         return self._finish(
                             "failed",
                             checks=last_checks,
@@ -746,6 +793,15 @@ class ExploreAgent:
                         "file_exists/regex 检查后再 final。"
                     )
                     if final_checks_retry_used:
+                        if not has_user_criteria:
+                            return self._auto_finalize(
+                                actions_used=actions_used,
+                                checks_spec=checks_spec,
+                                given_criteria=has_user_criteria,
+                                last_checks=last_checks,
+                                reason="final 未提供可执行 checks（已反馈一次仍未修正）",
+                                saw_final=True,
+                            )
                         return self._finish(
                             "failed",
                             checks=last_checks,
@@ -778,13 +834,121 @@ class ExploreAgent:
                 f"LLM 决策非法：action 必须是 tool/script/final，收到 {action or '<空>'}",
                 status=502,
             )
-        status = "failed" if saw_final else "budget_exceeded"
+        return self._auto_finalize(
+            actions_used=actions_used,
+            checks_spec=checks_spec,
+            given_criteria=has_user_criteria,
+            last_checks=last_checks,
+            reason=f"达到 max_steps={self.max_steps}（仅计 tool/script 动作）",
+            saw_final=saw_final,
+        )
+
+    def _candidate_outputs(self) -> list[str]:
+        """Files that can serve as deterministic completion evidence."""
+        base = self.sandbox.resolve()
+        rank = {".html": 0, ".htm": 0, ".md": 1, ".txt": 2, ".csv": 3, ".json": 4}
+        found: list[tuple[int, float, str]] = []
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            suffix = path.suffix.lower()
+            if suffix not in rank:
+                continue
+            try:
+                rel = str(path.relative_to(base))
+            except ValueError:
+                continue
+            parts = Path(rel).parts
+            if parts and parts[0] in {
+                "scripts",
+                ".panguverse",
+                "replay",
+                "__pycache__",
+                "artifacts",
+            }:
+                continue
+            if path.name in {"session.json", "success.json"} or path.name.startswith("."):
+                continue
+            found.append((rank[suffix], -path.stat().st_mtime, rel))
+        found.sort()
+        return [rel for _rank, _mtime, rel in found[:8]]
+
+    def _suggest_file_checks(self) -> list[dict[str, Any]]:
+        checks: list[dict[str, Any]] = []
+        used: set[str] = set()
+        for index, rel in enumerate(self._candidate_outputs(), 1):
+            base = Path(rel).stem
+            if base.lower() in {"report", "hot_news_report"} and Path(rel).suffix.lower() == ".html":
+                name = "report_html_exists"
+            else:
+                name = f"file_{_sanitize_var(base)}_{index}"
+            while name in used:
+                name = f"{name}_{index}"
+            used.add(name)
+            checks.append({"id": name, "type": "file_exists", "path": rel})
+        return checks
+
+    def _auto_finalize(
+        self,
+        *,
+        actions_used: int,
+        checks_spec: list[dict[str, Any]],
+        given_criteria: bool,
+        last_checks: list[dict[str, Any]],
+        reason: str,
+        saw_final: bool = False,
+    ) -> dict[str, Any]:
+        """Budget exhausted: close on real produced files, never on empty checks.
+
+        Given success criteria are respected: if they were not met at exhaustion
+        we fail rather than invent unrelated file checks.  For no-criteria
+        sessions we generate ``file_exists`` checks from actual outputs.
+        """
+        if given_criteria:
+            passed = bool(last_checks) and all(item["ok"] for item in last_checks)
+            status = "succeeded" if passed else "failed"
+            tail = "给定成功标准已满足" if passed else "给定成功标准未满足"
+            return self._finish(
+                status,
+                checks=last_checks,
+                summary={"reason": f"{reason}；{tail}", "steps": actions_used},
+            )
+        suggestions = self._suggest_file_checks()
+        if not suggestions:
+            return self._finish(
+                "failed",
+                checks=last_checks,
+                summary={
+                    "reason": reason + "；没有可校验的产物文件，不能伪装成功",
+                    "steps": actions_used,
+                },
+            )
+        checks = self._evaluate(suggestions)
+        verdict = "passed" if checks and all(item["ok"] for item in checks) else "failed"
+        self.emit(
+            "verify",
+            {"checks": checks, "verdict": verdict, "auto_finalized": True},
+        )
+        if verdict == "passed":
+            return self._finish(
+                "succeeded",
+                checks=checks,
+                summary={
+                    "reason": reason + "；已用产物文件自动收尾",
+                    "steps": actions_used,
+                    "verdict": "passed",
+                    "auto_finalized": True,
+                    "saw_final": bool(saw_final),
+                },
+            )
         return self._finish(
-            status,
-            checks=last_checks,
+            "failed",
+            checks=checks,
             summary={
-                "reason": f"达到 max_steps={self.max_steps}（仅计 tool/script 动作）",
+                "reason": reason + "；自动收尾检查未通过",
                 "steps": actions_used,
+                "verdict": "failed",
+                "auto_finalized": True,
             },
         )
 
@@ -849,34 +1013,57 @@ class ExploreAgent:
             "- 给定 criteria 一旦满足就立即 final；不要重复打开同一页面或重复落盘。\n"
             "- 没有可执行检查时不得 final。\n"
             "- 如果 last_failure 指出 checks 非法，必须修正字段后重发 final。\n"
+            "- 剩余步数 <=2 时必须立即 final；已有产物优先用 file_exists。\n"
         )
-        recent = [
-            {
-                "step": index,
-                "tool": item["tool"],
-                "ok": item["ok"],
-                "digest": item["digest"],
-            }
-            for index, item in enumerate(self.observations, 1)
-        ]
-        payload = {
-            "intent": intent,
-            "step": step_no,
-            "max_steps": self.max_steps,
-            "remaining_seconds": round(
-                max(0.0, self.total_timeout - (self.clock() - self.started)), 1
-            ),
-            "tools": self.catalog,
-            "observations": recent[-6:],
-            "criteria": criteria,
-            "last_failure": feedback,
-            "instructions": (
-                "给出下一步决策。若已具备证据，用 final + 确定性 checks 收尾。"
-                if step_no > 1
-                else "先观察真实世界：打开目标或读取数据。"
-            ),
-        }
-        user = json.dumps(payload, ensure_ascii=False, default=str)
+        # 系统提示也算在 8KB 预算里，给用户提示留出剩余空间。
+        prompt_budget = MAX_PROMPT_BYTES - len(system.encode("utf-8"))
+        try:
+            return self._decide_once(
+                system,
+                intent,
+                criteria,
+                step_no,
+                feedback,
+                slim=False,
+                prompt_budget=prompt_budget,
+            )
+        except AgentExecError as exc:
+            if exc.code not in {"llm_error", "llm_invalid"}:
+                raise
+            self.emit(
+                "feedback",
+                {"text": f"LLM 决策失败：{exc.message}；改用精简上下文重试一次"},
+            )
+            try:
+                return self._decide_once(
+                    system,
+                    intent,
+                    criteria,
+                    step_no,
+                    feedback,
+                    slim=True,
+                    prompt_budget=prompt_budget,
+                )
+            except AgentExecError as retry_exc:
+                raise AgentExecError(
+                    "llm_error",
+                    _llm_failure_message(retry_exc.message),
+                    status=502,
+                ) from retry_exc
+
+    def _decide_once(
+        self,
+        system: str,
+        intent: str,
+        criteria: list[dict[str, Any]],
+        step_no: int,
+        feedback: str,
+        *,
+        slim: bool,
+        prompt_budget: int,
+    ) -> dict[str, Any]:
+        payload = self._decision_payload(intent, criteria, step_no, feedback, slim=slim)
+        user = self._serialize_prompt(payload, prompt_budget)
         try:
             # 真实模型有时会在 JSON 前后夹带解释或多个对象；complete_json 会整段
             # 解析失败。这里取原始文本并抽取真正的 action 对象。
@@ -884,13 +1071,153 @@ class ExploreAgent:
                 decision = _extract_decision(self.llm.complete(system, user))
             else:
                 decision = self.llm.complete_json(system, user)
-        except Exception as exc:  # noqa: BLE001 - LLM 故障必须显式失败
-            raise AgentExecError(
-                "llm_error", f"LLM 调用失败: {type(exc).__name__}: {exc}", status=502
-            ) from exc
+        except Exception as exc:
+            message = str(exc) or type(exc).__name__
+            raise AgentExecError("llm_error", message, status=502) from exc
         if not isinstance(decision, dict):
             raise AgentExecError("llm_invalid", "LLM 未返回 JSON 对象", status=502)
         return decision
+
+    def _decision_payload(
+        self,
+        intent: str,
+        criteria: list[dict[str, Any]],
+        step_no: int,
+        feedback: str,
+        *,
+        slim: bool,
+    ) -> dict[str, Any]:
+        remaining_steps = max(0, self.max_steps - (step_no - 1))
+        suggested_checks = self._suggest_file_checks() if remaining_steps <= 2 else []
+        if remaining_steps <= 2:
+            hint = (
+                f"预算将尽（剩余 {remaining_steps} 步）：不要再重复 tool/script；"
+                "立即 final，用确定性 file_exists/text_contains 检查收尾。"
+            )
+            if suggested_checks:
+                hint += " 可直接使用 suggested_checks（来自真实产物文件）。"
+            instructions = hint
+        else:
+            instructions = (
+                "给出下一步决策。若已具备证据，用 final + 确定性 checks 收尾。"
+                if step_no > 1
+                else "先观察真实世界：打开目标或读取数据。"
+            )
+        if slim:
+            instructions = "精简上下文重试：只保留最近观察，直接给出可执行决策。" + instructions
+        obs_limit = MAX_PROMPT_SLIM_OBSERVATION if slim else MAX_PROMPT_OBSERVATION
+        obs_count = MAX_PROMPT_SLIM_OBSERVATIONS if slim else MAX_PROMPT_OBSERVATIONS
+        payload: dict[str, Any] = {
+            "intent": _clip(str(intent or ""), 300 if slim else 500),
+            "step": step_no,
+            "max_steps": self.max_steps,
+            "remaining_steps": remaining_steps,
+            "remaining_seconds": round(
+                max(0.0, self.total_timeout - (self.clock() - self.started)), 1
+            ),
+            "tools": self._compact_catalog(),
+            "observations": self._prompt_observations(obs_count, obs_limit),
+            "criteria": criteria,
+            "last_failure": _clip(str(feedback or ""), 600 if slim else 1_200),
+            "suggested_checks": suggested_checks,
+            "instructions": instructions,
+        }
+        if slim:
+            payload["slim_context"] = True
+        return payload
+
+    def _compact_catalog(self) -> list[dict[str, Any]]:
+        """工具目录压缩：只保留可执行决策需要的字段，避免 8KB 提示被目录撑爆。"""
+        tools: list[dict[str, Any]] = []
+        for entry in self.catalog:
+            inputs: dict[str, str] = {}
+            for key, raw in (entry.get("inputs") or {}).items():
+                hint = re.split(r"[（(]", str(raw), maxsplit=1)[0].strip()
+                inputs[str(key)] = _clip(hint, 32)
+            item: dict[str, Any] = {
+                "name": str(entry.get("name") or ""),
+                "description": _clip(str(entry.get("description") or ""), 60),
+                "inputs": inputs,
+            }
+            required = entry.get("required") or []
+            if required:
+                item["required"] = [str(name) for name in required]
+            tools.append(item)
+        return tools
+
+    def _prompt_observations(
+        self, limit: int, obs_limit: int
+    ) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for index, item in enumerate(self.observations, 1):
+            digest_text = json.dumps(
+                item.get("digest") or {}, ensure_ascii=False, default=str
+            )
+            entry: dict[str, Any] = {
+                "step": index,
+                "tool": item.get("tool") or "",
+                "ok": bool(item.get("ok")),
+                "digest": digest_text,
+            }
+            serialized = json.dumps(entry, ensure_ascii=False)
+            if len(serialized) > obs_limit:
+                delta = len(serialized) - len(digest_text)
+                entry["digest"] = _clip(digest_text, max(20, obs_limit - delta))
+            items.append(entry)
+        return items[-limit:]
+
+    def _serialize_prompt(self, payload: dict[str, Any], limit: int) -> str:
+        def dump(value: dict[str, Any]) -> str:
+            return json.dumps(value, ensure_ascii=False, default=str)
+
+        def fits(text: str) -> bool:
+            return len(text.encode("utf-8")) <= limit
+
+        text = dump(payload)
+        if fits(text):
+            return text
+        observations = list(payload.get("observations") or [])
+        for cap, keep in ((400, 6), (200, 3), (100, 2), (60, 1)):
+            payload["observations"] = [
+                {
+                    "step": item.get("step"),
+                    "tool": item.get("tool"),
+                    "ok": item.get("ok"),
+                    "digest": _clip(str(item.get("digest") or ""), cap),
+                }
+                for item in observations[-keep:]
+            ]
+            text = dump(payload)
+            if fits(text):
+                return text
+        payload["tools"] = [
+            {"name": tool.get("name"), "inputs": tool.get("inputs") or {}}
+            for tool in payload.get("tools") or []
+        ]
+        payload["suggested_checks"] = []
+        payload["last_failure"] = _clip(str(payload.get("last_failure") or ""), 200)
+        text = dump(payload)
+        if fits(text):
+            return text
+        payload["tools"] = [tool.get("name") for tool in payload.get("tools") or []]
+        payload["observations"] = []
+        text = dump(payload)
+        if fits(text):
+            return text
+        payload["intent"] = _clip(str(payload.get("intent") or ""), 80)
+        payload["instructions"] = _clip(str(payload.get("instructions") or ""), 100)
+        text = dump(payload)
+        if fits(text):
+            return text
+        # 理论上到不了这里；最后只保留最小可决策字段。
+        minimal = {
+            "intent": _clip(str(payload.get("intent") or ""), 80),
+            "step": payload.get("step"),
+            "max_steps": payload.get("max_steps"),
+            "instructions": _clip(str(payload.get("instructions") or ""), 100),
+            "tools": [str(name) for name in payload.get("tools") or []],
+        }
+        return dump(minimal)
 
     # ------------------------------------------------------------------ #
     def _do_tool(self, decision: Mapping[str, Any], step_no: int) -> None:
@@ -904,16 +1231,15 @@ class ExploreAgent:
                 f"工具不存在: {tool or '<空>'}；可用工具: {', '.join(sorted(self.tool_names)[:20])}",
                 status=400,
             )
-        signature = tool + "\n" + json.dumps(
-            dict(params), ensure_ascii=False, sort_keys=True, default=str
-        )
-        if signature == self.last_tool_sig:
-            self.repeat_count += 1
-        else:
-            self.last_tool_sig = signature
-            self.repeat_count = 1
-        if self.repeat_count >= 2:
-            message = "同一 tool+params 已连续重复 2 次：已执行过，请改用 final 或其他动作"
+        signature = self._tool_dedupe_key(tool, params)
+        if signature in self.seen_tool_keys:
+            if tool == "fs_list":
+                message = (
+                    "同一 tool+params 已执行过（fs_list 按相同根目录去重）："
+                    "已跳过重复调用，请改用 final 或其他动作"
+                )
+            else:
+                message = "同一 tool+params 已执行过：已跳过重复调用，请改用 final 或其他动作"
             self.emit("thought", {"text": f"系统：{message}"})
             self.emit(
                 "tool_result",
@@ -928,6 +1254,7 @@ class ExploreAgent:
             )
             self.pending_feedback = message
             return
+        self.seen_tool_keys.add(signature)
         try:
             resolved = self._resolve_refs(dict(params))
         except AgentExecError as exc:
@@ -989,6 +1316,15 @@ class ExploreAgent:
             payload["error"] = _clip(error, 1_000)
         self.emit("tool_result", payload)
 
+    def _tool_dedupe_key(self, tool: str, params: Mapping[str, Any]) -> str:
+        if tool == "fs_list":
+            root = str(params.get("path") or ".")
+            return "fs_list\nroot=" + Path(root).as_posix()
+        payload = json.dumps(dict(params), ensure_ascii=False, sort_keys=True, default=str)
+        if tool == "script_run":
+            payload += "\n" + json.dumps(self._tool_signature(tool, params), sort_keys=True)
+        return tool + "\n" + payload
+
     def _tool_signature(self, tool: str, params: Mapping[str, Any]) -> dict[str, Any]:
         """script_run 的代码指纹：执行哪份代码必须可追溯。"""
         if tool != "script_run":
@@ -1046,10 +1382,28 @@ class ExploreAgent:
                 },
             )
             return
+        code_sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        script_key = path_text + "\n" + code_sha
+        if script_key in self.seen_script_keys:
+            message = "同一脚本 path+sha 已执行过：已跳过重复执行，请改用 final 或其他动作"
+            self.emit("thought", {"text": f"系统：{message}"})
+            self.emit(
+                "script",
+                {
+                    "path": path_text,
+                    "code_sha256": code_sha,
+                    "exit_code": 0,
+                    "ok": False,
+                    "skipped": True,
+                    "error": message,
+                },
+            )
+            self.pending_feedback = message
+            return
+        self.seen_script_keys.add(script_key)
         target = safe_path(self.sandbox, path_text, field="path")
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(code, encoding="utf-8")
-        code_sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
         # Snapshot the exact code version before executing it.  The same script
         # path is overwritten by later LLM turns, so the trace must carry a
         # content-addressed copy for crystallization.
@@ -1296,7 +1650,6 @@ def build_crystallized_graph(
     # Second pass: params may reference outputs of earlier nodes, so captures
     # must be attached to their producer node before templates are built.
     captures_by_node: dict[str, dict[str, Any]] = {node["id"]: node["capture"] for node in nodes}
-    node_by_id = {node["id"]: node for node in nodes}
     for node in nodes:
         call = calls_by_node[node["id"]]
         params = {}
@@ -1312,7 +1665,7 @@ def build_crystallized_graph(
         node["params"] = params
 
     edges: list[dict[str, Any]] = []
-    for left, right in zip(nodes, nodes[1:]):
+    for left, right in itertools.pairwise(nodes):
         edges.append(
             {
                 "id": f"e-{left['id']}->{right['id']}:order",
