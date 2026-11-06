@@ -411,3 +411,157 @@ def test_crystallize_without_llm_returns_503(tmp_path: Path) -> None:
         explore.crystallize(tmp_path, "e-12345678", {}, llm=None)
     assert excinfo.value.code == "llm_required_for_crystallize"
     assert excinfo.value.status == 503
+
+
+def test_generality_runtime_crash_is_not_general() -> None:
+    """崩溃原子必须判成不通用：异常不能再被当作“哈希不同”的证据。"""
+    session = Path(tempfile.mkdtemp(prefix="pv-general-crash-session-"))
+    contract = {
+        "inputs": {"source?": "string"},
+        "outputs": {"report_html": "string"},
+        "output_paths": {"report_html": "report.html"},
+    }
+    crash = (
+        "from pathlib import Path\n"
+        "HTML_TEMPLATE = '<style>.g{background:linear-gradient(0deg,#fff 0%,#000 45%)}</style><h1>%s</h1>'\n"
+        "def run(ctx=None, source='', output_dir='.'):\n"
+        "    base = Path(getattr(ctx, 'workspace', '.') or '.')\n"
+        "    (base / 'report.html').write_text(HTML_TEMPLATE % '热点', encoding='utf-8')\n"
+        "    return {'report_html': 'report.html'}\n"
+    )
+    module = Path(tempfile.mkdtemp(prefix="pv-general-crash-mod-")) / "crash.py"
+    _write_module(module, crash)
+
+    report = abstraction.generality_check(
+        module_path=module,
+        source=crash,
+        contract=contract,
+        session_dir=session,
+        recorded_outputs={"report_html": "report.html"},
+    )
+    assert report.ok is False
+    assert report.dynamic["ok"] is False
+    assert report.dynamic["matched_recordings"] == []
+    assert any(item.startswith("runtime_error:") for item in report.violations)
+    assert "unsupported format character" in report.dynamic["error"]
+
+
+def test_generality_requires_every_declared_output() -> None:
+    """成功返回但没有写出全部声明产物，也必须判成不通用。"""
+    session = Path(tempfile.mkdtemp(prefix="pv-general-missing-session-"))
+    contract = {
+        "inputs": {"source?": "string"},
+        "outputs": {"report_html": "string", "items": "string"},
+        "output_paths": {"report_html": "report.html", "items": "items.json"},
+    }
+    partial = (
+        "from pathlib import Path\n"
+        "def run(ctx=None, source='', output_dir='.'):\n"
+        "    base = Path(getattr(ctx, 'workspace', '.') or '.')\n"
+        "    (base / 'report.html').write_text('<h1>ok</h1>', encoding='utf-8')\n"
+        "    return {'report_html': 'report.html', 'items': 'items.json'}\n"
+    )
+    module = Path(tempfile.mkdtemp(prefix="pv-general-missing-mod-")) / "partial.py"
+    _write_module(module, partial)
+
+    report = abstraction.generality_check(
+        module_path=module,
+        source=partial,
+        contract=contract,
+        session_dir=session,
+        recorded_outputs={},
+    )
+    assert report.ok is False
+    assert any(
+        item.startswith("missing_output: items") for item in report.violations
+    )
+
+
+class PercentCssCrystallizeLLM:
+    """Plans like the normal test double, but abstracts into a broken %-template."""
+
+    available = True
+
+    def status(self) -> dict[str, Any]:
+        return {"available": True, "model": "percent-css", "backend": "test"}
+
+    def complete_json(self, system: str, user: str) -> dict[str, Any]:
+        if "原子抽象器" in system or user.startswith("待抽象脚本"):
+            return {
+                "description": "生成带 CSS 渐变的报告",
+                "source": (
+                    "from pathlib import Path\n"
+                    "HTML_TEMPLATE = '<style>.g{background:linear-gradient(0deg,#fff 0%,#000 45%)}</style><h1>%s</h1>'\n"
+                    "def run(ctx=None, source='', output_dir='.'):\n"
+                    "    base = Path(getattr(ctx, 'workspace', '.') or '.')\n"
+                    "    (base / 'report.html').write_text(HTML_TEMPLATE % '热点', encoding='utf-8')\n"
+                    "    return {'report_html': 'report.html'}\n"
+                ),
+                "contract": {
+                    "inputs": {"source": "string?", "output_dir": "string?"},
+                    "outputs": {"report_html": "string"},
+                    "output_paths": {"report_html": "report.html"},
+                    "effects": ["write"],
+                    "idempotent": True,
+                    "failure_class": "transient",
+                },
+                "checks": [
+                    {
+                        "id": "html",
+                        "type": "regex",
+                        "artifact": "report.html",
+                        "pattern": "热点",
+                    }
+                ],
+            }
+        from test_web_explore import AutoCrystallizeLLM
+
+        return AutoCrystallizeLLM()._plan(user)
+
+
+def test_percent_css_template_atom_is_rejected(tmp_path: Path) -> None:
+    from test_web_explore import FakeLLM, call, wait_explore
+
+    from panguverse.core.registry import default_registry
+    from panguverse.web.api import WebAPI
+
+    script = (
+        "from pathlib import Path\n"
+        "Path('report.html').write_text('<h1>今日热点</h1>', encoding='utf-8')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [{"id": "html", "type": "file_exists", "path": "report.html"}],
+            "thought": "产物已落盘",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(
+        root,
+        crystallize_llm=PercentCssCrystallizeLLM(),
+        explore_llm=FakeLLM(decisions),
+        explore_registry=default_registry(),
+    )
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+
+    status, body, _ = call(
+        api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
+    )
+    assert status == 422, body
+    assert body["error"]["code"] == "not_general"
+    assert studio.list_drafts(root)["drafts"] == []
+    pending = body["error"]["pending_atoms"]
+    assert pending and pending[0]["reason"] == "not_general"
+    generality = pending[0]["generality"]
+    assert generality["ok"] is False
+    assert any(
+        "runtime_error" in item for item in generality["violations"]
+    )

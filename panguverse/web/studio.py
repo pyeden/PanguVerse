@@ -76,6 +76,7 @@ _STATUS_BY_CODE = {
     "intent_mismatch": 409,
     "capability_gap": 409,
     "not_general": 422,
+    "replay_failed": 422,
     "internal_error": 500,
 }
 

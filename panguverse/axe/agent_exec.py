@@ -1688,6 +1688,7 @@ def build_crystallized_graph(
     session_dir: Path | str | None = None,
     workspace: Path | str | None = None,
     llm: Any = None,
+    feedback: str = "",
 ) -> dict[str, Any]:
     """Crystallize a successful trace through LLM semantic abstraction.
 
@@ -1782,6 +1783,7 @@ def build_crystallized_graph(
                 script=script,
                 plan_node=plan_node,
                 checks=list(plan.get("checks") or []),
+                feedback=feedback,
             )
         except abstraction.AbstractionError as exc:
             pending.append(
@@ -1822,8 +1824,9 @@ def build_crystallized_graph(
         if report.ok and has_source and not report.dynamic.get("produced"):
             # A "general" atom that emits nothing for a source input cannot
             # replay a real run; ask the abstraction LLM to fix its parser once.
-            feedback = (
-                "用合成 source 运行后没有产出任何声明的输出文件。"
+            repair_feedback = (
+                (feedback + "\n\n" if feedback else "")
+                + "用合成 source 运行后没有产出任何声明的输出文件。"
                 "必须递归解析 source（例如 JSON 的 data.cards[].content[]），"
                 "不要假设 data 一定是 list；source 非空时不得联网。"
                 "样例 source：\n"
@@ -1836,7 +1839,7 @@ def build_crystallized_graph(
                     script=script,
                     plan_node=plan_node,
                     checks=list(plan.get("checks") or []),
-                    feedback=feedback,
+                    feedback=repair_feedback,
                 )
             except abstraction.AbstractionError:
                 retried = None

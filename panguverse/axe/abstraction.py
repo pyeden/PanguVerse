@@ -612,6 +612,11 @@ ABSTRACT_SYSTEM = """你是 PanguVerse 的「原子抽象器」。输入是一�
 10. 解析 source 时必须递归查找条目列表，不能假设 data 是 list；常见结构包括
     {"data": {"cards": [{"content": [{"query": "...", "hotScore": 123}]}]}}。
     条目标题字段可能是 word/query/title/name。
+11. 禁止用 `%` 运算符格式化可能包含 CSS 百分比的模板。CSS（如
+    `linear-gradient(90deg, #fff 0%, #000 45%)`）里的 `%` 会被当成格式说明符，
+    运行时抛 `ValueError: unsupported format character ','`。模板文本中出现 CSS `%`
+    时，必须改用 f-string、`str.format(...)` 或 `str.replace(...)` 占位替换；
+    绝不能写 `HTML_TEMPLATE % {...}` / `"%s" % ...`。
 
 JSON schema：
 {
@@ -939,15 +944,21 @@ def dynamic_generality_check(
 ) -> dict[str, Any]:
     """Run the atom in a clean temp workspace with different inputs.
 
-    Success means: it does not reproduce any recorded artifact byte-for-byte.
-    A controlled failure (invalid/empty input) is acceptable proof that the
-    atom does not replay a recording; reproducing the recording is not.
+    Success requires all of the following:
+
+    * the run itself must not raise (no runtime_error);
+    * every declared ``output_paths`` entry must be written;
+    * the produced artifacts must not reproduce a recorded one byte-for-byte.
+
+    A crash is never accepted as proof of generality: the atom must actually
+    work on different inputs and emit all of its declared outputs.
     """
     seed = seed or uuid.uuid4().hex[:8]
     temp = Path(tempfile.mkdtemp(prefix="pv-generality-"))
     produced: dict[str, str] = {}
     error = ""
     result: dict[str, Any] = {}
+    violations: list[str] = []
     previous_cwd = Path.cwd()
     try:
         os.chdir(temp)
@@ -978,31 +989,40 @@ def dynamic_generality_check(
         result = run(ctx=_GeneralityCtx(temp), **inputs) or {}
         if not isinstance(result, Mapping):
             result = {}
-    except Exception as exc:  # noqa: BLE001 - 受控失败是可接受的通用性证据
+    except Exception as exc:  # noqa: BLE001 - 任何执行异常都必须判定为不通用
         error = f"{type(exc).__name__}: {exc}"[:500]
+        violations.append(f"runtime_error: {error}")
     finally:
         os.chdir(previous_cwd)
-    for key, rel in (contract.get("output_paths") or {}).items():
-        safe = _safe_rel(rel)
-        if not safe:
-            continue
-        target = temp / safe
-        if target.is_file():
-            produced[str(key)] = _hash_bytes(target.read_bytes())
-    rel_by_key = {
+    declared = {
         str(key): _safe_rel(rel)
         for key, rel in (contract.get("output_paths") or {}).items()
     }
+    for key, safe in declared.items():
+        if not safe:
+            violations.append(f"invalid_output_path: {key}")
+            continue
+        target = temp / safe
+        if target.is_file():
+            produced[key] = _hash_bytes(target.read_bytes())
+        else:
+            violations.append(f"missing_output: {key} -> {safe}")
     matched = sorted(
-        rel
+        declared[key]
         for key, digest in produced.items()
-        if rel_by_key.get(str(key)) and recorded.get(rel_by_key[str(key)]) == digest
+        if declared.get(key) and recorded.get(declared[key]) == digest
     )
-    ok = not matched
+    if matched:
+        violations.append(
+            "matched_recording: 不同输入仍产出与录制完全相同的文件 -> "
+            + ", ".join(matched)
+        )
+    ok = not violations
     return {
         "ok": ok,
         "seed": seed,
         "error": error,
+        "violations": violations,
         "produced": produced,
         "recorded_hashes": dict(recorded),
         "matched_recordings": matched,
@@ -1032,10 +1052,7 @@ def generality_check(
     report.dynamic = dynamic
     if not dynamic["ok"]:
         report.ok = False
-        report.violations.append(
-            "不同输入重放仍产出与录制完全相同的文件（疑似内嵌录制数据）: "
-            + ", ".join(dynamic["matched_recordings"])
-        )
+        report.violations.extend(dynamic.get("violations") or [])
     return report
 
 
@@ -1131,6 +1148,52 @@ def write_pack_manifest(workspace: Path, eid: str, atoms: list[dict[str, Any]]) 
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return str(pack_dir)
+
+
+def discard_atoms(*, workspace: Path, eid: str, names: Iterable[str]) -> list[str]:
+    """Remove atoms materialized by a crystallize attempt that failed replay.
+
+    Atom packs are per explore session, so deleting the newly written modules
+    and their ``pack.json`` entries keeps a failed attempt from polluting the
+    workspace atom library.
+    """
+    pack = _pack_name(eid)
+    pack_dir = Path(workspace) / PACKS_REL / pack
+    atoms_dir = pack_dir / "atoms"
+    remove = {str(name) for name in names if name}
+    removed: list[str] = []
+    for name in sorted(remove):
+        if Path(name).name != name or name in (".", ".."):
+            continue
+        target = atoms_dir / f"{name}.py"
+        if target.is_file():
+            target.unlink()
+            removed.append(name)
+    manifest_path = pack_dir / "pack.json"
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = {}
+        if isinstance(manifest, Mapping):
+            remaining = [
+                item
+                for item in (manifest.get("atoms") or [])
+                if isinstance(item, Mapping) and str(item.get("name") or "") not in remove
+            ]
+            if remaining:
+                payload = dict(manifest)
+                payload["atoms"] = remaining
+                manifest_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            else:
+                manifest_path.unlink(missing_ok=True)
+    if atoms_dir.is_dir() and not any(atoms_dir.iterdir()):
+        atoms_dir.rmdir()
+    if pack_dir.is_dir() and not any(pack_dir.iterdir()):
+        pack_dir.rmdir()
+    return removed
 
 
 # --------------------------------------------------------------------------- #
@@ -2008,6 +2071,7 @@ __all__ = [
     "atom_catalog",
     "build_digest",
     "build_graph_from_plan",
+    "discard_atoms",
     "dynamic_generality_check",
     "generality_check",
     "plan_crystallization",

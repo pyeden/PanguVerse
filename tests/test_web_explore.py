@@ -783,7 +783,9 @@ def test_crystallize_records_dropped_script_steps(tmp_path: Path) -> None:
     assert any(item["atom"] == "assert_text_matches" for item in graph["nodes"])
 
 
-def test_replay_failure_blocks_publish(tmp_path: Path, hot_server: str) -> None:
+def test_replay_failure_returns_422_without_draft(
+    tmp_path: Path, hot_server: str
+) -> None:
     counting = [0]
     api = new_api(
         tmp_path,
@@ -797,22 +799,96 @@ def test_replay_failure_blocks_publish(tmp_path: Path, hot_server: str) -> None:
     session = wait_explore(api, body["eid"])
     assert session["status"] == "succeeded", session
 
-    status, draft, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
-    assert status == 200, draft
-    assert draft["replay"]["status"] == "failed"
-
-    workflow = studio.read_workflow(api.root, draft["wid"])
-    assert workflow["replay_status"] == "replay_failed"
-
     status, body, _ = call(
-        api, "POST", f"/api/studio/{draft['wid']}/state", {"to": "approved", "note": "试批准"}
+        api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
     )
-    assert status == 200, body
-    status, body, _ = call(
-        api, "POST", f"/api/studio/{draft['wid']}/publish", {"rev": 0, "message": "发布"}
-    )
-    assert status == 409, body
+    assert status == 422, body
     assert body["error"]["code"] == "replay_failed"
+    assert body["error"]["failed_node"]
+    assert body["error"]["error"]
+    assert body["error"]["new_atoms"] == []
+
+    # 重放失败不产出草案，也不留下可被后续工作流使用的新原子。
+    assert studio.list_drafts(api.root)["drafts"] == []
+    pending = json.loads(
+        (
+            api.root / ".panguverse" / "explore" / session["eid"] / "pending_atoms.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert pending["reason"] == "replay_failed"
+    assert pending["failed_node"] == body["error"]["failed_node"]
+    assert pending["error"] == body["error"]["error"]
+
+
+class _FailAfterAbstractLLM(AutoCrystallizeLLM):
+    """Plan the abstracted script plus one deliberately failing guard node."""
+
+    def _plan(self, user: str) -> dict[str, Any]:
+        plan = super()._plan(user)
+        fail_id = f"n{len(plan['nodes']) + 1}"
+        plan["nodes"].append(
+            {
+                "id": fail_id,
+                "role": "guard",
+                "atom": "fail",
+                "params": {"message": "negative replay test"},
+            }
+        )
+        plan["checks"].append(
+            {"id": "guard", "type": "status_code", "node": fail_id, "equals": 500}
+        )
+        return plan
+
+
+def test_replay_failure_discards_new_atoms_and_writes_pending(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+
+    script = (
+        "from pathlib import Path\n"
+        "Path('report.html').write_text('<h1>今日热点</h1>', encoding='utf-8')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [{"id": "html", "type": "file_exists", "path": "report.html"}],
+            "thought": "产物已落盘",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(
+        root,
+        crystallize_llm=_FailAfterAbstractLLM(),
+        explore_llm=FakeLLM(decisions),
+        explore_registry=default_registry(),
+    )
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+
+    status, body, _ = call(
+        api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
+    )
+    assert status == 422, body
+    assert body["error"]["code"] == "replay_failed"
+    assert body["error"]["failed_node"] == "s2_fail"
+    assert "negative replay test" in body["error"]["error"]
+    assert body["error"]["new_atoms"] == ["report"]
+    assert body["error"]["discarded_atoms"] == ["report"]
+    assert studio.list_drafts(root)["drafts"] == []
+    assert not list((root / ".panguverse" / "packs").rglob("*.py"))
+    pending = json.loads(
+        (
+            root / ".panguverse" / "explore" / session["eid"] / "pending_atoms.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert pending["reason"] == "replay_failed"
+    assert pending["new_atom_names"] == ["report"]
+    assert pending["atoms"][0]["reason"] == "replay_failed"
 
 
 # --------------------------------------------------------------------------- #
@@ -1536,27 +1612,70 @@ def test_synthesis_reports_unresolved_reference(tmp_path: Path) -> None:
     assert excinfo.value.details["reference"] == "${step9.html}"
 
 
-def test_replay_failed_blocks_debug_without_force(tmp_path: Path, hot_server: str) -> None:
-    counting = [0]
-    api = new_api(
-        tmp_path,
-        llm=FakeLLM(baidu_decisions(hot_server)),
-        registry=make_registry(counting=counting),
+def test_replay_failed_blocks_debug_without_force(
+    tmp_path: Path, hot_server: str
+) -> None:
+    from panguverse.core.registry import default_registry
+
+    root = tmp_path / "ws"
+    root.mkdir()
+    node = {
+        "id": "s1_web_open",
+        "atom": "web_open",
+        "name": "web_open",
+        "description": "打开网页",
+        "params": {"url": hot_server},
+        "capture": {},
+        "when": None,
+        "foreach": None,
+        "as": "item",
+        "retry": None,
+        "continue_on_failure": False,
+        "tags": [],
+        "optional": False,
+        "extra": {},
+        "case_id": "explore",
+        "case_name": "explore",
+        "origin": "explore",
+        "new_atom": False,
+        "locked": False,
+    }
+    created = studio.create_draft_from_graph(
+        root,
+        intent="打开百度热搜并提取标题",
+        name="打开百度热搜",
+        nodes=[node],
+        edges=[],
+        actor="test",
+        explore_id="e-12345678",
+        pending_atoms=[],
+        replay_checks=[],
+        abstraction={},
+        registry=None,
     )
-    status, body, _ = call(
-        api, "POST", "/api/studio/explore", {"intent": "打开百度热搜并提取标题", "max_steps": 4}
+    studio.record_replay(
+        root,
+        created["wid"],
+        {
+            "status": "failed",
+            "checks": [],
+            "errors": [{"step_id": "s1_web_open", "atom": "web_open", "error": "boom"}],
+            "llm_calls": 0,
+            "clean_workspace": True,
+        },
     )
-    assert status == 202, body
-    session = wait_explore(api, body["eid"])
-    status, draft, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
-    assert status == 200, draft
-    assert draft["replay_status"] == "replay_failed"
-    node_id = draft["graph"]["nodes"][0]["id"]
+    api = WebAPI(
+        root,
+        crystallize_llm=AutoCrystallizeLLM(),
+        explore_llm=FakeLLM([]),
+        explore_registry=default_registry(),
+    )
+    node_id = node["id"]
 
     status, body, _ = call(
         api,
         "POST",
-        f"/api/studio/{draft['wid']}/debug",
+        f"/api/studio/{created['wid']}/debug",
         {"rev": 0, "node_id": node_id, "mode": "from_start"},
     )
     assert status == 409, body
@@ -1565,7 +1684,7 @@ def test_replay_failed_blocks_debug_without_force(tmp_path: Path, hot_server: st
     status, body, _ = call(
         api,
         "POST",
-        f"/api/studio/{draft['wid']}/debug",
+        f"/api/studio/{created['wid']}/debug",
         {"rev": 0, "node_id": node_id, "mode": "from_start", "force": True},
     )
     assert status == 202, body

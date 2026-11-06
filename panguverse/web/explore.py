@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..axe import agent_exec
+from ..axe import abstraction, agent_exec
 from ..core import workspace_packs
 from . import studio
 from .studio import StudioError
@@ -464,6 +464,32 @@ def read_artifact(root: Path, eid: str, path: str) -> tuple[bytes, str, str]:
 # --------------------------------------------------------------------------- #
 # 固化 + 重放
 # --------------------------------------------------------------------------- #
+def _replay_failure_details(replay: Mapping[str, Any]) -> dict[str, str]:
+    """Extract the first actionable failure from a replay report."""
+    errors = [
+        item for item in (replay.get("errors") or []) if isinstance(item, Mapping)
+    ]
+    failed_checks = [
+        item
+        for item in (replay.get("checks") or [])
+        if isinstance(item, Mapping) and not item.get("ok")
+    ]
+    failed_node = ""
+    error = ""
+    if errors:
+        failed_node = str(errors[0].get("step_id") or errors[0].get("atom") or "")
+        error = str(errors[0].get("error") or "")
+    if not error and failed_checks:
+        item = failed_checks[0]
+        failed_node = str(
+            item.get("step_id") or item.get("node") or item.get("id") or ""
+        )
+        error = f"check failed: {item.get('id') or item.get('type') or 'unknown'}"
+    if not error:
+        error = f"replay status = {replay.get('status')}"
+    return {"failed_node": failed_node, "error": error}
+
+
 def crystallize(
     root: Path,
     eid: str,
@@ -525,7 +551,14 @@ def crystallize(
             status=503,
             details={"llm": _llm_status(llm)},
         )
-    try:
+    # A retried crystallize must not expose a stale pending list from an
+    # earlier failed attempt.
+    (session_dir / "pending_atoms.json").unlink(missing_ok=True)
+    base_registry = registry
+
+    def _attempt(feedback: str = "") -> tuple[
+        dict[str, Any], list[dict[str, Any]], Any, Any, dict[str, Any]
+    ]:
         graph = agent_exec.build_crystallized_graph(
             events,
             eid=eid,
@@ -533,38 +566,129 @@ def crystallize(
             checks=agent_exec.checks_from_success(success),
             name=str(data.get("name") or ""),
             domain_pack=str(meta.get("domain_pack") or ""),
-            registry=registry,
+            registry=base_registry,
             session_dir=session_dir,
             workspace=root,
             llm=llm,
+            feedback=feedback,
         )
+        atoms = list(graph.get("atoms_created") or [])
+        # Runtime atom lookup must see the workspace pack without mutating the
+        # process-global registry (one workspace cannot pollute another).
+        runtime_registry = workspace_packs.workspace_registry(root, base_registry)
+        # 测试注入的轻量 registry 不参与 studio 的 plan 校验（其接口不含 packs）；
+        # 生产 registry 则必须带上本 workspace 的原子，否则新原子会被判“不存在”。
+        validation = runtime_registry if hasattr(runtime_registry, "packs") else None
+        try:
+            replay_result = agent_exec.replay_graph(
+                nodes=graph["nodes"],
+                registry=runtime_registry,
+                sandbox=session_dir / "replay",
+                checks=graph["checks"],
+                clean=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - 重放异常也要落成 replay_failed
+            replay_result = {
+                "status": "failed",
+                "checks": [],
+                "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
+                "llm_calls": 0,
+                "clean_workspace": True,
+            }
+        return graph, atoms, runtime_registry, validation, replay_result
+
+    try:
+        graph, atoms_created, registry, validation_registry, replay = _attempt()
     except agent_exec.AgentExecError as exc:
         raise StudioError(exc.code, exc.message, status=exc.status, details=exc.details) from exc
 
-    atoms_created = list(graph.get("atoms_created") or [])
-    # Runtime atom lookup must see the workspace pack without mutating the
-    # process-global registry (one workspace cannot pollute another).
-    registry = workspace_packs.workspace_registry(root, registry)
-    # 测试注入的轻量 registry 不参与 studio 的 plan 校验（其接口不含 packs）；
-    # 生产 registry 则必须带上本 workspace 的原子，否则新原子会被判“不存在”。
-    validation_registry = registry if hasattr(registry, "packs") else None
-
-    try:
-        replay = agent_exec.replay_graph(
-            nodes=graph["nodes"],
-            registry=registry,
-            sandbox=session_dir / "replay",
-            checks=graph["checks"],
-            clean=True,
+    if str(replay.get("status")) != "passed":
+        # One re-abstraction retry: feed the deterministic replay failure back
+        # to the abstraction LLM.  A retry may fix the atom, but a second
+        # failure must never create a draft.
+        first_failure = _replay_failure_details(replay)
+        first_atoms = [
+            str(item.get("name"))
+            for item in atoms_created
+            if isinstance(item, Mapping) and item.get("name")
+        ]
+        abstraction.discard_atoms(workspace=root, eid=eid, names=first_atoms)
+        retry_feedback = (
+            "上一次固化在无 LLM 重放中失败，必须修正后才能固化：\n"
+            f"失败节点: {first_failure['failed_node'] or '(unknown)'}\n"
+            f"错误: {first_failure['error']}\n"
+            "请修正抽象源码/契约，使同一张图能在干净工作区重放通过："
+            "所有声明的 output_paths 必须实际写出；"
+            "产物必须包含可解析的时间戳（如 fetched_at）以通过 freshness；"
+            "禁止用 % 运算符格式化含 CSS 百分比的模板。"
         )
-    except Exception as exc:  # noqa: BLE001 - 重放异常也要落成 replay_failed
-        replay = {
-            "status": "failed",
-            "checks": [],
-            "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
-            "llm_calls": 0,
-            "clean_workspace": True,
-        }
+        try:
+            graph, atoms_created, registry, validation_registry, replay = _attempt(
+                retry_feedback
+            )
+        except agent_exec.AgentExecError as exc:
+            raise StudioError(
+                exc.code,
+                exc.message,
+                status=exc.status,
+                details={**exc.details, "replay_retry": first_failure},
+            ) from exc
+    if str(replay.get("status")) != "passed":
+        failure = _replay_failure_details(replay)
+        new_atoms = [
+            str(item.get("name"))
+            for item in atoms_created
+            if isinstance(item, Mapping) and item.get("name")
+        ]
+        pending_atoms = [
+            {
+                "name": name,
+                "kind": "atom",
+                "status": "pending",
+                "reason": "replay_failed",
+                "explore_id": eid,
+                "replay_failed_node": failure["failed_node"],
+                "replay_error": failure["error"],
+            }
+            for name in new_atoms
+        ]
+        _atomic_write_json(
+            session_dir / "pending_atoms.json",
+            {
+                "eid": eid,
+                "reason": "replay_failed",
+                "created_at": time.time(),
+                "atoms": pending_atoms,
+                "new_atom_names": new_atoms,
+                "failed_node": failure["failed_node"],
+                "error": failure["error"],
+                "replay": {
+                    "status": replay.get("status"),
+                    "checks": replay.get("checks") or [],
+                    "errors": replay.get("errors") or [],
+                    "llm_calls": int(replay.get("llm_calls") or 0),
+                    "clean_workspace": bool(replay.get("clean_workspace")),
+                },
+            },
+        )
+        # Failed attempts must not leave new atoms behind for later runs.
+        discarded = abstraction.discard_atoms(
+            workspace=root, eid=eid, names=new_atoms
+        )
+        raise StudioError(
+            "replay_failed",
+            "固化后的无 LLM 重放未通过，未创建草案；新原子已回收",
+            status=422,
+            details={
+                "explore_id": eid,
+                "failed_node": failure["failed_node"],
+                "error": failure["error"],
+                "new_atoms": new_atoms,
+                "discarded_atoms": discarded,
+                "pending_atoms": pending_atoms,
+                "replay": replay,
+            },
+        )
     created = studio.create_draft_from_graph(
         root,
         intent=str(meta.get("intent") or ""),
