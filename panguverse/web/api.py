@@ -754,7 +754,7 @@ class WebAPI:
             edges=revision.get("edges") or [],
             intent=str(workflow.get("intent") or ""),
             env_schema=revision.get("env_schema") or [],
-            assumptions=revision.get("assumptions") or workflow.get("assumptions") or [],
+            assumptions=revision.get("assumptions") or [],
             available_env=available_env,
             checks=data.get("checks"),
             domain_pack=str(workflow.get("domain_pack") or ""),

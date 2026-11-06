@@ -290,11 +290,53 @@ def _commit_revision(
     env_schema: list[str] | None = None,
     audit_note: str = "",
     intent: str | None = None,
+    name: str | None = None,
+    planner: str | None = None,
+    plan_source: str | None = None,
+    confidence: float | None = None,
+    assumptions: list[str] | None = None,
+    capability_gaps: list[str] | None = None,
+    param_audit: Mapping[str, Any] | None = None,
+    domain_pack: str | None = None,
 ) -> dict[str, Any]:
     rev = int(workflow.get("current_rev") or 0) + 1
     if intent is not None and str(intent).strip():
         workflow["intent"] = str(intent)
+    if domain_pack is not None and str(domain_pack).strip():
+        workflow["domain_pack"] = str(domain_pack)
     old_state = str(workflow.get("state") or "draft")
+    # 新版本必须自带元数据：缺字段时只继承**上一版**（同一张图的人工编辑），
+    # 绝不回退到 workflow 当前值，否则 apply 后会把旧草案的假设/名称带进新版本。
+    previous: dict[str, Any] = {}
+    if base_rev is not None:
+        try:
+            previous = read_revision(root, wid, int(base_rev))
+        except StudioError:
+            previous = {}
+
+    def _inherit(value: Any, key: str) -> Any:
+        if value is not None:
+            return value
+        return previous.get(key)
+
+    resolved_name = _inherit(name, "name")
+    if not str(resolved_name or "").strip():
+        # 历史版本没有 name 字段时，从图里的 case_name 恢复名称。
+        for node in nodes:
+            case_name = str(node.get("case_name") or "").strip()
+            if case_name:
+                resolved_name = case_name
+                break
+    if not str(resolved_name or "").strip():
+        resolved_name = workflow.get("name") or ""
+    metadata = {
+        "planner": _inherit(planner, "planner"),
+        "plan_source": _inherit(plan_source, "plan_source"),
+        "confidence": _inherit(confidence, "confidence"),
+        "assumptions": _inherit(assumptions, "assumptions"),
+        "capability_gaps": _inherit(capability_gaps, "capability_gaps"),
+        "param_audit": _inherit(param_audit, "param_audit"),
+    }
     revision = {
         "wid": wid,
         "rev": rev,
@@ -303,8 +345,10 @@ def _commit_revision(
         "created_at": time.time(),
         "message": message,
         "base_rev": base_rev,
+        "name": str(resolved_name or ""),
         "intent": workflow.get("intent") or "",
         "domain_pack": workflow.get("domain_pack") or "",
+        **{key: copy.deepcopy(value) for key, value in metadata.items() if value is not None},
         "env_schema": list(env_schema if env_schema is not None else _env_schema(nodes)),
         "nodes": copy.deepcopy(nodes),
         "edges": copy.deepcopy(edges),
@@ -312,8 +356,12 @@ def _commit_revision(
     _write_revision(root, wid, revision)
     workflow["current_rev"] = rev
     workflow["state"] = "draft"
+    workflow["name"] = revision["name"]
     workflow["locked"] = [node["id"] for node in nodes if node.get("locked")]
     workflow["env_schema"] = list(revision["env_schema"])
+    for key, value in metadata.items():
+        if value is not None:
+            workflow[key] = copy.deepcopy(value)
     workflow["updated_at"] = time.time()
     _write_workflow(root, wid, workflow)
     _append_audit(
@@ -386,6 +434,90 @@ def _registry() -> Any:
     from . import service
 
     return service.registry()
+
+
+def _revision_name(revision: Mapping[str, Any], workflow: Mapping[str, Any]) -> str:
+    """按版本恢复展示名称；旧版本没有 name 字段时用节点 case_name。"""
+    name = str(revision.get("name") or "").strip()
+    if name:
+        return name
+    for node in revision.get("nodes") or []:
+        case_name = str(node.get("case_name") or "").strip()
+        if case_name:
+            return case_name
+    return str(workflow.get("name") or "")
+
+
+def _plan_assumptions(plan: Any, nodes: Iterable[Mapping[str, Any]]) -> list[str]:
+    """从新计划 + 最终图重新推导假设，不带旧草案的模板假设。"""
+    items: list[str] = []
+    for case in getattr(plan, "cases", []) or []:
+        meta = getattr(case, "meta", None) or {}
+        for item in meta.get("assumptions") or ():
+            text_item = str(item).strip()
+            if text_item and text_item not in items:
+                items.append(text_item)
+    env_keys = _env_schema(nodes)
+    for key in env_keys:
+        text = f"需要 {key}"
+        if text not in items:
+            items.append(text)
+    # 自动填充 URL 后，旧模板里的「需要 X」若已不在图中则丢弃。
+    result: list[str] = []
+    for item in items:
+        match = re.fullmatch(r"需要 ([A-Za-z_][A-Za-z0-9_]*)", item)
+        if match and match.group(1) not in env_keys:
+            continue
+        result.append(item)
+    return sorted(dict.fromkeys(result))
+
+
+def _plan_confidence(plan: Any, domain_pack: str) -> float:
+    try:
+        value = float((getattr(plan, "meta", None) or {}).get("confidence"))
+    except (TypeError, ValueError):
+        value = 0.45 if domain_pack == "web_research" else 0.4
+    return max(0.0, min(1.0, value))
+
+
+def _merge_assumptions(
+    base: Iterable[str], nodes: Iterable[Mapping[str, Any]]
+) -> list[str]:
+    """部分接受提案时，按**最终图**校正假设列表。"""
+    env_keys = _env_schema(nodes)
+    items: list[str] = []
+    for item in base or ():
+        text_item = str(item).strip()
+        if not text_item:
+            continue
+        match = re.fullmatch(r"需要 ([A-Za-z_][A-Za-z0-9_]*)", text_item)
+        if match and match.group(1) not in env_keys:
+            continue
+        if text_item not in items:
+            items.append(text_item)
+    for key in env_keys:
+        text = f"需要 {key}"
+        if text not in items:
+            items.append(text)
+    return sorted(dict.fromkeys(items))
+
+
+def _param_audit_for(
+    nodes: Iterable[Mapping[str, Any]],
+    *,
+    url: str = "",
+    url_source: str = "",
+    autofilled: Iterable[Mapping[str, Any]] = (),
+    assumptions: Iterable[str] = (),
+) -> dict[str, Any]:
+    return {
+        "url": str(url or ""),
+        "url_source": str(url_source or ""),
+        "autofilled": [dict(item) for item in autofilled],
+        "param_gaps": param_fill.audit_param_gaps(nodes, _registry()),
+        "env_inputs": param_fill.audit_env_inputs(nodes, _registry()),
+        "assumptions": list(assumptions),
+    }
 
 
 def _baseline_env(root: Path) -> dict[str, Any]:
@@ -785,6 +917,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "created_at": now,
         "message": "AI 生成初稿",
         "base_rev": None,
+        "name": name,
         "intent": intent,
         "domain_pack": workflow["domain_pack"],
         "planner": bundle.planner,
@@ -911,21 +1044,21 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
     workflow = read_workflow(root, wid)
     target_rev = int(workflow.get("current_rev") or 0) if rev is None else _as_rev(rev)
     revision = read_revision(root, wid, target_rev)
+    # 版本视图必须只读该 revision 的元数据：历史 rev 的 domain_pack/intent/名称
+    # 不能被 workflow 的当前值覆盖（否则 ?rev=0 会显示 replan 后的 web 计划）。
+    revision_intent = str(revision.get("intent") or "")
+    revision_pack = str(revision.get("domain_pack") or "")
     return {
         "wid": wid,
-        "name": workflow.get("name"),
-        "intent": workflow.get("intent"),
-        "domain_pack": workflow.get("domain_pack"),
-        "planner": revision.get("planner") or workflow.get("planner") or "",
-        "plan_source": revision.get("plan_source") or workflow.get("plan_source") or "",
-        "confidence": revision.get("confidence", workflow.get("confidence", 0.0)),
-        "assumptions": list(revision.get("assumptions") or workflow.get("assumptions") or []),
-        "capability_gaps": list(
-            revision.get("capability_gaps") or workflow.get("capability_gaps") or []
-        ),
-        "param_audit": dict(
-            revision.get("param_audit") or workflow.get("param_audit") or {}
-        ),
+        "name": _revision_name(revision, workflow),
+        "intent": revision_intent or str(workflow.get("intent") or ""),
+        "domain_pack": revision_pack or str(workflow.get("domain_pack") or ""),
+        "planner": str(revision.get("planner") or ""),
+        "plan_source": str(revision.get("plan_source") or ""),
+        "confidence": revision.get("confidence", 0.0),
+        "assumptions": list(revision.get("assumptions") or []),
+        "capability_gaps": list(revision.get("capability_gaps") or []),
+        "param_audit": dict(revision.get("param_audit") or {}),
         "state": workflow.get("state"),
         "current_rev": workflow.get("current_rev"),
         "rev": target_rev,
@@ -933,7 +1066,7 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
         "created_by": revision.get("created_by"),
         "created_at": revision.get("created_at"),
         "message": revision.get("message"),
-        "env_schema": revision.get("env_schema") or workflow.get("env_schema") or [],
+        "env_schema": revision.get("env_schema") or [],
         "locked": workflow.get("locked") or [],
         "published_ref": workflow.get("published_ref") or "",
         "graph": _graph_of(revision),
@@ -1062,7 +1195,7 @@ def _node_payload(root: Path, wid: str, revision: Mapping[str, Any], workflow: d
         edges=edges,
         intent=str(workflow.get("intent") or ""),
         env_schema=revision.get("env_schema") or [],
-        assumptions=revision.get("assumptions") or workflow.get("assumptions") or [],
+        assumptions=revision.get("assumptions") or [],
         available_env=set(service.load_last_env(root)),
         domain_pack=str(workflow.get("domain_pack") or ""),
     )
@@ -1372,13 +1505,26 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         origin="ai",
         locked=[str(node.get("id")) for node in revision.get("nodes") or [] if node.get("locked")],
     )
+    autofilled: list[dict[str, Any]] = []
     if guard.url and str(guard.domain or "") in _WEB_DOMAINS:
-        param_fill.fill_url_params(
+        autofilled = param_fill.fill_url_params(
             proposed["nodes"],
             _registry(),
             guard.url,
             source=guard.url_source or "site_alias",
         )
+    assumptions = _plan_assumptions(plan, proposed["nodes"])
+    plan_name = str(plan.cases[0].name or plan_intent)[:80]
+    planner_name = str(getattr(plan, "planner", "") or "template")
+    plan_source = str(getattr(plan, "source", "") or "template")
+    confidence = _plan_confidence(plan, proposal_pack)
+    param_audit = _param_audit_for(
+        proposed["nodes"],
+        url=guard.url if str(guard.domain or "") in _WEB_DOMAINS else "",
+        url_source=guard.url_source if str(guard.domain or "") in _WEB_DOMAINS else "",
+        autofilled=autofilled,
+        assumptions=assumptions,
+    )
     conflicts = _locked_conflicts(revision.get("nodes") or [], proposed["nodes"])
     if conflicts:
         raise StudioError(
@@ -1418,6 +1564,14 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         "domain_pack": proposal_pack,
         "domain_pack_ignored": ignored_pack,
         "domain_pack_message": guard.domain_pack_message,
+        "name": plan_name,
+        "planner": planner_name,
+        "plan_source": plan_source,
+        "confidence": confidence,
+        "assumptions": assumptions,
+        "capability_gaps": [],
+        "env_schema": _env_schema(proposed["nodes"]),
+        "param_audit": param_audit,
         "nodes": proposed["nodes"],
         "edges": proposed["edges"],
         "diff": diff,
@@ -1436,6 +1590,10 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         "graph": proposed,
         "intent": plan_intent,
         "domain_pack": proposal_pack,
+        "name": plan_name,
+        "planner": planner_name,
+        "confidence": confidence,
+        "assumptions": assumptions,
         "domain_pack_ignored": ignored_pack,
         "domain_pack_message": guard.domain_pack_message,
     }
@@ -1519,6 +1677,28 @@ def apply_diff(root: Path, wid: str, payload: Any, *, actor: str = "local") -> d
         str(proposal.get("intent") or "").strip()
         or str(proposal.get("instruction") or "").strip()
     )
+    # apply 后用**提案/新图**重算元数据：旧 revision 只有图，没有名称与假设，
+    # 若继续用 workflow 旧值，页面会一直停留在被替换掉的 API 草案上。
+    proposal_audit = proposal.get("param_audit") or {}
+    applied_assumptions = _merge_assumptions(
+        proposal.get("assumptions") or [], nodes
+    )
+    applied_autofilled = [
+        item
+        for item in (proposal.get("autofilled") or proposal_audit.get("autofilled") or [])
+        if str(item.get("node_id")) in node_ids
+    ]
+    applied_audit = _param_audit_for(
+        nodes,
+        url=str(proposal_audit.get("url") or ""),
+        url_source=str(proposal_audit.get("url_source") or ""),
+        autofilled=applied_autofilled,
+        assumptions=applied_assumptions,
+    )
+    applied_name = (
+        str(proposal.get("name") or "").strip()
+        or _revision_name(revision, workflow)
+    )
 
     new_rev = _commit_revision(
         root,
@@ -1535,6 +1715,14 @@ def apply_diff(root: Path, wid: str, payload: Any, *, actor: str = "local") -> d
             f" intent={applied_intent} domain_pack={proposal_pack or workflow.get('domain_pack') or ''}"
         ),
         intent=applied_intent or None,
+        name=applied_name,
+        planner=str(proposal.get("planner") or ""),
+        plan_source=str(proposal.get("plan_source") or ""),
+        confidence=proposal.get("confidence"),
+        assumptions=applied_assumptions,
+        capability_gaps=list(proposal.get("capability_gaps") or []),
+        param_audit=applied_audit,
+        env_schema=_env_schema(nodes),
     )
     _append_audit(
         _workflow_dir(root, wid),
@@ -1588,7 +1776,7 @@ def review(root: Path, wid: str, payload: Any) -> dict[str, Any]:
             edges=target.get("edges") or [],
             intent=str(workflow.get("intent") or ""),
             env_schema=target.get("env_schema") or [],
-            assumptions=target.get("assumptions") or workflow.get("assumptions") or [],
+            assumptions=target.get("assumptions") or [],
             available_env=set(_baseline_env(root)),
             domain_pack=str(workflow.get("domain_pack") or ""),
         ),
@@ -1666,7 +1854,7 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
         edges=revision.get("edges") or [],
         intent=str(workflow.get("intent") or ""),
         env_schema=revision.get("env_schema") or [],
-        assumptions=revision.get("assumptions") or workflow.get("assumptions") or [],
+        assumptions=revision.get("assumptions") or [],
         available_env=set(_baseline_env(root)),
         domain_pack=str(workflow.get("domain_pack") or ""),
     )
