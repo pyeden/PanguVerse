@@ -87,6 +87,32 @@ def _hash_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _run_signature_params(source: str) -> tuple[set[str], set[str]] | None:
+    """从 ``run()`` 源码签名推导（带默认值的参数, 全部具名参数）。
+
+    契约里的可选性必须跟真实函数签名一致：``def run(..., limit=30)``
+    的 ``limit`` 是可选的，即使抽象器忘了在名字或类型上加 ``?``。
+    解析失败或没有 ``run()`` 时返回 ``None``，调用方回退到旧白名单。
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "run":
+            continue
+        args = node.args
+        positional = [*args.posonlyargs, *args.args]
+        padded = [None] * (len(positional) - len(args.defaults)) + list(args.defaults)
+        optional = {arg.arg for arg, default in zip(positional, padded, strict=False) if default is not None}
+        optional.update(
+            arg.arg for arg, default in zip(args.kwonlyargs, args.kw_defaults, strict=False) if default is not None
+        )
+        named = {arg.arg for arg in positional} | {arg.arg for arg in args.kwonlyargs}
+        return optional, named
+    return None
+
+
 def _safe_rel(raw: Any) -> str:
     text = str(raw or "").replace("\\", "/").strip()
     while text.startswith("./"):
@@ -694,11 +720,22 @@ def abstract_script(
         "input_dir",
         "input_files",
     }
+    signature = _run_signature_params(source)
+    signature_optional, signature_named = signature if signature else (set(), set())
     normalized_inputs: dict[str, str] = {}
     for key, value in inputs.items():
         name = str(key)
         type_name = str(value)
-        if name.rstrip("?") in optional_inputs and not name.endswith("?"):
+        base = name.rstrip("?")
+        optional = (
+            name.endswith("?")
+            or type_name.strip().endswith("?")
+            or base in signature_optional
+            # 名字不在 run() 签名里时保留旧白名单兜底；签名里声明的参数
+            # 严格按「有没有默认值」判断，不能被白名单误标成可选。
+            or (base not in signature_named and base in optional_inputs)
+        )
+        if optional and not name.endswith("?"):
             name = f"{name}?"
         normalized_inputs[name] = type_name
     checks: list[dict[str, Any]] = []

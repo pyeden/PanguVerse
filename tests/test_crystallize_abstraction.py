@@ -80,6 +80,53 @@ def test_static_generality_rejects_recordings_and_paths() -> None:
     assert abstraction.static_source_check(general)["ok"] is True
 
 
+def test_abstract_script_derives_optional_inputs_from_run_signature() -> None:
+    source = (
+        "from pathlib import Path\n"
+        "def run(source, *, limit=30, title='热点新闻报告', output_dir='.', flag: bool = False):\n"
+        "    base = Path(output_dir)\n"
+        "    base.mkdir(parents=True, exist_ok=True)\n"
+        "    (base / 'report.html').write_text(str(source) + title + str(limit), encoding='utf-8')\n"
+        "    return {'report_html': 'report.html'}\n"
+    )
+    llm = StaticLLM(
+        {
+            "description": "defaulted inputs",
+            "source": source,
+            "contract": {
+                "inputs": {
+                    "source": "string",
+                    "limit": "int",
+                    "title": "string",
+                    "output_dir": "string",
+                    "flag": "boolean",
+                    "odd": "string?",
+                },
+                "outputs": {"report_html": "string"},
+                "output_paths": {"report_html": "report.html"},
+            },
+            "checks": [],
+        }
+    )
+    result = abstraction.abstract_script(
+        llm,
+        intent="生成热点报告",
+        script={"path": "scripts/report.py", "seq": 1},
+        plan_node=None,
+        checks=[],
+    )
+    inputs = result["contract"]["inputs"]
+    assert "source" in inputs  # 签名里无默认值 -> 必填
+    for name in ("limit", "title", "output_dir", "flag"):
+        assert f"{name}?" in inputs, (name, inputs)
+    assert "odd?" in inputs  # 类型后缀 ? 也视为可选
+
+    from panguverse.core.atom import Atom
+
+    atom = Atom(name="repro", fn=lambda **_: {}, inputs=inputs)
+    assert atom.required == ("source",), atom.required
+
+
 def test_plan_requires_a_semantic_check() -> None:
     digest = {
         "intent": "生成报告",
@@ -263,7 +310,7 @@ def test_crystallize_rejects_hardcoded_recording_as_not_general(tmp_path: Path) 
     status, draft, _ = call(
         api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
     )
-    assert status != 200, draft
+    assert status == 422, draft
     assert draft["error"]["code"] == "not_general"
     pending = draft["error"].get("pending_atoms") or []
     assert pending and pending[0]["reason"] == "not_general"

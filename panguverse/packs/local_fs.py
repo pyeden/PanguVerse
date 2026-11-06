@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import errno
 import json
+import os
 import re
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -38,7 +39,13 @@ def sandbox_root(ctx: RunContext) -> Path:
     # only pass env, then cwd as the last resort.
     workspace = getattr(ctx, "workspace", None)
     if workspace:
-        root = getattr(workspace, "root", None) or workspace
+        # ``Path`` 自带 ``.root``（文件系统根 "/"），不能当成自定义
+        # workspace 对象的根属性，否则相对路径会被解析到 "/"。
+        root = (
+            workspace
+            if isinstance(workspace, (str, os.PathLike))
+            else getattr(workspace, "root", None) or workspace
+        )
         return Path(str(root)).expanduser().resolve()
     for key in DEFAULT_ROOT_ENV:
         value = ctx.env.get(key)

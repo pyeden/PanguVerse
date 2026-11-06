@@ -529,7 +529,18 @@ def test_debug_is_isolated_and_url_override_rejected(api: WebAPI, tmp_path: Path
     assert final["duration_ms"] >= 0
     assert debug["variables"]["env"]["API_PASSWORD"] == "***"
     assert "super-secret-value" not in json.dumps(debug, ensure_ascii=False)
-    assert debug["variables"]["env"]["FS_ROOT"] == str(fs_root.resolve())
+    sandbox = (
+        api.root
+        / ".panguverse"
+        / "studio"
+        / wid
+        / "debug"
+        / started["session_id"]
+        / "workspace"
+    )
+    assert debug["sandbox"] == str(sandbox)
+    assert debug["variables"]["env"]["FS_ROOT"] == str(sandbox)
+    assert debug["variables"]["env"]["PANGUVERSE_FS_ROOT"] == str(sandbox)
     assert service.list_runs(api.root) == []  # 调试不进正式历史
 
     debug_files = list((api.root / ".panguverse" / "studio" / wid / "debug").glob("*.jsonl"))
@@ -560,6 +571,88 @@ def test_debug_is_isolated_and_url_override_rejected(api: WebAPI, tmp_path: Path
 # --------------------------------------------------------------------------- #
 # 审计
 # --------------------------------------------------------------------------- #
+def test_debug_runs_in_per_session_sandbox_and_restores_cwd(
+    api: WebAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """相对路径写出的产物与 assert_* 必须落在同一 sandbox，而不是进程 cwd。"""
+    from panguverse.core import workspace_packs
+    from panguverse.core.atom import Atom
+
+    def write_relative(ctx: Any = None, output_dir: str = ".", title: str = "热点") -> dict[str, str]:
+        base = Path(output_dir)
+        base.mkdir(parents=True, exist_ok=True)
+        (base / "report.html").write_text(f"<h1>{title}</h1>", encoding="utf-8")
+        return {"report_html": "report.html"}
+
+    writer = Atom(
+        name="test_write_relative",
+        fn=write_relative,
+        inputs={"output_dir": "string", "title": "string"},
+        required=("output_dir",),
+        outputs={"report_html": "string"},
+    )
+    base_registry = service.registry()
+
+    class _Registry:
+        def get(self, name: str) -> Any:
+            return writer if name == writer.name else base_registry.get(name)
+
+    monkeypatch.setattr(
+        workspace_packs, "workspace_registry", lambda root, base: _Registry()
+    )
+    wid = "w-abcdef12"
+    sid = "dbg-w-abcdef12-12345678"
+    nodes = [
+        {
+            "id": "n1",
+            "atom": writer.name,
+            "name": "写报告",
+            "params": {"output_dir": ".", "title": "热点"},
+        },
+        {
+            "id": "n2",
+            "atom": "assert_file_exists",
+            "name": "确认落盘",
+            "params": {"path": "report.html"},
+        },
+    ]
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    monkeypatch.chdir(outside)
+    session = studio._DebugSession(
+        root=api.root,
+        wid=wid,
+        rev=0,
+        sid=sid,
+        node_id="n1",
+        mode="downstream",
+        nodes=nodes,
+        env={},
+        actor="test",
+    )
+    session.start()
+    deadline = time.time() + 30
+    debug: dict[str, Any] | None = None
+    while time.time() < deadline:
+        debug = studio.get_debug_session(api.root, sid, cursor=0)
+        if debug.get("done"):
+            break
+        time.sleep(0.02)
+    assert debug and debug["done"] is True
+    final: dict[str, str] = {}
+    for item in debug["nodes"]:
+        if item.get("type") == "node" or item.get("node_id"):
+            final[str(item["node_id"])] = str(item["status"])
+    assert final == {"n1": "passed", "n2": "passed"}, final
+
+    sandbox = api.root / ".panguverse" / "studio" / wid / "debug" / sid / "workspace"
+    assert debug["sandbox"] == str(sandbox)
+    assert (sandbox / "report.html").is_file()
+    assert not (outside / "report.html").exists()
+    assert Path.cwd() == outside
+    assert debug["variables"]["env"]["FS_ROOT"] == str(sandbox)
+
+
 def test_audit_records_state_publish_and_diff(api: WebAPI) -> None:
     status, draft = call(
         api,

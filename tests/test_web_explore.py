@@ -1636,7 +1636,12 @@ def test_workspace_pack_survives_registry_restart_and_debug_from_start(
         time.sleep(0.02)
     assert done and done["done"] is True, done
     assert done["summary"]["failed"] == 0, done
-    assert (root / ".panguverse" / "fs-demo" / "reports" / "report.html").is_file()
+    sandbox = Path(done["sandbox"])
+    assert sandbox == (
+        root / ".panguverse" / "studio" / draft["wid"] / "debug" / started["session_id"] / "workspace"
+    )
+    assert (sandbox / "reports" / "report.html").is_file()
+    assert not (root / ".panguverse" / "fs-demo" / "reports" / "report.html").exists()
 
 
 def test_replay_passes_after_deleting_explore_scripts(tmp_path: Path) -> None:

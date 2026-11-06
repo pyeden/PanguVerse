@@ -75,6 +75,7 @@ _STATUS_BY_CODE = {
     "risk_unconfirmed": 409,
     "intent_mismatch": 409,
     "capability_gap": 409,
+    "not_general": 422,
     "internal_error": 500,
 }
 
@@ -2345,6 +2346,14 @@ def _debug_root(root: Path, wid: str) -> Path:
     return _workflow_dir(root, wid) / "debug"
 
 
+def _debug_sandbox(root: Path, wid: str, sid: str) -> Path:
+    """每次调试会话独立的工作目录：产物、相对路径与断言共享同一根。"""
+    return _debug_root(root, wid) / sid / "workspace"
+
+
+_DEBUG_CWD_LOCK = threading.RLock()
+
+
 def _debug_node_step(node: Mapping[str, Any]) -> Step:
     spec = {
         "id": node.get("id"),
@@ -2394,6 +2403,7 @@ class _DebugSession:
         self.nodes = nodes
         self.env = env
         self.actor = actor
+        self.sandbox = _debug_sandbox(root, wid, sid)
         self.path = _debug_root(root, wid) / f"{sid}.jsonl"
         self.snapshot_path = _debug_root(root, wid) / f"{sid}.json"
         self.events: list[dict[str, Any]] = []
@@ -2429,7 +2439,14 @@ class _DebugSession:
             _append_jsonl(self.path, item)
             return self.seq
 
+    def _ensure_sandbox(self) -> Path:
+        self.sandbox.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            self.sandbox.chmod(DIR_MODE)
+        return self.sandbox
+
     def start(self) -> None:
+        sandbox = self._ensure_sandbox()
         self.emit(
             {
                 "type": "start",
@@ -2439,6 +2456,7 @@ class _DebugSession:
                 "node_id": self.node_id,
                 "mode": self.mode,
                 "total": len(self.nodes),
+                "sandbox": str(sandbox),
                 "status": "running",
             }
         )
@@ -2626,10 +2644,24 @@ class _DebugSession:
         from . import service
 
         registry = workspace_registry(self.root, service.registry())
-        ctx = RunContext(env=dict(self.env), run_id=self.sid)
+        sandbox = self._ensure_sandbox()
+        env = dict(self.env)
+        # 调试的硬边界就是本次会话的 sandbox：相对路径产物与 assert_*
+        # 都以它为根，绝不落到服务进程 cwd。
+        env["FS_ROOT"] = str(sandbox)
+        env["PANGUVERSE_FS_ROOT"] = str(sandbox)
+        ctx = RunContext(env=env, run_id=self.sid, workspace=sandbox)
         passed = failed = skipped = 0
         by_reason: dict[str, int] = {}
         aborted = False
+        # os.chdir 是进程级状态；串行化调试执行，避免并发会话互相切目录。
+        _DEBUG_CWD_LOCK.acquire()
+        previous_cwd = os.getcwd()
+        try:
+            os.chdir(sandbox)
+        except BaseException:
+            _DEBUG_CWD_LOCK.release()
+            raise
         try:
             for node in self.nodes:
                 node_id = str(node.get("id") or "")
@@ -2736,6 +2768,10 @@ class _DebugSession:
                 }
             )
         finally:
+            try:
+                os.chdir(previous_cwd)
+            finally:
+                _DEBUG_CWD_LOCK.release()
             summary = {
                 "passed": passed,
                 "failed": failed,
@@ -2763,6 +2799,7 @@ class _DebugSession:
                 "mode": self.mode,
                 "status": "ok" if failed == 0 else "failed",
                 "summary": summary,
+                "sandbox": str(self.sandbox),
                 "trace": [
                     {
                         "node_id": item.get("node_id"),
@@ -2913,8 +2950,10 @@ def get_debug_session(root: Path, sid: str, *, cursor: int = 0) -> dict[str, Any
         "skipped": 0,
         "by_reason": {},
     }
+    start = next((item for item in events if item.get("type") == "start"), {})
     return {
         "session_id": sid,
+        "sandbox": (start or {}).get("sandbox") or "",
         "cursor": max([cursor, *[int(item.get("seq") or 0) for item in pending]]),
         "done": end is not None,
         "status": (end or {}).get("status")

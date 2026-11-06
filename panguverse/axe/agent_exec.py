@@ -70,7 +70,11 @@ class AgentExecError(Exception):
         super().__init__(message)
         self.code = code
         self.message = message
-        self.status = status or {"bad_request": 400, "not_found": 404}.get(code, 500)
+        self.status = status or {
+            "bad_request": 400,
+            "not_found": 404,
+            "not_general": 422,
+        }.get(code, 500)
         self.details = dict(details or {})
 
 
