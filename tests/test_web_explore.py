@@ -13,9 +13,9 @@ from typing import Any
 
 import pytest
 
+from panguverse.axe import agent_exec
 from panguverse.core.atom import Atom
 from panguverse.web import studio
-from panguverse.axe import agent_exec
 from panguverse.web.api import WebAPI
 from panguverse.web.explore import EID_RE
 
@@ -53,7 +53,7 @@ def wait_explore(api: WebAPI, eid: str, *, timeout: float = 15.0) -> dict[str, A
 # 假工具：真实 HTTP + 真实文本提取，但不依赖 Chrome
 # --------------------------------------------------------------------------- #
 class _Handler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
+    def do_GET(self) -> None:
         body = HTML.encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
@@ -61,7 +61,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *args: Any) -> None:  # noqa: D401
+    def log_message(self, *args: Any) -> None:
         return
 
 
@@ -723,3 +723,152 @@ def test_script_step_is_crystallized_into_workspace_atom_and_replayed(
     assert draft["replay"]["status"] == "passed", draft["replay"]
     packs = load_workspace_packs(root)
     assert any(pack.name == atom["pack"] for pack in packs)
+
+
+# --------------------------------------------------------------------------- #
+# QA 阻断项回归：代码版本快照 / 证据绑定 / fs 沙箱
+# --------------------------------------------------------------------------- #
+def test_script_atom_uses_selected_success_code_not_live_failed_file(tmp_path: Path) -> None:
+    import hashlib
+
+    from panguverse.core.registry import default_registry
+
+    good = (
+        "with open('report.html', 'w', encoding='utf-8') as f:\n"
+        "    f.write('<h1>GOOD</h1>')\n"
+        "print('good')\n"
+    )
+    bad = "raise SystemExit(1)\n"
+    decisions = [
+        {"action": "script", "path": "scripts/x.py", "code": good, "thought": "成功版本"},
+        {"action": "script", "path": "scripts/x.py", "code": bad, "thought": "后来被覆盖成失败版本"},
+        {
+            "action": "final",
+            "checks": [{"id": "html", "type": "file_exists", "path": "report.html"}],
+            "thought": "收尾",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=FakeLLM(decisions), explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "覆盖复现", "max_steps": 5}
+    )
+    assert status == 202, body
+    eid = body["eid"]
+    session = wait_explore(api, eid)
+    assert session["status"] == "succeeded", session
+
+    events = session["events"]
+    scripts = [event for event in events if event["type"] == "script"]
+    assert all(event.get("code_artifact") for event in scripts)
+    assert scripts[0]["code_sha256"] == hashlib.sha256(good.encode()).hexdigest()
+    assert scripts[1]["code_sha256"] == hashlib.sha256(bad.encode()).hexdigest()
+
+    status, draft, _ = call(api, "POST", f"/api/studio/explore/{eid}/crystallize", {})
+    assert status == 200, draft
+    atom = draft["atoms_created"][0]
+    assert atom["code_sha256"] == hashlib.sha256(good.encode()).hexdigest()
+    embedded = Path(atom["path"]).read_text(encoding="utf-8")
+    assert "GOOD" in embedded and "SystemExit" not in embedded
+    assert draft["replay_status"] == "replay_passed"
+    failed = [
+        item for item in draft["pending_atoms"] if item.get("trace_seq") == scripts[1]["seq"]
+    ]
+    assert failed and "脚本执行失败" in failed[0]["reason"]
+
+
+def test_text_check_binds_to_report_artifact_and_is_persisted(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+
+    script = (
+        "with open('report.html', 'w', encoding='utf-8') as f:\n"
+        "    f.write('<html><body><h1>今日热点榜</h1></body></html>')\n"
+        "print('written')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [{"id": "title", "type": "text_contains", "value": "今日热点榜"}],
+            "thought": "内容已落盘",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=FakeLLM(decisions), explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+
+    status, draft, _ = call(
+        api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
+    )
+    assert status == 200, draft
+    assert draft["replay_status"] == "replay_passed"
+    check = draft["graph"]["checks"][0] if "checks" in draft["graph"] else None
+    if check is None:
+        check = draft["replay"]["checks"][0]["spec"]
+    assert check["binding"] == "artifact"
+    assert check["artifact"] == "report.html"
+    revision = studio.read_revision(root, draft["wid"], draft["rev"])
+    assert revision["replay_checks"][0]["artifact"] == "report.html"
+    workflow = studio.read_workflow(root, draft["wid"])
+    assert workflow["replay_checks"][0]["artifact"] == "report.html"
+
+
+def test_unbindable_text_check_blocks_replay_passed(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+
+    script = "print('ONLY-IN-STDOUT')\n"
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [{"id": "stdout-only", "type": "text_contains", "value": "ONLY-IN-STDOUT"}],
+            "thought": "stdout 有证据",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=FakeLLM(decisions), explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成报告", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+
+    status, draft, _ = call(
+        api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {}
+    )
+    assert status == 200, draft
+    assert draft["replay_status"] != "replay_passed"
+    assert draft["replay"]["unbound"] == ["stdout-only"]
+    assert any("未绑定证据" in item.get("error", "") for item in draft["replay"]["errors"])
+
+
+def test_fs_atoms_use_ctx_workspace_over_fs_root(tmp_path: Path) -> None:
+    from panguverse.core.context import RunContext
+    from panguverse.core.registry import default_registry
+
+    atom = default_registry().get("fs_write_text")
+    workspace = tmp_path / "sandbox"
+    other = tmp_path / "other"
+    other.mkdir()
+    name = "sandbox_boundary_probe.txt"
+    ctx = RunContext(workspace=str(workspace), env={"FS_ROOT": str(other)})
+    atom.invoke(ctx, {"path": f"data/{name}", "text": "sandbox-only"})
+    assert (workspace / "data" / name).read_text() == "sandbox-only"
+    assert not (other / "data" / name).exists()
+    assert not (Path.cwd() / "data" / name).exists()
+
+
+def test_atomize_effect_inference_read_only() -> None:
+    from panguverse.axe.atomize import infer_effects
+
+    assert infer_effects("print('hi')\n") == ("read",)
+    assert infer_effects("open('x.html', 'w').write('x')\n") == ("write",)

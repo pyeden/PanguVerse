@@ -13,6 +13,7 @@ declared output paths.
 
 from __future__ import annotations
 
+import hashlib
 import itertools
 import json
 import re
@@ -123,6 +124,25 @@ def infer_inputs(source: str) -> tuple[dict[str, str], list[str]]:
     if re.search(r"\bsys\.argv\b", source):
         inputs["args?"] = "array"
     return inputs, globs + [f"literal:{item}" for item in reads if item not in globs]
+
+
+WRITE_PATTERNS = (
+    r"open\(\s*['\"][^'\"]+['\"]\s*,\s*['\"][wax]",
+    r"write_text\(",
+    r"write_bytes\(",
+    r"json\.dump\([^;\n]*?open\(",
+    r"shutil\.(?:copy|copy2|copyfile|move)\(",
+    r"os\.(?:mkdir|makedirs|remove|unlink|rename|replace)\(",
+    r"Path\([^)]*\)\.mkdir\(",
+)
+
+
+def infer_effects(source: str) -> tuple[str, ...]:
+    """Infer read/write effects from literal write operations in the source."""
+    for pattern in WRITE_PATTERNS:
+        if re.search(pattern, source):
+            return ("write",)
+    return ("read",)
 
 
 def infer_failure_class(source: str) -> str:
@@ -355,6 +375,47 @@ def _node_for(
     }
 
 
+def _pending_script(event: Mapping[str, Any], reason: str) -> dict[str, Any]:
+    rel = str(event.get("path") or "")
+    return {
+        "name": re.sub(r"[^A-Za-z0-9_]+", "_", Path(rel or "script").stem),
+        "path": rel,
+        "code_sha256": str(event.get("code_sha256") or ""),
+        "code_artifact": str(event.get("code_artifact") or ""),
+        "exit_code": event.get("exit_code"),
+        "status": "pending",
+        "kind": "script",
+        "reason": reason,
+        "trace_seq": event.get("seq"),
+    }
+
+
+def _load_snapshot_source(
+    event: Mapping[str, Any], session_dir: Path
+) -> tuple[str | None, str]:
+    """Read the code version recorded by the trace, never the live script file."""
+    code_artifact = str(event.get("code_artifact") or "").strip()
+    expected = str(event.get("code_sha256") or "").strip()
+    if not code_artifact:
+        return None, "trace 缺少 code_artifact（旧轨迹或未快照），拒绝固化"
+    rel = _script_path(code_artifact)
+    if rel is None or not rel.parts or rel.parts[0] != "artifacts":
+        return None, f"code_artifact 路径非法：{code_artifact}"
+    target = session_dir / rel
+    if not target.is_file():
+        return None, f"code_artifact 不存在：{code_artifact}"
+    raw = target.read_bytes()
+    actual = hashlib.sha256(raw).hexdigest()
+    if not expected:
+        return None, "trace 缺少 code_sha256，拒绝固化"
+    if actual != expected:
+        return None, f"code_artifact sha 不一致：期望 {expected[:12]}…，实际 {actual[:12]}…，拒绝固化"
+    try:
+        return raw.decode("utf-8"), ""
+    except UnicodeDecodeError:
+        return None, "code_artifact 不是 UTF-8 源码，拒绝固化"
+
+
 def materialize_script_atoms(
     *,
     workspace: Path,
@@ -363,36 +424,70 @@ def materialize_script_atoms(
     eid: str,
     intent: str = "",
 ) -> dict[str, Any]:
-    """Create/refresh one atom per successful unique script path."""
+    """Create/refresh one atom per script path using its last *successful* trace.
+
+    The live ``scripts/<name>.py`` file may have been overwritten by a later
+    failed attempt.  Crystallization therefore reads only the per-execution
+    ``code_artifact`` and verifies its sha against the selected trace event.
+    """
     workspace = Path(workspace)
     session_dir = Path(session_dir)
-    latest: dict[str, dict[str, Any]] = {}
+
+    by_path: dict[str, list[dict[str, Any]]] = {}
     for event in scripts:
-        if not event.get("ok") or int(event.get("exit_code") or 0) != 0:
-            continue
         rel = _script_path(str(event.get("path") or ""))
         if rel is None:
             continue
-        latest[str(rel)] = event
-    if not latest:
-        return {"atoms_created": [], "nodes": [], "pack": "", "pack_path": ""}
+        by_path.setdefault(str(rel), []).append(event)
+
+    selected: dict[str, dict[str, Any]] = {}
+    pending: list[dict[str, Any]] = []
+    for rel, events in by_path.items():
+        events = sorted(events, key=lambda item: int(item.get("seq") or 0))
+        good = [
+            item
+            for item in events
+            if item.get("ok") and int(item.get("exit_code") or 0) == 0
+        ]
+        chosen = good[-1] if good else None
+        if chosen is not None:
+            selected[rel] = chosen
+        for event in events:
+            if event is chosen:
+                continue
+            if event.get("ok") and int(event.get("exit_code") or 0) == 0:
+                pending.append(
+                    _pending_script(
+                        event,
+                        f"同路径存在更新的成功版本 trace seq={chosen.get('seq')}，本版本未固化",
+                    )
+                )
+            else:
+                pending.append(
+                    _pending_script(
+                        event,
+                        f"脚本执行失败（exit_code={event.get('exit_code')}），不固化",
+                    )
+                )
 
     pack_name = "explore_" + re.sub(r"[^a-z0-9]+", "_", eid.lower()).strip("_")
     pack_dir = workspace / PACKS_REL / pack_name
     atoms_dir = pack_dir / "atoms"
     data_dir = pack_dir / "data"
-    atoms_dir.mkdir(parents=True, exist_ok=True)
-    data_dir.mkdir(parents=True, exist_ok=True)
 
     manifest_atoms: list[dict[str, Any]] = []
     created: list[dict[str, Any]] = []
     nodes: list[dict[str, Any]] = []
     used_names: set[str] = set()
-    for rel, event in sorted(latest.items(), key=lambda item: int(item[1].get("seq") or 0)):
-        source_path = session_dir / rel
-        if not source_path.is_file():
+    if selected:
+        atoms_dir.mkdir(parents=True, exist_ok=True)
+        data_dir.mkdir(parents=True, exist_ok=True)
+
+    for rel, event in sorted(selected.items(), key=lambda item: int(item[1].get("seq") or 0)):
+        source, reason = _load_snapshot_source(event, session_dir)
+        if source is None:
+            pending.append(_pending_script(event, reason))
             continue
-        source = source_path.read_text(encoding="utf-8", errors="replace")
         seq = int(event.get("seq") or 0)
         atom_name = snake(Path(rel).stem)
         while atom_name in used_names:
@@ -420,9 +515,9 @@ def materialize_script_atoms(
             output_paths=output_paths,
             globs=[*globs, *[f"literal:{item}" for item in literal_reads]],
         )
-        # literal reads are declared inputs, not glob patterns for the generated module
         module_globs = globs
         failure_class = infer_failure_class(source)
+        effects = infer_effects(source)
         code = _render_module(
             atom_name=atom_name,
             pack_name=pack_name,
@@ -439,8 +534,9 @@ def materialize_script_atoms(
         atom_path.write_text(code, encoding="utf-8")
 
         description = (
-            f"探索 {eid} 固化脚本 {rel}：读取 {snapshot or ['(无快照输入)']}，"
-            f"产出 {list(outputs)}" + (f"；任务：{intent}" if intent else "")
+            f"探索 {eid} 固化脚本 {rel}（trace seq={seq}）："
+            f"读取 {snapshot or ['(无快照输入)']}，产出 {list(outputs)}"
+            + (f"；任务：{intent}" if intent else "")
         )
         atom_manifest = {
             "name": atom_name,
@@ -448,7 +544,7 @@ def materialize_script_atoms(
             "inputs": inputs,
             "outputs": output_types,
             "output_paths": output_paths_map,
-            "effects": ["write"],
+            "effects": list(effects),
             "idempotent": True,
             "failure_class": failure_class,
             "entry": f"atoms/{atom_name}.py",
@@ -458,6 +554,7 @@ def materialize_script_atoms(
             "explore_id": eid,
             "trace_seq": seq,
             "source_script": rel,
+            "code_artifact": str(event.get("code_artifact") or ""),
             "code_sha256": str(event.get("code_sha256") or ""),
         }
         manifest_atoms.append(atom_manifest)
@@ -471,13 +568,14 @@ def materialize_script_atoms(
                 "inputs": dict(inputs),
                 "outputs": dict(output_types),
                 "output_paths": dict(output_paths_map),
-                "effects": ["write"],
+                "effects": list(effects),
                 "idempotent": True,
                 "failure_class": failure_class,
                 "origin": "explore",
                 "explore_id": eid,
                 "trace_seq": seq,
                 "source_script": rel,
+                "code_artifact": str(event.get("code_artifact") or ""),
                 "code_sha256": str(event.get("code_sha256") or ""),
                 "inputs_snapshot": snapshot,
             }
@@ -496,7 +594,14 @@ def materialize_script_atoms(
         )
 
     if not manifest_atoms:
-        return {"atoms_created": [], "nodes": [], "pack": "", "pack_path": ""}
+        return {
+            "atoms_created": [],
+            "nodes": [],
+            "pending": pending,
+            "pack": "",
+            "pack_path": "",
+            "selected_seqs": sorted(int(item.get("seq") or 0) for item in selected.values()),
+        }
     manifest = {
         "name": pack_name,
         "domain": "explore",
@@ -512,8 +617,10 @@ def materialize_script_atoms(
     return {
         "atoms_created": created,
         "nodes": nodes,
+        "pending": pending,
         "pack": pack_name,
         "pack_path": str(pack_dir),
+        "selected_seqs": sorted(int(item.get("seq") or 0) for item in selected.values()),
     }
 
 

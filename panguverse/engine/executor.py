@@ -183,11 +183,15 @@ class Executor:
         if parent is not None:
             ctx = parent.child(**(variables or {}))
         else:
+            # FS_ROOT is an explicit per-run sandbox for filesystem atoms;
+            # make it the context workspace so the hard boundary matches the
+            # declared sandbox (explore sets both to its session directory).
+            workspace = (env or {}).get("FS_ROOT") or self.workspace
             ctx = RunContext(
                 env=env or {},
                 variables=variables or {},
                 run_id=run_id,
-                workspace=self.workspace,
+                workspace=workspace,
             )
             ctx.env = {**ctx.env, **(env or {})}
         ctx.vars["case_id"] = case.case_id

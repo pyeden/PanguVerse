@@ -540,14 +540,30 @@ def crystallize(
     atoms_created = list(materialized.get("atoms_created") or [])
     if materialized.get("nodes"):
         graph = atomize.merge_script_nodes(graph, materialized["nodes"])
-        materialized_paths = {
-            str(item.get("source_script") or "") for item in atoms_created
-        }
-        graph["pending_atoms"] = [
-            item
-            for item in (graph.get("pending_atoms") or [])
-            if not (item.get("kind") == "script" and str(item.get("path") or "") in materialized_paths)
-        ]
+    # Failed / superseded / snapshot-invalid script versions stay pending with
+    # an exact reason; only the selected successful trace becomes an atom.
+    graph["pending_atoms"] = [
+        item
+        for item in (graph.get("pending_atoms") or [])
+        if item.get("kind") != "script"
+    ] + list(materialized.get("pending") or [])
+
+    produced_paths: set[str] = set()
+    for item in atoms_created:
+        produced_paths.update(str(v) for v in (item.get("output_paths") or {}).values())
+    for node in graph["nodes"]:
+        params = node.get("params") or {}
+        if str(node.get("atom") or "").startswith("fs_write"):
+            path = params.get("path")
+            if isinstance(path, str) and "${" not in path:
+                produced_paths.add(path)
+    graph["checks"] = agent_exec.bind_checks_to_evidence(
+        graph.get("checks") or [],
+        nodes=graph["nodes"],
+        session_dir=session_dir,
+        events=events,
+        produced_paths=produced_paths,
+    )
     # Runtime atom lookup must see the workspace pack without mutating the
     # process-global registry (one workspace cannot pollute another).
     registry = workspace_packs.workspace_registry(root, registry)
@@ -592,6 +608,7 @@ def crystallize(
         "route": graph.get("route") or "",
         "replay": replay,
         "validation": created.get("validation") or {},
+        "checks": graph["checks"],
         "graph": {"nodes": graph["nodes"], "edges": graph["edges"]},
         "state": recorded.get("state") or created.get("state") or "draft",
         "replay_status": recorded.get("replay_status") or "",

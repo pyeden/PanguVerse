@@ -1059,6 +1059,7 @@ def create_draft_from_graph(
         "param_audit": workflow["param_audit"],
         "env_schema": env_schema,
         "explore_id": explore_id,
+        "replay_checks": copy.deepcopy(replay_checks or []),
         "nodes": copy.deepcopy(nodes),
         "edges": copy.deepcopy(edges),
     }

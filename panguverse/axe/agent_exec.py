@@ -381,16 +381,30 @@ def _default_text_observation(observations: list[dict[str, Any]]) -> dict[str, A
 
 
 def _latest_artifact_text(base_dir: Path) -> str | None:
-    base = base_dir / "artifacts"
+    base = Path(base_dir)
     if not base.is_dir():
         return None
-    candidates = [
-        path
-        for path in base.rglob("*")
-        if path.is_file() and path.suffix.lower() in {".txt", ".md", ".html", ".htm", ".json"}
-    ]
-    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
-    for path in candidates:
+    rank = {".html": 0, ".htm": 0, ".md": 1, ".txt": 2, ".json": 3}
+    candidates: list[tuple[int, int, float, Path]] = []
+    for path in base.rglob("*"):
+        if not path.is_file() or path.suffix.lower() not in rank:
+            continue
+        try:
+            rel = path.relative_to(base)
+        except ValueError:
+            continue
+        if rel.parts and rel.parts[0] in {"scripts", ".panguverse", "replay"}:
+            continue
+        if path.name in {"session.json", "success.json"} or path.name.startswith("."):
+            continue
+        # Prefer rendered products in the sandbox root over artifact-wrapper
+        # JSON; otherwise an unbound text check inspects metadata, not the report.
+        in_artifacts = 1 if rel.parts and rel.parts[0] == "artifacts" else 0
+        candidates.append(
+            (rank[path.suffix.lower()], in_artifacts, -path.stat().st_mtime, path)
+        )
+    candidates.sort(key=lambda item: item[:3])
+    for _rank, _artifact, _mtime, path in candidates:
         try:
             return path.read_text(encoding="utf-8", errors="replace")[:300_000]
         except OSError:
@@ -469,10 +483,8 @@ def _text_for(
     base_dir: Path,
     extra_texts: list[str] | None = None,
 ) -> str | None:
-    if _has_step_binding(spec):
-        if observation is None:
-            return None
-        return _text_of_result(observation.get("result") or {})
+    # An artifact binding is a deterministic file path that replay also
+    # produces, so it always wins over an in-memory observation.
     artifact = spec.get("artifact")
     if artifact:
         try:
@@ -482,14 +494,22 @@ def _text_for(
         if target.is_file():
             return target.read_text(encoding="utf-8", errors="replace")
         return None
+    if _has_step_binding(spec):
+        if observation is None:
+            return None
+        return _text_of_result(observation.get("result") or {})
     if observation is not None:
         text = _text_of_result(observation.get("result") or {})
         if text:
             return text
+    # Produced files are stronger, replayable evidence than transient stdout.
+    artifact_text = _latest_artifact_text(base_dir)
+    if artifact_text:
+        return artifact_text
     for text in reversed(extra_texts or []):
         if text and text.strip():
             return text
-    return _latest_artifact_text(base_dir)
+    return None
 
 
 def check_observations(
@@ -1001,7 +1021,9 @@ class ExploreAgent:
                 outcome = _run_python(target, cwd=self.sandbox, timeout=min(timeout, MAX_SCRIPT_TIMEOUT))
                 return bool(outcome["ok"]), outcome, "" if outcome["ok"] else _clip(outcome["stderr"], 1_000)
             atom = self.registry.get(tool)
-            ctx = RunContext(workspace=str(self.sandbox))
+            ctx = RunContext(
+                workspace=str(self.sandbox), env={"FS_ROOT": str(self.sandbox)}
+            )
             result = atom.invoke(ctx, params)
             return True, dict(result), ""
         except Exception as exc:  # noqa: BLE001 - 工具失败要进入观测，由 LLM 决定是否补救
@@ -1028,6 +1050,14 @@ class ExploreAgent:
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(code, encoding="utf-8")
         code_sha = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        # Snapshot the exact code version before executing it.  The same script
+        # path is overwritten by later LLM turns, so the trace must carry a
+        # content-addressed copy for crystallization.
+        code_name = f"{step_no:03d}_script_{_safe_tool_fragment(Path(path_text).stem)}_code.py"
+        code_path = self.sandbox / "artifacts" / code_name
+        code_path.parent.mkdir(parents=True, exist_ok=True)
+        code_path.write_text(code, encoding="utf-8")
+        code_artifact = str(code_path.relative_to(self.sandbox.resolve()))
         outcome = _run_python(target, cwd=self.sandbox, timeout=DEFAULT_SCRIPT_TIMEOUT)
         rel = str(target.relative_to(self.sandbox.resolve()))
         artifacts = self._write_artifacts(
@@ -1036,9 +1066,11 @@ class ExploreAgent:
             {},
             {"stdout": outcome.get("stdout", ""), "stderr": outcome.get("stderr", "")},
         )
+        artifacts.insert(0, code_artifact)
         event = {
             "path": rel,
             "code_sha256": code_sha,
+            "code_artifact": code_artifact,
             "exit_code": outcome["exit_code"],
             "ok": bool(outcome["ok"]),
             "stdout": outcome["stdout"],
@@ -1048,7 +1080,13 @@ class ExploreAgent:
             "step": step_no,
         }
         self.scripts.append(
-            {"path": rel, "code_sha256": code_sha, "exit_code": outcome["exit_code"], "ok": bool(outcome["ok"])}
+            {
+                "path": rel,
+                "code_sha256": code_sha,
+                "code_artifact": code_artifact,
+                "exit_code": outcome["exit_code"],
+                "ok": bool(outcome["ok"]),
+            }
         )
         self.script_outputs.append(
             (outcome.get("stdout") or "") + "\n" + (outcome.get("stderr") or "")
@@ -1403,6 +1441,137 @@ def resolve_templates(value: Any, ctx: RunContext) -> Any:
     return value
 
 
+_TEXT_CHECK_KINDS = ("text_contains", "regex")
+_TEXT_EXT_PRIORITY = {".html": 0, ".htm": 0, ".md": 1, ".txt": 2, ".json": 3, ".csv": 4}
+
+
+def _read_text_file(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def _matches_check(spec: Mapping[str, Any], text: str) -> bool:
+    if spec.get("type") == "text_contains":
+        return str(spec.get("value") or "") in text
+    try:
+        return re.search(str(spec.get("pattern") or ""), text) is not None
+    except re.error:
+        return False
+
+
+def _node_by_trace(nodes: list[dict[str, Any]]) -> dict[int, str]:
+    out: dict[int, str] = {}
+    for node in nodes:
+        seq = (node.get("extra") or {}).get("trace_seq")
+        if seq not in (None, ""):
+            try:
+                out[int(seq)] = str(node.get("id") or "")
+            except (TypeError, ValueError):
+                continue
+    return out
+
+
+def _status_step_from_events(events: list[dict[str, Any]], nodes: list[dict[str, Any]]) -> str:
+    by_trace = _node_by_trace(nodes)
+    current_seq: int | None = None
+    latest: str = ""
+    for event in events:
+        if event.get("type") == "tool_call":
+            try:
+                current_seq = int(event.get("seq") or 0)
+            except (TypeError, ValueError):
+                current_seq = None
+        elif event.get("type") == "tool_result" and current_seq is not None:
+            digest = event.get("digest") or {}
+            if digest.get("status") is not None or digest.get("status_code") is not None:
+                node_id = by_trace.get(current_seq)
+                if node_id:
+                    latest = node_id
+            current_seq = None
+    return latest
+
+
+def bind_checks_to_evidence(
+    checks: list[dict[str, Any]],
+    *,
+    nodes: list[dict[str, Any]],
+    session_dir: Path,
+    events: list[dict[str, Any]] | None = None,
+    produced_paths: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Attach every check to evidence that replay will actually reproduce.
+
+    - text/regex: prefer a produced artifact file whose content matched during
+      exploration (e.g. ``report.html``), then a mapped step/observation.
+    - status: bind to the node whose result carried status.
+    - file_exists: inherently path-bound.
+    Unbindable text/status checks are marked ``unbound`` so replay cannot pass.
+    """
+    session_dir = Path(session_dir)
+    events = list(events or [])
+    produced = {
+        str(item).replace("\\", "/").lstrip("./")
+        for item in (produced_paths or set())
+        if item and ".." not in Path(str(item)).parts
+    }
+    candidates = sorted(
+        produced,
+        key=lambda rel: (_TEXT_EXT_PRIORITY.get(Path(rel).suffix.lower(), 9), rel),
+    )
+    node_ids = {str(node.get("id") or "") for node in nodes}
+    latest_status_node = _status_step_from_events(events, nodes)
+    bound: list[dict[str, Any]] = []
+    for raw in checks:
+        item = dict(raw)
+        kind = str(item.get("type") or "")
+        if kind == "file_exists":
+            item["binding"] = "path"
+            bound.append(item)
+            continue
+        if kind in _TEXT_CHECK_KINDS:
+            artifact = str(item.get("artifact") or "").replace("\\", "/").lstrip("./")
+            if artifact and artifact in produced and (session_dir / artifact).is_file():
+                text = _read_text_file(session_dir / artifact)
+                if text is not None and _matches_check(item, text):
+                    item["artifact"] = artifact
+                    item["binding"] = "artifact"
+                    bound.append(item)
+                    continue
+            found = ""
+            for rel in candidates:
+                text = _read_text_file(session_dir / rel)
+                if text is not None and _matches_check(item, text):
+                    found = rel
+                    break
+            if found:
+                item["artifact"] = found
+                item["binding"] = "artifact"
+            elif str(item.get("step_id") or "") in node_ids:
+                item["binding"] = "step"
+            else:
+                item["binding"] = "unbound"
+                item["unbound"] = True
+            bound.append(item)
+            continue
+        if kind == "status_code":
+            step_id = str(item.get("step_id") or "")
+            if step_id not in node_ids and latest_status_node:
+                step_id = latest_status_node
+                item["step_id"] = step_id
+            if step_id in node_ids:
+                item["binding"] = "step"
+            else:
+                item["binding"] = "unbound"
+                item["unbound"] = True
+            bound.append(item)
+            continue
+        item["binding"] = "path"
+        bound.append(item)
+    return bound
+
+
 def replay_graph(
     *,
     nodes: list[dict[str, Any]],
@@ -1417,7 +1586,7 @@ def replay_graph(
     if sandbox.exists():
         shutil.rmtree(sandbox)
     sandbox.mkdir(parents=True, exist_ok=True)
-    ctx = RunContext(workspace=str(sandbox))
+    ctx = RunContext(workspace=str(sandbox), env={"FS_ROOT": str(sandbox)})
     observations: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     started = time.monotonic()
@@ -1462,11 +1631,30 @@ def replay_graph(
                 "result": dict(result),
             }
         )
+    unbound = [
+        str(item.get("id") or item.get("type"))
+        for item in checks
+        if item.get("unbound") or item.get("binding") == "unbound"
+    ]
+    if unbound:
+        errors.append(
+            {
+                "step_id": "",
+                "atom": "",
+                "error": "未绑定证据的检查，不能判定 replay_passed: " + ", ".join(unbound),
+            }
+        )
     results = check_observations(checks, observations=observations, base_dir=sandbox)
-    passed = not errors and all(item["ok"] for item in results) and bool(checks)
+    passed = (
+        not errors
+        and not unbound
+        and all(item["ok"] for item in results)
+        and bool(checks)
+    )
     return {
         "status": "passed" if passed else "failed",
         "checks": results,
+        "unbound": unbound,
         "errors": errors,
         "duration_ms": int((time.monotonic() - started) * 1000),
         "nodes": [node.get("id") for node in nodes],

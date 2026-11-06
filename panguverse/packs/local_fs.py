@@ -31,6 +31,13 @@ DEFAULT_ROOT_ENV = ("FS_ROOT", "PANGUVERSE_FS_ROOT")
 # 沙箱：能力授权的最小落地
 # --------------------------------------------------------------------------- #
 def sandbox_root(ctx: RunContext) -> Path:
+    # The execution context's workspace is the hard boundary (explore sandbox,
+    # debug session, workflow run).  FS_ROOT is a fallback for callers that
+    # only pass env, then cwd as the last resort.
+    workspace = getattr(ctx, "workspace", None)
+    if workspace:
+        root = getattr(workspace, "root", None) or workspace
+        return Path(str(root)).expanduser().resolve()
     for key in DEFAULT_ROOT_ENV:
         value = ctx.env.get(key)
         if value:
