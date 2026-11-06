@@ -24,12 +24,14 @@ import '@xyflow/react/dist/style.css'
 import { api, debugReasonDetail, debugReasonLabel, isStudioMock, onStudioMockChange, readStudioProvenance, studioApi } from '../shared/api'
 import { navigate, href, useRoute } from '../shared/router'
 import { errorText, formatDuration, pretty, statusLabel } from '../shared/utils'
+import { contractText, effectsText, isNewAtomNode, readNewAtomCache } from '../shared/atomContracts'
 import type {
   AnyRecord,
   Atom,
   DebugNodeState,
   DebugSession,
   DebugSummary,
+  ExploreAtomCreated,
   Risk,
   StudioEdge,
   StudioNode,
@@ -60,6 +62,7 @@ interface AtomNodeData extends Record<string, unknown> {
   studioNode: StudioNode
   issues: ValidationIssue[]
   risks: Risk[]
+  newAtomContract?: ExploreAtomCreated | null
   debugStatus?: string
   debugReason?: string
   debugCurrent?: boolean
@@ -128,6 +131,8 @@ function atomEffects(node: StudioNode): string[] {
 
 const AtomNode = memo(function AtomNode({ data, selected }: NodeProps<AtomFlowNode>) {
   const node = data.studioNode
+  const isNewAtom = isNewAtomNode(node)
+  const contract = data.newAtomContract || null
   const debugStatus = data.debugStatus || ''
   const debugReason = data.debugReason || ''
   const reasonLabel = debugReasonLabel(debugReason)
@@ -157,6 +162,13 @@ const AtomNode = memo(function AtomNode({ data, selected }: NodeProps<AtomFlowNo
         ) : null}
       </div>
       <strong className="flow-name">{node.name || node.atom}</strong>
+      {isNewAtom ? (
+        <div className="flow-new-atom" data-testid="canvas-new-atom" data-atom={node.atom}>
+          <span className="flow-new-atom-badge"><Icon name="spark" size={9} />新原子</span>
+          <b className="flow-new-atom-name mono">{node.atom}</b>
+          <span className="flow-new-atom-summary">{contract ? `${effectsText(contract.effects)} · ${Object.keys(contract.inputs || {}).length} 入 / ${Object.keys(contract.outputs || {}).length} 出` : '契约待读取'}</span>
+        </div>
+      ) : null}
       <div className="flow-params">
         {Object.entries(node.with || {}).slice(0, 2).map(([key, value]) => (
           <span key={key}><b>{key}</b><em>{typeof value === 'object' ? '{…}' : String(value).replace(/\$\{env\.([^}]+)\}/g, '${$1}').slice(0, 22)}</em></span>
@@ -309,6 +321,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [paramAtom, setParamAtom] = useState('')
   const [paramJson, setParamJson] = useState<Record<string, string>>({})
   const [paramError, setParamError] = useState('')
+  const [newAtomCache, setNewAtomCache] = useState<Record<string, ExploreAtomCreated>>(() => readNewAtomCache(wid))
 
   const workflowQuery = useQuery({ queryKey: ['studio-workflow', wid], queryFn: () => studioApi.getWorkflow(wid), enabled: !!wid })
   const atomsQuery = useQuery({ queryKey: ['atoms'], queryFn: api.atoms, staleTime: 60_000 })
@@ -316,6 +329,35 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const atoms = atomsQuery.data || []
   const selectedNode = workflow?.graph?.nodes.find((node) => node.node_id === selectedId) || null
   const selectedAtom = atoms.find((atom) => atom.name === (selectedNode?.atom || paramAtom)) || null
+  const newAtomContracts = useMemo(() => {
+    const map: Record<string, ExploreAtomCreated> = { ...newAtomCache }
+    ;(workflow?.graph?.nodes || []).forEach((node) => {
+      if (!isNewAtomNode(node)) return
+      const spec = atoms.find((atom) => atom.name === node.atom)
+      const cached = map[node.atom] || {}
+      const extra = (node.extra && typeof node.extra === 'object' ? node.extra : {}) as AnyRecord
+      map[node.atom] = {
+        ...(spec ? {
+          description: spec.description,
+          inputs: spec.inputs,
+          outputs: spec.outputs,
+          effects: spec.effects,
+          pack: spec.pack,
+        } : {}),
+        ...cached,
+        name: node.atom,
+        pack: cached.pack || String(extra.atom_pack || '') || spec?.pack,
+        source_script: cached.source_script || String(extra.source_script || ''),
+      }
+    })
+    return map
+  }, [atoms, newAtomCache, workflow])
+  const selectedNewAtom = isNewAtomNode(selectedNode)
+  const selectedContract = selectedNewAtom ? newAtomContracts[selectedNode?.atom || ''] || null : null
+
+  useEffect(() => {
+    setNewAtomCache(readNewAtomCache(wid))
+  }, [wid])
 
   useEffect(() => onStudioMockChange(setMock), [])
 
@@ -378,6 +420,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
           studioNode: node,
           issues: nodeIssues,
           risks: nodeRisks,
+          newAtomContract: newAtomContracts[node.atom] || null,
           debugStatus: debugState?.status || '',
           debugReason: debugState?.reason || '',
           debugCurrent: debugState?.status === 'running',
@@ -385,7 +428,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         selected: node.node_id === selectedId,
       }
     })
-  }, [selectedId, wid])
+  }, [selectedId, wid, newAtomContracts])
 
   const buildFlowEdges = useCallback((source: Workflow): Edge[] => {
     return ((source.graph?.edges || []) as StudioEdge[]).map((edge, index) => ({
@@ -1448,6 +1491,35 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                 <span className="mono">{selectedNode.node_id}</span>
                 {selectedNode.locked ? <Badge tone="warn"><Icon name="lock" size={10} />锁定</Badge> : null}
               </div>
+              {selectedNewAtom ? (
+                <details className="new-atom-contract" data-testid="canvas-new-atom-contract" data-atom={selectedNode.atom} open>
+                  <summary>
+                    <span className="new-atom-contract-title"><Icon name="spark" size={12} />新原子契约</span>
+                    <span className="mono">{selectedNode.atom}</span>
+                  </summary>
+                  <div className="new-atom-contract-body">
+                    <div className="new-atom-contract-head">
+                      <Badge tone="violet">新原子</Badge>
+                      <strong className="mono">{selectedNode.atom}</strong>
+                      {selectedContract?.pack ? <span className="new-atom-contract-pack mono">{selectedContract.pack}</span> : null}
+                    </div>
+                    {selectedContract?.description ? <p className="new-atom-contract-desc">{selectedContract.description}</p> : null}
+                    <dl className="new-atom-contract-grid">
+                      <div><dt>inputs</dt><dd><pre>{contractText(selectedContract?.inputs)}</pre></dd></div>
+                      <div><dt>outputs</dt><dd><pre>{contractText(selectedContract?.outputs)}</pre></dd></div>
+                      <div><dt>output_paths</dt><dd><pre>{contractText(selectedContract?.output_paths)}</pre></dd></div>
+                      <div><dt>effects</dt><dd><pre>{contractText(selectedContract?.effects)}</pre></dd></div>
+                      <div><dt>source_script</dt><dd><code className="mono">{contractText(selectedContract?.source_script)}</code></dd></div>
+                      <div><dt>code_sha256</dt><dd><code className="mono new-atom-sha">{contractText(selectedContract?.code_sha256)}</code></dd></div>
+                    </dl>
+                    {!selectedContract?.output_paths || !selectedContract?.code_sha256 ? (
+                      <p className="new-atom-contract-note">
+                        完整的 output_paths / code_sha256 来自本次固化的结果缓存；若在新浏览器打开，原子接口不返回这两个字段。
+                      </p>
+                    ) : null}
+                  </div>
+                </details>
+              ) : null}
               <Field label="业务名称"><input className="input" value={paramName} onChange={(event) => setParamName(event.target.value)} /></Field>
               <Field label="原子">
                 <Select value={paramAtom} onChange={(event) => setParamAtom(event.target.value)}>

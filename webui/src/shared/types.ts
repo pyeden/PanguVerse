@@ -639,12 +639,47 @@ export interface ExploreReplay {
   [key: string]: any
 }
 
+/** 探索固化出的脚本原子契约（后端 atoms_created 的真实对象形状）。 */
+export interface ExploreAtomCreated {
+  name: string
+  pack?: string
+  path?: string
+  entry?: string
+  description?: string
+  inputs?: AnyRecord
+  outputs?: AnyRecord
+  output_paths?: AnyRecord
+  effects?: string[]
+  idempotent?: boolean
+  failure_class?: string
+  origin?: string
+  explore_id?: string
+  trace_seq?: number
+  source_script?: string
+  code_sha256?: string
+  inputs_snapshot?: string[]
+  [key: string]: any
+}
+
+/** 未封装成原子的脚本 / 越域步骤。 */
+export interface ExplorePendingAtom {
+  name?: string
+  path?: string
+  reason?: string
+  status?: string
+  kind?: string
+  code_sha256?: string
+  exit_code?: number | null
+  trace_seq?: number
+  [key: string]: any
+}
+
 export interface ExploreCrystallizeResult {
   wid: string
   rev?: number
   explore_id?: string
-  atoms_created?: string[]
-  pending_atoms?: string[]
+  atoms_created?: ExploreAtomCreated[]
+  pending_atoms?: ExplorePendingAtom[]
   replay?: ExploreReplay
   validation?: Validation | AnyRecord
   graph?: { nodes?: AnyRecord[]; edges?: AnyRecord[] }

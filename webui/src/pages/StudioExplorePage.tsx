@@ -9,6 +9,13 @@ import {
 } from '../shared/exploreMock'
 import { href, navigate } from '../shared/router'
 import { relativeTime } from '../shared/utils'
+import {
+  atomContracts,
+  contractText,
+  effectsText,
+  pendingAtoms,
+  writeNewAtomCache,
+} from '../shared/atomContracts'
 import type {
   AnyRecord,
   ExploreArtifact,
@@ -221,6 +228,8 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
   const nextKeyRef = useRef(1)
   const autoNavRef = useRef(0)
   const eid = routeEid || ''
+  const newAtoms = useMemo(() => atomContracts(crystallizeResult?.atoms_created), [crystallizeResult])
+  const pending = useMemo(() => pendingAtoms(crystallizeResult?.pending_atoms), [crystallizeResult])
 
   const newCriterion = (type: ExploreCheckType = 'text_contains'): CriterionDraft => {
     const key = nextKeyRef.current
@@ -502,6 +511,7 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
         ? mockCrystallize(eid)
         : await exploreApi.crystallize(eid, { include_scripts: true })
       setCrystallizeResult(result)
+      writeNewAtomCache(result.wid, result.rev, atomContracts(result.atoms_created))
       setHistoryTick((value) => value + 1)
       push(`已固化草稿 ${result.wid}`, 'ok')
       window.clearTimeout(autoNavRef.current)
@@ -1096,13 +1106,59 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
                 <div><span>wid</span><strong className="mono">{crystallizeResult.wid}</strong></div>
                 <div><span>rev</span><strong>{crystallizeResult.rev ?? 0}</strong></div>
                 <div><span>重放状态</span><strong className={crystallizeResult.replay?.status === 'passed' ? 'tone-ok' : 'tone-bad'}>{crystallizeResult.replay?.status || '未执行'}</strong></div>
-                <div><span>新原子</span><strong>{crystallizeResult.atoms_created?.length ? crystallizeResult.atoms_created.join('、') : '无'}</strong></div>
-                <div><span>待封装脚本</span><strong>{crystallizeResult.pending_atoms?.length ? `${crystallizeResult.pending_atoms.length} 个` : '无'}</strong></div>
+                <div><span>新原子</span><strong data-testid="explore-new-atom-count">{newAtoms.length ? `${newAtoms.length} 个` : '无新原子'}</strong></div>
+                <div><span>待封装脚本</span><strong data-testid="explore-pending-atom-count">{pending.length ? `${pending.length} 个` : '无'}</strong></div>
               </div>
-              {crystallizeResult.pending_atoms?.length ? (
-                <div className="explore-pending-atoms">
-                  <span>待封装脚本</span>
-                  {crystallizeResult.pending_atoms.map((name) => <Badge key={name} tone="warn">{name}</Badge>)}
+              <div className="explore-new-atoms" data-testid="explore-new-atoms">
+                <div className="explore-crystal-subhead">
+                  <span>新原子契约</span>
+                  <span>{newAtoms.length ? `${newAtoms.length} 个` : '无新原子'}</span>
+                </div>
+                {newAtoms.length ? newAtoms.map((atom) => (
+                  <details className="explore-new-atom" data-testid="explore-new-atom" data-atom={atom.name} key={atom.name}>
+                    <summary>
+                      <strong className="mono explore-new-atom-name">{atom.name}</strong>
+                      {atom.pack ? <Badge tone="violet">{atom.pack}</Badge> : null}
+                      <span className="explore-new-atom-hint">{effectsText(atom.effects)}</span>
+                    </summary>
+                    <div className="explore-new-atom-body">
+                      <div><span>inputs</span><pre>{contractText(atom.inputs)}</pre></div>
+                      <div><span>outputs</span><pre>{contractText(atom.outputs)}</pre></div>
+                      <div><span>output_paths</span><pre>{contractText(atom.output_paths)}</pre></div>
+                      <div><span>effects</span><pre>{contractText(atom.effects)}</pre></div>
+                      <div><span>source_script</span><pre className="mono">{contractText(atom.source_script)}</pre></div>
+                      <div><span>code_sha256</span><pre className="mono">{contractText(atom.code_sha256)}</pre></div>
+                    </div>
+                  </details>
+                )) : (
+                  <p className="explore-contract-empty" data-testid="explore-new-atoms-empty">
+                    无新原子：本次固化没有把脚本封装成可复用原子。
+                  </p>
+                )}
+              </div>
+              {pending.length ? (
+                <div className="explore-pending-atoms" data-testid="explore-pending-atoms">
+                  <div className="explore-crystal-subhead">
+                    <span>待封装脚本</span>
+                    <span>{pending.length} 个</span>
+                  </div>
+                  {pending.map((item, index) => (
+                    <div
+                      className="explore-pending-atom"
+                      data-testid="explore-pending-atom"
+                      data-status={item.status || 'pending'}
+                      key={`${item.name || item.path || 'pending'}-${index}`}
+                    >
+                      <div className="explore-pending-atom-head">
+                        <strong className="mono">{item.name || `待封装脚本 ${index + 1}`}</strong>
+                        <Badge tone="warn">{item.status || 'pending'}</Badge>
+                      </div>
+                      <dl className="explore-pending-atom-meta">
+                        <div><dt>path</dt><dd className="mono">{contractText(item.path)}</dd></div>
+                        <div><dt>reason</dt><dd>{contractText(item.reason)}</dd></div>
+                      </dl>
+                    </div>
+                  ))}
                 </div>
               ) : null}
               {crystallizeResult.replay?.errors?.length ? (
