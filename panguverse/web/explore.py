@@ -26,7 +26,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from ..axe import agent_exec, atomize
+from ..axe import agent_exec
 from ..core import workspace_packs
 from . import studio
 from .studio import StudioError
@@ -524,46 +524,13 @@ def crystallize(
             name=str(data.get("name") or ""),
             domain_pack=str(meta.get("domain_pack") or ""),
             registry=registry,
+            session_dir=session_dir,
+            workspace=root,
         )
     except agent_exec.AgentExecError as exc:
         raise StudioError(exc.code, exc.message, status=exc.status, details=exc.details) from exc
 
-    # P1: successful scripts become real workspace atoms; their nodes are
-    # inserted in trace order so replay executes the new atom, not the file.
-    materialized = atomize.materialize_script_atoms(
-        workspace=root,
-        session_dir=session_dir,
-        scripts=graph.get("scripts") or [],
-        eid=eid,
-        intent=str(meta.get("intent") or ""),
-    )
-    atoms_created = list(materialized.get("atoms_created") or [])
-    if materialized.get("nodes"):
-        graph = atomize.merge_script_nodes(graph, materialized["nodes"])
-    # Failed / superseded / snapshot-invalid script versions stay pending with
-    # an exact reason; only the selected successful trace becomes an atom.
-    graph["pending_atoms"] = [
-        item
-        for item in (graph.get("pending_atoms") or [])
-        if item.get("kind") != "script"
-    ] + list(materialized.get("pending") or [])
-
-    produced_paths: set[str] = set()
-    for item in atoms_created:
-        produced_paths.update(str(v) for v in (item.get("output_paths") or {}).values())
-    for node in graph["nodes"]:
-        params = node.get("params") or {}
-        if str(node.get("atom") or "").startswith("fs_write"):
-            path = params.get("path")
-            if isinstance(path, str) and "${" not in path:
-                produced_paths.add(path)
-    graph["checks"] = agent_exec.bind_checks_to_evidence(
-        graph.get("checks") or [],
-        nodes=graph["nodes"],
-        session_dir=session_dir,
-        events=events,
-        produced_paths=produced_paths,
-    )
+    atoms_created = list(graph.get("atoms_created") or [])
     # Runtime atom lookup must see the workspace pack without mutating the
     # process-global registry (one workspace cannot pollute another).
     registry = workspace_packs.workspace_registry(root, registry)
@@ -606,6 +573,8 @@ def crystallize(
         "pending_atoms": graph["pending_atoms"],
         "out_of_scope": graph.get("out_of_scope") or [],
         "route": graph.get("route") or "",
+        "synthesis": graph.get("synthesis") or {},
+        "dropped_checks": graph.get("dropped_checks") or [],
         "replay": replay,
         "validation": created.get("validation") or {},
         "checks": graph["checks"],

@@ -17,6 +17,7 @@ import hashlib
 import itertools
 import json
 import re
+from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -32,6 +33,12 @@ WRITE_PATH_RE = re.compile(
 )
 JSON_DUMP_OPEN_RE = re.compile(
     r"json\.dump\([^;\n]*?open\(\s*['\"]([^'\"]+\.json)['\"]\s*,\s*['\"]w"
+)
+# ``out = Path('reports')`` + ``(out / 'report.html').write_text(...)``
+PATH_VAR_RE = re.compile(r"([A-Za-z_]\w*)\s*=\s*Path\(\s*['\"]([^'\"]+)['\"]\s*\)")
+JOIN_WRITE_RE = re.compile(
+    r"(?:([A-Za-z_]\w*)|Path\(\s*['\"]([^'\"]+)['\"]\s*\))"
+    r"\s*/\s*['\"]([^'\"]+\.(?:html?|md|json|csv|txt))['\"]"
 )
 READ_OPEN_RE = re.compile(
     r"open\(\s*['\"]([^'\"]+\.(?:json|txt|html?|csv))['\"]\s*,\s*['\"][^'\"]*r"
@@ -89,6 +96,20 @@ def infer_outputs(source: str, *, session_dir: Path) -> dict[str, str]:
     for pattern in (WRITE_OPEN_RE, JSON_DUMP_OPEN_RE):
         candidates.extend(pattern.findall(source))
     candidates.extend(WRITE_PATH_RE.findall(source))
+    # Path join form: ``base = Path('reports'); base / 'report.html'``.
+    path_vars = dict(PATH_VAR_RE.findall(source))
+    for var, literal_base, name in JOIN_WRITE_RE.findall(source):
+        base = path_vars.get(var) if var else literal_base
+        if base:
+            candidates.append(f"{base.rstrip('/')}/{name}")
+    for name, base in path_vars.items():
+        # ``(out / 'x.html')`` already captured above; this keeps direct
+        # ``base.write_text`` calls that reference a literal file name.
+        for match in re.finditer(
+            re.escape(name) + r"\s*/\s*['\"]([^'\"]+\.(?:html?|md|json|csv|txt))['\"]",
+            source,
+        ):
+            candidates.append(f"{base.rstrip('/')}/{match.group(1)}")
     rels: list[str] = []
     for rel in _unique([item.replace("\\", "/") for item in candidates]):
         rel = rel.lstrip("./")
@@ -120,7 +141,7 @@ def infer_inputs(source: str) -> tuple[dict[str, str], list[str]]:
     """Return (input contract, inferred glob patterns)."""
     globs = _unique([str(item).replace("\\", "/") for item in GLOB_RE.findall(source)])
     reads = _unique([str(item).replace("\\", "/") for item in READ_OPEN_RE.findall(source)])
-    inputs = {"input_dir": "string", "input_files?": "array"}
+    inputs = {"input_dir?": "string", "input_files?": "array"}
     if re.search(r"\bsys\.argv\b", source):
         inputs["args?"] = "array"
     return inputs, globs + [f"literal:{item}" for item in reads if item not in globs]
@@ -261,7 +282,14 @@ DECLARE_OUTPUT_FILES = {"output_files" in outputs}
 
 def _workspace(ctx):
     raw = getattr(ctx, "workspace", None) if ctx is not None else None
-    return Path(raw).expanduser().resolve() if raw else Path.cwd().resolve()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    env = getattr(ctx, "env", None) or {{}}
+    for key in ("FS_ROOT", "PANGUVERSE_FS_ROOT"):
+        value = env.get(key) if hasattr(env, "get") else None
+        if value:
+            return Path(str(value)).expanduser().resolve()
+    return Path.cwd().resolve()
 
 
 def _copy_inputs(workspace: Path, input_dir: str, input_files):
@@ -342,7 +370,9 @@ def _node_for(
     data_dir: Path,
     input_files: list[str],
 ) -> dict[str, Any]:
-    params: dict[str, Any] = {"input_dir": str(data_dir)}
+    # Inputs are snapshotted into the pack's data/ directory; the generated
+    # atom defaults to it, so the graph never carries an absolute explore path.
+    params: dict[str, Any] = {}
     if input_files:
         params["input_files"] = list(input_files)
     task = f"；任务：{intent}" if intent else ""
@@ -390,6 +420,13 @@ def _pending_script(event: Mapping[str, Any], reason: str) -> dict[str, Any]:
     }
 
 
+def load_script_source(
+    event: Mapping[str, Any], session_dir: Path
+) -> tuple[str | None, str]:
+    """Public wrapper: read the trace's content-addressed script snapshot."""
+    return _load_snapshot_source(event, Path(session_dir))
+
+
 def _load_snapshot_source(
     event: Mapping[str, Any], session_dir: Path
 ) -> tuple[str | None, str]:
@@ -423,6 +460,8 @@ def materialize_script_atoms(
     scripts: list[dict[str, Any]],
     eid: str,
     intent: str = "",
+    only_seqs: set[int] | None = None,
+    include_nodes: bool = True,
 ) -> dict[str, Any]:
     """Create/refresh one atom per script path using its last *successful* trace.
 
@@ -440,35 +479,51 @@ def materialize_script_atoms(
             continue
         by_path.setdefault(str(rel), []).append(event)
 
-    selected: dict[str, dict[str, Any]] = {}
     pending: list[dict[str, Any]] = []
-    for rel, events in by_path.items():
-        events = sorted(events, key=lambda item: int(item.get("seq") or 0))
-        good = [
-            item
-            for item in events
-            if item.get("ok") and int(item.get("exit_code") or 0) == 0
-        ]
-        chosen = good[-1] if good else None
-        if chosen is not None:
-            selected[rel] = chosen
-        for event in events:
-            if event is chosen:
-                continue
-            if event.get("ok") and int(event.get("exit_code") or 0) == 0:
-                pending.append(
-                    _pending_script(
-                        event,
-                        f"同路径存在更新的成功版本 trace seq={chosen.get('seq')}，本版本未固化",
+    if only_seqs is not None:
+        wanted = {int(item) for item in only_seqs}
+        chosen_events: list[tuple[str, dict[str, Any]]] = []
+        for rel, events in by_path.items():
+            for event in events:
+                if int(event.get("seq") or 0) not in wanted:
+                    continue
+                if event.get("ok") and int(event.get("exit_code") or 0) == 0:
+                    chosen_events.append((rel, event))
+                else:
+                    pending.append(
+                        _pending_script(event, "选中的脚本版本执行失败，拒绝固化")
                     )
-                )
-            else:
-                pending.append(
-                    _pending_script(
-                        event,
-                        f"脚本执行失败（exit_code={event.get('exit_code')}），不固化",
+        chosen_events.sort(key=lambda item: int(item[1].get("seq") or 0))
+    else:
+        chosen_events = []
+        for rel, events in by_path.items():
+            events = sorted(events, key=lambda item: int(item.get("seq") or 0))
+            good = [
+                item
+                for item in events
+                if item.get("ok") and int(item.get("exit_code") or 0) == 0
+            ]
+            chosen = good[-1] if good else None
+            if chosen is not None:
+                chosen_events.append((rel, chosen))
+            for event in events:
+                if event is chosen:
+                    continue
+                if event.get("ok") and int(event.get("exit_code") or 0) == 0:
+                    pending.append(
+                        _pending_script(
+                            event,
+                            f"同路径存在更新的成功版本 trace seq={chosen.get('seq')}，本版本未固化",
+                        )
                     )
-                )
+                else:
+                    pending.append(
+                        _pending_script(
+                            event,
+                            f"脚本执行失败（exit_code={event.get('exit_code')}），不固化",
+                        )
+                    )
+        chosen_events.sort(key=lambda item: int(item[1].get("seq") or 0))
 
     pack_name = "explore_" + re.sub(r"[^a-z0-9]+", "_", eid.lower()).strip("_")
     pack_dir = workspace / PACKS_REL / pack_name
@@ -479,19 +534,27 @@ def materialize_script_atoms(
     created: list[dict[str, Any]] = []
     nodes: list[dict[str, Any]] = []
     used_names: set[str] = set()
-    if selected:
+    if chosen_events:
         atoms_dir.mkdir(parents=True, exist_ok=True)
         data_dir.mkdir(parents=True, exist_ok=True)
 
-    for rel, event in sorted(selected.items(), key=lambda item: int(item[1].get("seq") or 0)):
+    path_totals = Counter(Path(rel).stem for rel, _event in chosen_events)
+    for rel, event in chosen_events:
         source, reason = _load_snapshot_source(event, session_dir)
         if source is None:
             pending.append(_pending_script(event, reason))
             continue
         seq = int(event.get("seq") or 0)
-        atom_name = snake(Path(rel).stem)
-        while atom_name in used_names:
-            atom_name = f"{atom_name}_2"
+        base_name = snake(Path(rel).stem)
+        atom_name = base_name
+        if path_totals[Path(rel).stem] > 1 or atom_name in used_names:
+            atom_name = f"{base_name}_s{int(event.get('seq') or 0)}"
+        suffix = 2
+        candidate = atom_name
+        while candidate in used_names:
+            candidate = f"{atom_name}_{suffix}"
+            suffix += 1
+        atom_name = candidate
         used_names.add(atom_name)
 
         output_paths_map = infer_outputs(source, session_dir=session_dir)
@@ -580,18 +643,19 @@ def materialize_script_atoms(
                 "inputs_snapshot": snapshot,
             }
         )
-        nodes.append(
-            _node_for(
-                atom_name=atom_name,
-                pack_name=pack_name,
-                eid=eid,
-                intent=intent,
-                seq=seq,
-                script_rel=rel,
-                data_dir=data_dir,
-                input_files=snapshot,
+        if include_nodes:
+            nodes.append(
+                _node_for(
+                    atom_name=atom_name,
+                    pack_name=pack_name,
+                    eid=eid,
+                    intent=intent,
+                    seq=seq,
+                    script_rel=rel,
+                    data_dir=data_dir,
+                    input_files=snapshot,
+                )
             )
-        )
 
     if not manifest_atoms:
         return {
@@ -600,7 +664,7 @@ def materialize_script_atoms(
             "pending": pending,
             "pack": "",
             "pack_path": "",
-            "selected_seqs": sorted(int(item.get("seq") or 0) for item in selected.values()),
+            "selected_seqs": [],
         }
     manifest = {
         "name": pack_name,
@@ -620,7 +684,7 @@ def materialize_script_atoms(
         "pending": pending,
         "pack": pack_name,
         "pack_path": str(pack_dir),
-        "selected_seqs": sorted(int(item.get("seq") or 0) for item in selected.values()),
+        "selected_seqs": sorted(int(event.get("seq") or 0) for _rel, event in chosen_events),
     }
 
 
@@ -650,6 +714,7 @@ __all__ = [
     "infer_failure_class",
     "infer_inputs",
     "infer_outputs",
+    "load_script_source",
     "materialize_script_atoms",
     "merge_script_nodes",
     "snake",

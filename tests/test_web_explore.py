@@ -260,6 +260,7 @@ def test_explore_baidu_hot_search_crystallize_and_replay(tmp_path: Path, hot_ser
     nodes = draft["graph"]["nodes"]
     assert [node["atom"] for node in nodes] == ["web_open", "web_get_text"]
     assert nodes[0]["params"]["url"] == hot_server
+    assert any(edge["kind"] == "data" for edge in draft["graph"]["edges"])
     assert nodes[1]["params"]["html"] == "${s1_web_open_html}"
     assert nodes[0]["capture"]["s1_web_open_html"]["path"] == "html"
 
@@ -482,8 +483,9 @@ def test_crystallize_filters_out_of_scope_atoms() -> None:
         ],
         registry=default_registry(),
     )
-    assert [node["atom"] for node in graph["nodes"]] == ["http_request"]
+    assert [node["atom"] for node in graph["nodes"]] == ["http_request", "assert_status"]
     assert graph["nodes"][0]["params"]["url"] == "https://top.baidu.com/board?tab=realtime"
+    assert any(edge["kind"] == "data" for edge in graph["edges"])
     assert [item["name"] for item in graph["out_of_scope"]] == ["android_devices"]
     assert any(
         item.get("status") == "out_of_scope" and item.get("name") == "android_devices"
@@ -510,8 +512,11 @@ def test_crystallize_keeps_script_steps_as_pending_atoms() -> None:
         intent="排名",
         checks=[{"id": "c1", "type": "status_code", "equals": 200, "step": 1}],
     )
-    assert [node["atom"] for node in graph["nodes"]] == ["web_open"]
-    assert graph["pending_atoms"] == [
+    assert [node["atom"] for node in graph["nodes"]] == ["web_open", "assert_status"]
+    pending = [
+        item for item in graph["pending_atoms"] if item.get("kind") == "script"
+    ]
+    assert pending == [
         {
             "name": "rank",
             "path": "scripts/rank.py",
@@ -519,7 +524,7 @@ def test_crystallize_keeps_script_steps_as_pending_atoms() -> None:
             "exit_code": 0,
             "status": "pending",
             "kind": "script",
-            "reason": "P0 只固化已有原子，脚本步骤待 P1 封装",
+            "reason": "固化时未提供 session_dir，无法读取脚本快照",
             "trace_seq": 3,
         }
     ]
@@ -717,10 +722,22 @@ def test_script_step_is_crystallized_into_workspace_atom_and_replayed(
     assert atom_path.is_file()
     assert root / ".panguverse" / "packs" in atom_path.parents
     nodes = draft["graph"]["nodes"]
-    assert [node["atom"] for node in nodes] == ["build_report"]
+    assert [node["atom"] for node in nodes] == [
+        "build_report",
+        "assert_file_exists",
+        "assert_file_exists",
+    ]
     assert nodes[0]["origin"] == "explore"
     assert nodes[0]["new_atom"] is True
-    assert Path(nodes[0]["params"]["input_dir"]).parent.name == atom["pack"]
+    assert "input_dir" not in nodes[0]["params"]
+    assert all(
+        not (isinstance(value, str) and value.startswith("/"))
+        for value in nodes[0]["params"].values()
+    )
+    assert sorted(item["params"]["path"] for item in nodes[1:]) == [
+        "report.html",
+        "report_items.json",
+    ]
     assert draft["pending_atoms"] == []
     assert draft["replay"]["status"] == "passed", draft["replay"]
     packs = load_workspace_packs(root)
@@ -1219,3 +1236,217 @@ def test_llm_timeout_without_products_fails_with_single_error_layer(tmp_path: Pa
     assert "LLMError" not in reason
     assert "没有可校验的产物文件" in reason
     assert session["error"] == {}
+
+
+# --------------------------------------------------------------------------- #
+# P0 合成层：最小图 / 数据边 / 参数归一 / 引用报错
+# --------------------------------------------------------------------------- #
+def test_synthesis_prunes_probes_and_dedupes_urls() -> None:
+    from panguverse.axe.agent_exec import build_crystallized_graph
+    from panguverse.core.registry import default_registry
+
+    events = [
+        {"seq": 1, "type": "tool_call", "tool": "web_open", "params": {"url": "https://example.com/hot", "timeout": 30000}},
+        {"seq": 2, "type": "tool_result", "tool": "web_open", "ok": True, "digest": {"status": 200, "keys": ["status", "html"]}},
+        {"seq": 3, "type": "tool_call", "tool": "web_open", "params": {"url": "https://example.com/hot", "timeout": 30}},
+        {"seq": 4, "type": "tool_result", "tool": "web_open", "ok": True, "digest": {"status": 200, "keys": ["status", "html"]}},
+        {"seq": 5, "type": "tool_call", "tool": "fs_list", "params": {"path": ".", "recursive": True}},
+        {"seq": 6, "type": "tool_result", "tool": "fs_list", "ok": True, "digest": {"keys": ["files"]}},
+        {
+            "seq": 7,
+            "type": "tool_call",
+            "tool": "http_request",
+            "params": {"url": "https://example.com/api", "method": "GET", "expect_status": "2xx"},
+        },
+        {"seq": 8, "type": "tool_result", "tool": "http_request", "ok": True, "digest": {"status_code": 200, "keys": ["body", "status_code"]}},
+    ]
+    graph = build_crystallized_graph(
+        events,
+        eid="e-12345678",
+        intent="打开百度网站，提取今天的热点新闻",
+        checks=[
+            {"id": "status", "type": "status_code", "equals": 200, "step": 1},
+            {"id": "hot", "type": "text_contains", "value": "热搜", "step": 4},
+        ],
+        registry=default_registry(),
+    )
+    atoms = [node["atom"] for node in graph["nodes"]]
+    assert atoms.count("web_open") == 1
+    assert "fs_list" not in atoms
+    web = next(node for node in graph["nodes"] if node["atom"] == "web_open")
+    assert web["params"]["timeout"] == 30
+    http = next(node for node in graph["nodes"] if node["atom"] == "http_request")
+    assert http["params"]["expect_status"] == 200
+    assert any(edge["kind"] == "data" for edge in graph["edges"])
+    assert any(node["atom"] == "assert_status" for node in graph["nodes"])
+
+
+def test_synthesis_reports_unresolved_reference() -> None:
+    from panguverse.axe.agent_exec import AgentExecError, build_crystallized_graph
+    from panguverse.core.registry import default_registry
+
+    events = [
+        {"seq": 1, "type": "tool_call", "tool": "web_open", "params": {"url": "https://example.com"}},
+        {"seq": 2, "type": "tool_result", "tool": "web_open", "ok": True, "digest": {"status": 200, "keys": ["html"]}},
+        {
+            "seq": 3,
+            "type": "tool_call",
+            "tool": "web_get_text",
+            "params": {"html": "${step9.html}"},
+            "params_template": {"html": "${step9.html}"},
+        },
+        {"seq": 4, "type": "tool_result", "tool": "web_get_text", "ok": True, "digest": {"keys": ["text"]}},
+    ]
+    with pytest.raises(AgentExecError) as excinfo:
+        build_crystallized_graph(
+            events,
+            eid="e-12345678",
+            intent="提取正文",
+            checks=[{"id": "text", "type": "text_contains", "value": "热搜", "step": 2}],
+            registry=default_registry(),
+        )
+    assert excinfo.value.code == "unresolved_reference"
+    assert excinfo.value.details["unresolved"]
+
+
+def test_replay_failed_blocks_debug_without_force(tmp_path: Path, hot_server: str) -> None:
+    counting = [0]
+    api = new_api(
+        tmp_path,
+        llm=FakeLLM(baidu_decisions(hot_server)),
+        registry=make_registry(counting=counting),
+    )
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开百度热搜并提取标题", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    status, draft, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
+    assert status == 200, draft
+    assert draft["replay_status"] == "replay_failed"
+    node_id = draft["graph"]["nodes"][0]["id"]
+
+    status, body, _ = call(
+        api,
+        "POST",
+        f"/api/studio/{draft['wid']}/debug",
+        {"rev": 0, "node_id": node_id, "mode": "from_start"},
+    )
+    assert status == 409, body
+    assert body["error"]["code"] == "replay_failed"
+
+    status, body, _ = call(
+        api,
+        "POST",
+        f"/api/studio/{draft['wid']}/debug",
+        {"rev": 0, "node_id": node_id, "mode": "from_start", "force": True},
+    )
+    assert status == 202, body
+
+
+def test_workspace_pack_survives_registry_restart_and_debug_from_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """new_atom 必须从磁盘 pack 重新加载后仍可执行（模拟进程重启）。"""
+    from panguverse.core.registry import default_registry
+    from panguverse.web import service as web_service
+
+    script = (
+        "from pathlib import Path\n"
+        "Path('reports').mkdir(parents=True, exist_ok=True)\n"
+        "Path('reports/report.html').write_text('<h1>今日热点</h1>', encoding='utf-8')\n"
+        "print('written')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [{"id": "html", "type": "file_exists", "path": "reports/report.html"}],
+            "thought": "落盘",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=FakeLLM(decisions), explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 4}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    status, draft, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
+    assert status == 200, draft
+    assert draft["replay_status"] == "replay_passed"
+    node_id = draft["graph"]["nodes"][0]["id"]
+
+    # Simulate a fresh server: global registry cache is cleared, pack is only
+    # available from <workspace>/.panguverse/packs on disk.
+    monkeypatch.setattr(web_service, "_REGISTRY", None, raising=False)
+    import sys
+    for name in [key for key in sys.modules if key.startswith("panguverse_ws_")]:
+        sys.modules.pop(name, None)
+    import shutil
+
+    shutil.rmtree(root / ".panguverse" / "fs-demo", ignore_errors=True)
+
+    status, started, _ = call(
+        api,
+        "POST",
+        f"/api/studio/{draft['wid']}/debug",
+        {"rev": 0, "node_id": node_id, "mode": "from_start"},
+    )
+    assert status == 202, started
+    cursor = 0
+    done = None
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        status, done, _ = call(
+            api, "GET", f"/api/studio/debug/{started['session_id']}?cursor={cursor}"
+        )
+        assert status == 200, done
+        cursor = max(cursor, int(done.get("cursor") or 0))
+        if done.get("done"):
+            break
+        time.sleep(0.02)
+    assert done and done["done"] is True, done
+    assert done["summary"]["failed"] == 0, done
+    assert (root / ".panguverse" / "fs-demo" / "reports" / "report.html").is_file()
+
+
+def test_replay_passes_after_deleting_explore_scripts(tmp_path: Path) -> None:
+    from panguverse.core.registry import default_registry
+    from panguverse.core.workspace_packs import workspace_registry
+
+    script = (
+        "from pathlib import Path\n"
+        "Path('reports').mkdir(parents=True, exist_ok=True)\n"
+        "Path('reports/report.html').write_text('<h1>report</h1>', encoding='utf-8')\n"
+    )
+    decisions = [
+        {"action": "script", "path": "scripts/report.py", "code": script, "thought": "生成报告"},
+        {
+            "action": "final",
+            "checks": [{"id": "html", "type": "file_exists", "path": "reports/report.html"}],
+            "thought": "落盘",
+        },
+    ]
+    root = tmp_path / "ws"
+    root.mkdir()
+    api = WebAPI(root, explore_llm=FakeLLM(decisions), explore_registry=default_registry())
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "生成热点报告", "max_steps": 4}
+    )
+    session = wait_explore(api, body["eid"])
+    status, draft, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
+    assert status == 200 and draft["replay_status"] == "replay_passed", draft
+
+    import shutil
+
+    shutil.rmtree(root / ".panguverse" / "explore" / session["eid"] / "scripts")
+    revision = studio.read_revision(root, draft["wid"], draft["rev"])
+    replay = agent_exec.replay_graph(
+        nodes=revision["nodes"],
+        registry=workspace_registry(root, default_registry()),
+        sandbox=tmp_path / "clean-replay",
+        checks=revision["replay_checks"],
+    )
+    assert replay["status"] == "passed", replay

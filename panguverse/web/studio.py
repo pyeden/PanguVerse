@@ -2794,6 +2794,17 @@ def debug_workflow(root: Path, wid: str, payload: Any, *, actor: str = "local") 
         raise StudioError("bad_request", "mode 只能是 only/from_start/downstream")
     node_id = _clean_text(data.get("node_id"), field="node_id", required=True, limit=200)
     workflow = read_workflow(root, wid)
+    if (
+        workflow.get("origin") == "explore"
+        and workflow.get("replay_status") == "replay_failed"
+        and not bool(data.get("force"))
+    ):
+        raise StudioError(
+            "replay_failed",
+            "固化流程的无 LLM 重放未通过，调试被阻断；如确需人工排查请显式传 force=true",
+            status=409,
+            details={"replay": workflow.get("replay") or {}},
+        )
     rev = (
         int(workflow.get("current_rev") or 0)
         if data.get("rev") is None

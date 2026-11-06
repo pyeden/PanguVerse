@@ -14,7 +14,6 @@ the sandbox executable in isolation and easy to unit test.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import re
 import subprocess
@@ -1551,180 +1550,127 @@ def build_crystallized_graph(
     name: str = "",
     domain_pack: str = "",
     registry: Any = None,
+    session_dir: Path | str | None = None,
+    workspace: Path | str | None = None,
 ) -> dict[str, Any]:
-    """Turn a successful trace into graph nodes/edges plus pending/out-of-scope steps."""
-    calls: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    scripts: list[dict[str, Any]] = []
-    for event in events:
-        kind = event.get("type")
-        if kind == "tool_call":
-            current = {
-                "seq": int(event.get("seq") or 0),
-                "tool": str(event.get("tool") or ""),
-                "params": dict(event.get("params_template") or event.get("params") or {}),
-                "actual_params": dict(event.get("params") or {}),
-                "ok": False,
-                "digest": {},
-            }
-        elif kind == "tool_result" and current is not None:
-            if current["tool"] == event.get("tool"):
-                current["ok"] = bool(event.get("ok"))
-                current["digest"] = dict(event.get("digest") or {})
-                calls.append(current)
-                current = None
-        elif kind == "script":
-            scripts.append(event)
+    """Synthesize a minimal replayable workflow from a successful trace.
 
-    successful = [item for item in calls if item["ok"] and item["tool"]]
-    successful_scripts = [
-        item
-        for item in scripts
-        if item.get("ok") and int(item.get("exit_code") or 0) == 0
-    ]
-    if not successful and not successful_scripts:
-        raise AgentExecError("bad_request", "探索轨迹没有成功的原子调用或脚本可固化")
+    Kept: nodes on the input→artifact/check path.  Dropped: failed steps,
+    repeated tool+params (last success wins), probes with no referenced output,
+    and scripts whose outputs nobody checks.  ``${stepN.path}`` references
+    become capture variables with real ``data`` edges.
+    """
+    from . import atomize, synthesize
+
+    base_dir = Path(session_dir) if session_dir else None
+    steps = synthesize.collect_steps(events, session_dir=base_dir)
 
     analysis = route_analysis(intent, domain_pack) if registry is not None else None
     allowed = allowed_atom_names(registry, analysis) if registry is not None else None
     route = str(getattr(analysis, "domain", "") or "") if analysis is not None else ""
-    kept: list[tuple[int, dict[str, Any]]] = []
-    out_of_scope: list[dict[str, Any]] = []
-    for order, call in enumerate(successful, 1):
-        if allowed is None or call["tool"] in allowed:
-            kept.append((order, call))
-            continue
-        out_of_scope.append(
-            {
-                "name": call["tool"],
-                "path": "",
-                "status": "out_of_scope",
-                "kind": "out_of_scope",
-                "reason": (
-                    f"原子 {call['tool']} 不属于路由域 {route or '未知'}"
-                    "（仅保留路由域 + core + local_fs），已排除出画布"
-                ),
-                "trace_seq": call["seq"],
-                "params": call["actual_params"],
-            }
+
+    try:
+        selection = synthesize.select_workflow(
+            steps,
+            checks,
+            session_dir=base_dir,
+            allowed=allowed,
         )
-    if not kept and not successful_scripts:
+    except synthesize.SynthesisError as exc:
+        raise AgentExecError(
+            exc.code,
+            exc.message,
+            status=400 if exc.code in {"unresolved_reference", "empty_workflow"} else None,
+            details=exc.details,
+        ) from exc
+    if not selection.steps:
         raise AgentExecError(
             "bad_request",
-            f"轨迹中的原子均不属于路由域 {route or '未知'}，没有可固化节点",
+            "探索轨迹剪枝后没有可固化的节点（没有产物/检查路径）",
+            details={"pruned": selection.pruned[:20]},
         )
 
-    call_order = {call["seq"]: index for index, call in enumerate(successful, 1)}
-    order_to_node = {
-        order: f"s{new_index}_{re.sub(r'[^A-Za-z0-9_]+', '_', call['tool'])}"
-        for new_index, (order, call) in enumerate(kept, 1)
-    }
-    seq_to_node = {call["seq"]: order_to_node[order] for order, call in kept}
-    calls_by_node = {order_to_node[order]: call for order, call in kept}
-    nodes: list[dict[str, Any]] = []
-    for new_index, (order, call) in enumerate(kept, 1):
-        node_id = order_to_node[order]
-        nodes.append(
-            {
-                "id": node_id,
-                "atom": call["tool"],
-                "name": call["tool"],
-                "description": f"来自探索 {eid} 第 {new_index} 步（trace seq={call['seq']}）",
-                "params": {},
-                "capture": {},
-                "when": None,
-                "foreach": None,
-                "as": "item",
-                "retry": None,
-                "continue_on_failure": False,
-                "tags": ["explore"],
-                "optional": False,
-                "extra": {"explore_id": eid, "trace_seq": call["seq"]},
-                "case_id": "explore",
-                "case_name": name or intent or "explore",
-                "origin": "explore",
-                "locked": False,
-            }
-        )
-
-    # Second pass: params may reference outputs of earlier nodes, so captures
-    # must be attached to their producer node before templates are built.
-    captures_by_node: dict[str, dict[str, Any]] = {node["id"]: node["capture"] for node in nodes}
-    for node in nodes:
-        call = calls_by_node[node["id"]]
-        params = {}
-        for key, value in call["params"].items():
-            params[key] = _crystallize_param(
-                value,
-                nodes_by_seq=seq_to_node,
-                order_to_node=order_to_node,
-                capture_by_node=captures_by_node,
-                captures=node["capture"],
-                current_node=node["id"],
+    atoms_created: list[dict[str, Any]] = []
+    materialized: dict[int, dict[str, Any]] = {}
+    pending: list[dict[str, Any]] = [
+        *[item for item in selection.failed if item.get("kind") == "script"],
+        *selection.out_of_scope,
+        *[item for item in selection.pruned if item.get("kind") == "script"],
+    ]
+    if workspace and base_dir and selection.script_seqs:
+        try:
+            materialized_result = atomize.materialize_script_atoms(
+                workspace=Path(workspace),
+                session_dir=base_dir,
+                scripts=[event for event in events if event.get("type") == "script"],
+                eid=eid,
+                intent=intent,
+                only_seqs=set(selection.script_seqs),
+                include_nodes=False,
             )
-        node["params"] = params
-
-    edges: list[dict[str, Any]] = []
-    for left, right in itertools.pairwise(nodes):
-        edges.append(
-            {
-                "id": f"e-{left['id']}->{right['id']}:order",
-                "from": left["id"],
-                "to": right["id"],
-                "via": None,
-                "kind": "order",
-                "order_only": True,
-            }
-        )
-
-    replay_checks: list[dict[str, Any]] = []
-    for spec in checks:
-        item = dict(spec)
-        step = item.get("step")
-        if step not in (None, ""):
+        except Exception as exc:
+            raise AgentExecError(
+                "atomize_failed",
+                f"脚本原子固化失败: {type(exc).__name__}: {exc}",
+            ) from exc
+        for item in materialized_result.get("atoms_created") or []:
             try:
-                node_id = order_to_node.get(int(step))
+                seq = int(item.get("trace_seq") or 0)
             except (TypeError, ValueError):
-                node_id = None
-            if node_id:
-                item["step_id"] = node_id
-        artifact = str(item.get("artifact") or "")
-        match = _ARTIFACT_SEQ_RE.match(artifact)
-        if match:
-            original_order = call_order.get(int(match.group(1)))
-            node_id = order_to_node.get(original_order) if original_order else None
-            if node_id:
-                item["step_id"] = node_id
-        replay_checks.append(item)
+                continue
+            materialized[seq] = dict(item)
+            atoms_created.append(dict(item))
+        pending.extend(materialized_result.get("pending") or [])
+        usable_seqs = {step.seq for step in selection.steps if step.kind != "script"}
+        usable_seqs.update(materialized)
+        missing = {step.seq for step in selection.steps if step.kind == "script"} - set(materialized)
+        if missing:
+            for seq in sorted(missing):
+                step = next((item for item in selection.steps if item.seq == seq), None)
+                if step is not None:
+                    pending.append(
+                        synthesize._pending(step, "脚本原子未能固化，节点已移除")
+                    )
+            selection.steps = [
+                step for step in selection.steps if step.seq not in missing
+            ]
+            selection.checks = [
+                spec
+                for spec in selection.checks
+                if int(spec.get("_producer_seq") or 0) not in missing
+                and int(spec.get("_fallback_seq") or 0) not in missing
+            ]
 
-    pending_atoms: list[dict[str, Any]] = []
-    for item in scripts:
-        pending_atoms.append(
-            {
-                "name": re.sub(
-                    r"[^A-Za-z0-9_]+", "_", Path(str(item.get("path") or "script")).stem
-                ),
-                "path": str(item.get("path") or ""),
-                "code_sha256": str(item.get("code_sha256") or ""),
-                "exit_code": item.get("exit_code"),
-                "status": "pending",
-                "kind": "script",
-                "reason": "P0 只固化已有原子，脚本步骤待 P1 封装",
-                "trace_seq": item.get("seq"),
-            }
+    try:
+        graph = synthesize.build_graph(
+            selection=selection,
+            materialized=materialized,
+            checks=selection.checks,
+            eid=eid,
+            intent=intent,
+            name=name,
+            registry=registry,
+            session_dir=base_dir,
         )
-    pending_atoms.extend(out_of_scope)
-    return {
-        "nodes": nodes,
-        "edges": edges,
-        "checks": replay_checks,
-        "pending_atoms": pending_atoms,
-        "out_of_scope": out_of_scope,
-        "scripts": scripts,
-        "intent": intent,
-        "name": name or intent,
-        "route": route,
-    }
+    except synthesize.SynthesisError as exc:
+        raise AgentExecError(exc.code, exc.message, details=exc.details) from exc
+
+    # Stable de-dupe: one pending row per (kind, path, trace_seq).
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in pending:
+        key = (item.get("kind"), item.get("path"), item.get("trace_seq"))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(item)
+
+    graph["pending_atoms"] = deduped
+    graph["atoms_created"] = atoms_created
+    graph["out_of_scope"] = list(selection.out_of_scope)
+    graph["route"] = route
+    graph["scripts"] = [event for event in events if event.get("type") == "script"]
+    return graph
 
 
 def _crystallize_param(
