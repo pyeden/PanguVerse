@@ -202,7 +202,67 @@ def checks_from_success(success: Mapping[str, Any] | None) -> list[dict[str, Any
     return specs
 
 
+def _has_step_binding(spec: Mapping[str, Any]) -> bool:
+    return spec.get("step") not in (None, "") or spec.get("step_id") not in (None, "")
+
+
+def _json_objects(text: str) -> list[dict[str, Any]]:
+    """从可能夹带解释/多个 JSON 的 LLM 文本里提取所有顶层对象。"""
+    found: list[dict[str, Any]] = []
+    length = len(text)
+    index = 0
+    while index < length:
+        start = text.find("{", index)
+        if start < 0:
+            break
+        depth = 0
+        in_string = False
+        escaped = False
+        end = -1
+        for pos in range(start, length):
+            char = text[pos]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    end = pos
+                    break
+        if end < 0:
+            break
+        try:
+            data = json.loads(text[start : end + 1])
+        except ValueError:
+            data = None
+        if isinstance(data, dict):
+            found.append(data)
+        index = end + 1
+    return found
+
+
+def _extract_decision(text: str) -> dict[str, Any]:
+    """优先取最后一个带 action 的 JSON 对象；兼容多段输出/前后解释。"""
+    objects = _json_objects(text)
+    for data in reversed(objects):
+        if str(data.get("action") or "").strip() in {"tool", "script", "final"}:
+            return data
+    if objects:
+        return objects[0]
+    raise ValueError(f"没有可解析的 JSON 对象: {text[:200]}")
+
+
 def _observation_for(spec: Mapping[str, Any], observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """按显式 step/step_id 取观察；没有绑定则返回 None（交给默认证据选择）。"""
     step_id = spec.get("step_id")
     if step_id not in (None, ""):
         for item in observations:
@@ -218,7 +278,43 @@ def _observation_for(spec: Mapping[str, Any], observations: list[dict[str, Any]]
         if 1 <= index <= len(observations):
             return observations[index - 1]
         return None
-    return observations[-1] if observations else None
+    return None
+
+
+def _default_status_observation(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """默认绑定：最近一次真的带 status/status_code 的观察。"""
+    for item in reversed(observations):
+        result = item.get("result") or {}
+        if result.get("status") is not None or result.get("status_code") is not None:
+            return item
+    return None
+
+
+def _default_text_observation(observations: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """默认绑定：最近一次带正文类输出的观察。"""
+    for item in reversed(observations):
+        text = _text_of_result(item.get("result") or {})
+        if isinstance(text, str) and text.strip():
+            return item
+    return None
+
+
+def _latest_artifact_text(base_dir: Path) -> str | None:
+    base = base_dir / "artifacts"
+    if not base.is_dir():
+        return None
+    candidates = [
+        path
+        for path in base.rglob("*")
+        if path.is_file() and path.suffix.lower() in {".txt", ".md", ".html", ".htm", ".json"}
+    ]
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    for path in candidates:
+        try:
+            return path.read_text(encoding="utf-8", errors="replace")[:300_000]
+        except OSError:
+            continue
+    return None
 
 
 def _text_of_result(result: Mapping[str, Any]) -> str | None:
@@ -234,6 +330,7 @@ def _eval_one(
     *,
     observations: list[dict[str, Any]],
     base_dir: Path,
+    extra_texts: list[str] | None = None,
 ) -> tuple[bool, str]:
     kind = spec["type"]
     if kind == "file_exists":
@@ -245,31 +342,36 @@ def _eval_one(
             return False, f"文件不存在: {spec['path']}"
         return True, f"{spec['path']} 存在（{target.stat().st_size} bytes）"
 
-    observation = _observation_for(spec, observations)
     if kind == "status_code":
+        observation = (
+            _observation_for(spec, observations)
+            if _has_step_binding(spec)
+            else _default_status_observation(observations)
+        )
         if observation is None:
-            return False, "找不到对应步骤的状态码"
+            return False, "没有可用的 status 证据（最近观察均无 status/status_code）"
         result = observation.get("result") or {}
         actual = result.get("status", result.get("status_code"))
         expected = int(spec.get("equals", 200))
         return (actual == expected), f"status={actual!r}，期望 {expected}"
 
-    if kind == "text_contains":
-        text = _text_for(spec, observation, base_dir)
-        needle = str(spec["value"])
+    if kind in ("text_contains", "regex"):
+        observation = (
+            _observation_for(spec, observations)
+            if _has_step_binding(spec)
+            else _default_text_observation(observations)
+        )
+        text = _text_for(spec, observation, base_dir, extra_texts or [])
         if text is None:
-            return False, "找不到可校验的文本来源"
-        position = text.find(needle)
-        if position < 0:
-            return False, f"文本未包含 {needle!r}（来源长度 {len(text)}）"
-        start = max(0, position - 60)
-        end = min(len(text), position + len(needle) + 60)
-        return True, text[start:end]
-
-    if kind == "regex":
-        text = _text_for(spec, observation, base_dir)
-        if text is None:
-            return False, "找不到可校验的文本来源"
+            return False, "找不到可校验的文本来源（观察与 artifacts 均无文本）"
+        if kind == "text_contains":
+            needle = str(spec["value"])
+            position = text.find(needle)
+            if position < 0:
+                return False, f"文本未包含 {needle!r}（来源长度 {len(text)}）"
+            start = max(0, position - 60)
+            end = min(len(text), position + len(needle) + 60)
+            return True, text[start:end]
         match = re.search(str(spec["pattern"]), text)
         if match is None:
             return False, f"正则未匹配: {spec['pattern']}"
@@ -284,8 +386,9 @@ def _text_for(
     spec: Mapping[str, Any],
     observation: Mapping[str, Any] | None,
     base_dir: Path,
+    extra_texts: list[str] | None = None,
 ) -> str | None:
-    if observation is not None or spec.get("step") not in (None, "") or spec.get("step_id"):
+    if _has_step_binding(spec):
         if observation is None:
             return None
         return _text_of_result(observation.get("result") or {})
@@ -298,7 +401,14 @@ def _text_for(
         if target.is_file():
             return target.read_text(encoding="utf-8", errors="replace")
         return None
-    return None
+    if observation is not None:
+        text = _text_of_result(observation.get("result") or {})
+        if text:
+            return text
+    for text in reversed(extra_texts or []):
+        if text and text.strip():
+            return text
+    return _latest_artifact_text(base_dir)
 
 
 def check_observations(
@@ -306,11 +416,17 @@ def check_observations(
     *,
     observations: list[dict[str, Any]],
     base_dir: Path,
+    extra_texts: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     results: list[dict[str, Any]] = []
     for spec in checks:
         try:
-            ok, evidence = _eval_one(spec, observations=observations, base_dir=base_dir)
+            ok, evidence = _eval_one(
+                spec,
+                observations=observations,
+                base_dir=base_dir,
+                extra_texts=extra_texts,
+            )
         except Exception as exc:  # noqa: BLE001 - 检查失败不能吞掉，要落成证据
             ok, evidence = False, f"检查执行失败: {type(exc).__name__}: {exc}"
         results.append(
@@ -413,6 +529,10 @@ class ExploreAgent:
         self.tool_names = {entry["name"] for entry in self.catalog}
         self.observations: list[dict[str, Any]] = []
         self.scripts: list[dict[str, Any]] = []
+        self.script_outputs: list[str] = []
+        self.pending_feedback = ""
+        self.last_tool_sig = ""
+        self.repeat_count = 0
         self.started = self.clock()
 
     # ------------------------------------------------------------------ #
@@ -428,26 +548,53 @@ class ExploreAgent:
         feedback = ""
         saw_final = False
         last_checks: list[dict[str, Any]] = []
-        step_no = 0
-        for step_no in range(1, self.max_steps + 1):
+        actions_used = 0
+        llm_turns = 0
+        while actions_used < self.max_steps:
+            llm_turns += 1
+            if llm_turns > self.max_steps + 6:
+                return self._finish(
+                    "budget_exceeded",
+                    checks=last_checks,
+                    summary={
+                        "reason": f"LLM 回合超限（>{self.max_steps + 6}），停止以避免空转",
+                        "steps": actions_used,
+                    },
+                )
             if self.clock() - self.started >= self.total_timeout:
                 return self._finish(
                     "budget_exceeded",
                     checks=last_checks,
-                    summary={"reason": f"总时长超过 {self.total_timeout:.0f}s", "steps": step_no - 1},
+                    summary={
+                        "reason": f"总时长超过 {self.total_timeout:.0f}s",
+                        "steps": actions_used,
+                    },
                 )
-            decision = self._decide(intent, checks_spec, step_no, feedback)
+            decision = self._decide(intent, checks_spec, actions_used + 1, feedback)
             action = str(decision.get("action") or "").strip()
             thought = str(decision.get("thought") or "").strip()
             if thought:
                 self.emit("thought", {"text": _clip(thought, MAX_THOUGHT)})
-            if action == "tool":
-                self._do_tool(decision, step_no)
-                feedback = ""
-                continue
-            if action == "script":
-                self._do_script(decision, step_no)
-                feedback = ""
+            if action in ("tool", "script"):
+                # 预算只计真实动作（tool/script），不计 thought / final 重试。
+                actions_used += 1
+                self.pending_feedback = ""
+                if action == "tool":
+                    self._do_tool(decision, actions_used)
+                else:
+                    self._do_script(decision, actions_used)
+                feedback = self.pending_feedback
+                # 给定的 success_criteria 每一步都立即评估；满足即自动收尾。
+                checks = self._evaluate(checks_spec)
+                if checks:
+                    last_checks = checks
+                    if all(item["ok"] for item in checks):
+                        self.emit("verify", {"checks": checks, "verdict": "passed"})
+                        return self._finish(
+                            "succeeded",
+                            checks=checks,
+                            summary={"steps": actions_used, "verdict": "passed", "auto_verified": True},
+                        )
                 continue
             if action == "final":
                 saw_final = True
@@ -459,19 +606,17 @@ class ExploreAgent:
                         "成功标准必须落成可执行检查（text_contains/status_code/file_exists/regex）",
                     )
                 checks_spec = specs
-                checks = check_observations(
-                    specs, observations=self.observations, base_dir=self.sandbox
-                )
-                verdict = "passed" if all(item["ok"] for item in checks) else "failed"
-                self.emit("verify", {"checks": checks, "verdict": verdict})
-                last_checks = checks
+                checks = self._evaluate(specs)
+                verdict = "passed" if checks and all(item["ok"] for item in checks) else "failed"
+                self.emit("verify", {"checks": checks or [], "verdict": verdict})
+                last_checks = checks or []
                 if verdict == "passed":
                     return self._finish(
                         "succeeded",
-                        checks=checks,
-                        summary={"steps": step_no, "verdict": "passed"},
+                        checks=checks or [],
+                        summary={"steps": actions_used, "verdict": "passed"},
                     )
-                failed = [item for item in checks if not item["ok"]]
+                failed = [item for item in checks or [] if not item["ok"]]
                 feedback = "确定性校验未通过：" + "；".join(
                     f"{item['id']}: {item['evidence']}" for item in failed[:5]
                 )
@@ -486,9 +631,19 @@ class ExploreAgent:
             status,
             checks=last_checks,
             summary={
-                "reason": f"达到 max_steps={self.max_steps}",
-                "steps": step_no,
+                "reason": f"达到 max_steps={self.max_steps}（仅计 tool/script 动作）",
+                "steps": actions_used,
             },
+        )
+
+    def _evaluate(self, specs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not specs:
+            return []
+        return check_observations(
+            specs,
+            observations=self.observations,
+            base_dir=self.sandbox,
+            extra_texts=self.script_outputs,
         )
 
     # ------------------------------------------------------------------ #
@@ -539,6 +694,7 @@ class ExploreAgent:
             "- 引用前面工具输出用 ${stepN.field}（N 为工具调用序号，从 1 开始）。\n"
             "- 脚本在工作目录内执行（python -I），路径必须是相对路径。\n"
             "- final 的 checks 必须是确定性检查；LLM 自述不算通过。\n"
+            "- 给定 criteria 一旦满足就立即 final；不要重复打开同一页面或重复落盘。\n"
             "- 没有可执行检查时不得 final。\n"
         )
         recent = [
@@ -569,7 +725,12 @@ class ExploreAgent:
         }
         user = json.dumps(payload, ensure_ascii=False, default=str)
         try:
-            decision = self.llm.complete_json(system, user)
+            # 真实模型有时会在 JSON 前后夹带解释或多个对象；complete_json 会整段
+            # 解析失败。这里取原始文本并抽取真正的 action 对象。
+            if hasattr(self.llm, "complete"):
+                decision = _extract_decision(self.llm.complete(system, user))
+            else:
+                decision = self.llm.complete_json(system, user)
         except Exception as exc:  # noqa: BLE001 - LLM 故障必须显式失败
             raise AgentExecError(
                 "llm_error", f"LLM 调用失败: {type(exc).__name__}: {exc}", status=502
@@ -590,6 +751,30 @@ class ExploreAgent:
                 f"工具不存在: {tool or '<空>'}；可用工具: {', '.join(sorted(self.tool_names)[:20])}",
                 status=400,
             )
+        signature = tool + "\n" + json.dumps(
+            dict(params), ensure_ascii=False, sort_keys=True, default=str
+        )
+        if signature == self.last_tool_sig:
+            self.repeat_count += 1
+        else:
+            self.last_tool_sig = signature
+            self.repeat_count = 1
+        if self.repeat_count >= 2:
+            message = "同一 tool+params 已连续重复 2 次：已执行过，请改用 final 或其他动作"
+            self.emit("thought", {"text": f"系统：{message}"})
+            self.emit(
+                "tool_result",
+                {
+                    "tool": tool,
+                    "ok": False,
+                    "digest": {},
+                    "artifacts": [],
+                    "error": message,
+                    "skipped": True,
+                },
+            )
+            self.pending_feedback = message
+            return
         try:
             resolved = self._resolve_refs(dict(params))
         except AgentExecError as exc:
@@ -731,6 +916,9 @@ class ExploreAgent:
         }
         self.scripts.append(
             {"path": rel, "code_sha256": code_sha, "exit_code": outcome["exit_code"], "ok": bool(outcome["ok"])}
+        )
+        self.script_outputs.append(
+            (outcome.get("stdout") or "") + "\n" + (outcome.get("stderr") or "")
         )
         self.emit("script", event)
 

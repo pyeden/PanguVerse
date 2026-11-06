@@ -291,8 +291,13 @@ def test_explore_requires_llm_and_never_fakes_execution(
 
 def test_explore_budget_exceeded(tmp_path: Path, hot_server: str) -> None:
     decisions = [
-        {"action": "tool", "tool": "web_open", "params": {"url": hot_server}, "thought": "再看一次"}
-        for _ in range(5)
+        {
+            "action": "tool",
+            "tool": "web_open",
+            "params": {"url": f"{hot_server}?i={index}"},
+            "thought": "再看一次",
+        }
+        for index in range(5)
     ]
     api = new_api(tmp_path, llm=FakeLLM(decisions), registry=make_registry())
     status, body, _ = call(
@@ -306,6 +311,93 @@ def test_explore_budget_exceeded(tmp_path: Path, hot_server: str) -> None:
     status, body, _ = call(api, "POST", f"/api/studio/explore/{session['eid']}/crystallize", {})
     assert status == 409, body
     assert body["error"]["code"] == "not_succeeded"
+
+
+def test_given_criteria_auto_verify_without_final(tmp_path: Path, hot_server: str) -> None:
+    """给定 criteria 时，tool_result 后立即自动 verify，不依赖 LLM 发 final。"""
+    llm = FakeLLM(
+        [
+            {
+                "action": "tool",
+                "tool": "web_open",
+                "params": {"url": hot_server},
+                "thought": "打开页面",
+            }
+        ]
+    )
+    criteria = [
+        {"id": "status", "type": "status_code", "equals": 200},
+        {"id": "hot", "type": "text_contains", "value": "热搜"},
+        {"id": "rank", "type": "regex", "pattern": "热搜第[一二三]名"},
+    ]
+    api = new_api(tmp_path, llm=llm, registry=make_registry())
+    status, body, _ = call(
+        api,
+        "POST",
+        "/api/studio/explore",
+        {"intent": "打开百度热搜", "success_criteria": criteria, "max_steps": 6},
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "succeeded", session
+    assert all(item["ok"] for item in session["checks"])
+    assert len(llm.prompts) == 1  # 没有第二次决策，更没有 final
+    types = [event["type"] for event in session["events"]]
+    assert types == ["thought", "tool_call", "tool_result", "verify", "end"]
+    assert session["summary"].get("auto_verified") is True
+
+
+def test_check_default_binding_ignores_later_non_evidence_observation() -> None:
+    from panguverse.axe.agent_exec import check_observations
+
+    observations = [
+        {
+            "index": 1,
+            "tool": "web_open",
+            "ok": True,
+            "result": {"status": 200, "text": "百度热搜 热搜指数 7904280"},
+        },
+        {"index": 2, "tool": "fs_list", "ok": True, "result": {"count": 2, "files": []}},
+    ]
+    specs = [
+        {"id": "status", "type": "status_code", "equals": 200},
+        {"id": "hot", "type": "text_contains", "value": "热搜"},
+        {"id": "rank", "type": "regex", "pattern": "热搜指数\\s*\\d+"},
+    ]
+    results = check_observations(specs, observations=observations, base_dir=Path("/tmp"))
+    assert [item["ok"] for item in results] == [True, True, True], results
+
+
+def test_duplicate_tool_call_is_skipped_with_feedback(tmp_path: Path, hot_server: str) -> None:
+    decision = {
+        "action": "tool",
+        "tool": "web_open",
+        "params": {"url": hot_server},
+        "thought": "重复打开",
+    }
+    api = new_api(
+        tmp_path,
+        llm=FakeLLM([decision, dict(decision)]),
+        registry=make_registry(),
+    )
+    status, body, _ = call(
+        api, "POST", "/api/studio/explore", {"intent": "打开页面", "max_steps": 2}
+    )
+    assert status == 202, body
+    session = wait_explore(api, body["eid"])
+    assert session["status"] == "budget_exceeded"
+    assert len([event for event in session["events"] if event["type"] == "tool_call"]) == 1
+    skipped = [
+        event
+        for event in session["events"]
+        if event["type"] == "tool_result" and event.get("skipped")
+    ]
+    assert len(skipped) == 1
+    assert "已执行过" in skipped[0]["error"]
+    assert any(
+        event["type"] == "thought" and "已执行过" in event.get("text", "")
+        for event in session["events"]
+    )
 
 
 def test_explore_script_path_traversal_is_rejected(tmp_path: Path, hot_server: str) -> None:
