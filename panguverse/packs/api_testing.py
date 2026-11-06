@@ -319,6 +319,7 @@ def build_pack() -> Any:
         enrich(assertions.assert_latency, domain="api", effects=("pure",)),
         enrich(assertions.assert_header, domain="api", effects=("pure",)),
         enrich(assertions.assert_body_contains, domain="api", effects=("pure",)),
+        enrich(assertions.assert_text_matches, domain="api", effects=("pure",)),
     ]
     return AtomPack(
         name="api_testing",

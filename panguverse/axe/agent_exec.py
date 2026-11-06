@@ -15,11 +15,13 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -440,6 +442,106 @@ def _text_of_result(result: Mapping[str, Any]) -> str | None:
     return None
 
 
+_ITEM_TAG_RE = re.compile(
+    r"<li\b|<article\b|class=[\"'](?:item|card|hot-item|news-item)[\"']", re.I
+)
+
+
+def _count_items(text: str, pattern: str) -> int:
+    if pattern:
+        try:
+            return len(re.findall(pattern, text))
+        except re.error:
+            return 0
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return len(_ITEM_TAG_RE.findall(text))
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        for key in ("items", "data", "results", "list", "hot", "hotList"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return len(value)
+            if isinstance(value, dict):
+                for nested in ("items", "list", "content"):
+                    if isinstance(value.get(nested), list):
+                        return len(value[nested])
+        for value in data.values():
+            if isinstance(value, list):
+                return len(value)
+    return 0
+
+
+_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%Y年%m月%d日",
+)
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo is None else parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _find_timestamp(text: str, pattern: str) -> datetime | None:
+    if pattern:
+        try:
+            match = re.search(pattern, text)
+        except re.error:
+            return None
+        if match:
+            raw = match.group(1) if match.groups() else match.group(0)
+            return _parse_time(raw)
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    stack = [data] if data is not None else []
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if str(key).lower() in (
+                    "fetched_at",
+                    "generated_at",
+                    "updated_at",
+                    "created_at",
+                    "timestamp",
+                    "date",
+                ):
+                    parsed = _parse_time(value)
+                    if parsed is not None:
+                        return parsed
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(item, list):
+            stack.extend(item)
+    return None
+
+
 def _eval_one(
     spec: Mapping[str, Any],
     *,
@@ -493,6 +595,35 @@ def _eval_one(
         start = max(0, match.start() - 60)
         end = min(len(text), match.end() + 60)
         return True, text[start:end]
+
+    if kind == "min_items":
+        rel = str(spec.get("artifact") or spec.get("path") or "")
+        try:
+            target = safe_path(base_dir, rel, field="artifact")
+        except AgentExecError as exc:
+            return False, exc.message
+        if not target.is_file():
+            return False, f"产物不存在: {rel}"
+        text = target.read_text(encoding="utf-8", errors="replace")
+        minimum = int(spec.get("min_items") or 1)
+        count = _count_items(text, str(spec.get("pattern") or ""))
+        return count >= minimum, f"{rel} 条目数 {count}，要求 ≥ {minimum}"
+
+    if kind == "freshness":
+        rel = str(spec.get("artifact") or spec.get("path") or "")
+        try:
+            target = safe_path(base_dir, rel, field="artifact")
+        except AgentExecError as exc:
+            return False, exc.message
+        if not target.is_file():
+            return False, f"产物不存在: {rel}"
+        text = target.read_text(encoding="utf-8", errors="replace")
+        stamp = _find_timestamp(text, str(spec.get("pattern") or ""))
+        if stamp is None:
+            return False, f"{rel} 找不到可解析的时间戳"
+        max_age = int(spec.get("max_age_seconds") or 86400)
+        age = (datetime.now() - stamp).total_seconds()
+        return age <= max_age, f"{rel} 时间戳 {stamp.isoformat(sep=' ')}，距今 {int(age)}s（上限 {max_age}s）"
 
     return False, f"未知检查类型: {kind}"
 
@@ -1552,124 +1683,282 @@ def build_crystallized_graph(
     registry: Any = None,
     session_dir: Path | str | None = None,
     workspace: Path | str | None = None,
+    llm: Any = None,
 ) -> dict[str, Any]:
-    """Synthesize a minimal replayable workflow from a successful trace.
+    """Crystallize a successful trace through LLM semantic abstraction.
 
-    Kept: nodes on the input→artifact/check path.  Dropped: failed steps,
-    repeated tool+params (last success wins), probes with no referenced output,
-    and scripts whose outputs nobody checks.  ``${stepN.path}`` references
-    become capture variables with real ``data`` edges.
+    The LLM only *induces* (which steps matter, how to generalize scripts, what
+    proves success).  Materialization, generality gates, graph construction and
+    replay are deterministic.  Without an LLM crystallization is refused: a
+    recording must never masquerade as a workflow.
     """
-    from . import atomize, synthesize
+    from . import abstraction
 
-    base_dir = Path(session_dir) if session_dir else None
-    steps = synthesize.collect_steps(events, session_dir=base_dir)
-
-    analysis = route_analysis(intent, domain_pack) if registry is not None else None
-    allowed = allowed_atom_names(registry, analysis) if registry is not None else None
-    route = str(getattr(analysis, "domain", "") or "") if analysis is not None else ""
-
-    try:
-        selection = synthesize.select_workflow(
-            steps,
-            checks,
-            session_dir=base_dir,
-            allowed=allowed,
-        )
-    except synthesize.SynthesisError as exc:
+    if registry is None:
+        raise AgentExecError("internal_error", "固化需要原子注册表")
+    if session_dir is None or workspace is None:
+        raise AgentExecError("bad_request", "固化需要探索会话目录与工作区")
+    base_dir = Path(session_dir)
+    root = Path(workspace)
+    if not isinstance(llm, object) or llm is None or getattr(llm, "available", True) is False:
         raise AgentExecError(
-            exc.code,
-            exc.message,
-            status=400 if exc.code in {"unresolved_reference", "empty_workflow"} else None,
-            details=exc.details,
+            "llm_required_for_crystallize",
+            "固化需要 LLM 做语义归纳（PANGUVERSE_API_KEY / OPENAI_API_KEY）；未配置时不做假固化",
+            status=503,
+        )
+    catalog = abstraction.atom_catalog(registry)
+    digest = abstraction.build_digest(
+        events, session_dir=base_dir, checks=checks, intent=intent
+    )
+    try:
+        plan = abstraction.plan_crystallization(
+            llm, intent=intent, digest=digest, catalog=catalog
+        )
+    except abstraction.AbstractionError as exc:
+        raise AgentExecError(
+            exc.code, exc.message, status=exc.status, details=exc.details
         ) from exc
-    if not selection.steps:
-        raise AgentExecError(
-            "bad_request",
-            "探索轨迹剪枝后没有可固化的节点（没有产物/检查路径）",
-            details={"pruned": selection.pruned[:20]},
-        )
 
-    atoms_created: list[dict[str, Any]] = []
-    materialized: dict[int, dict[str, Any]] = {}
-    pending: list[dict[str, Any]] = [
-        *[item for item in selection.failed if item.get("kind") == "script"],
-        *selection.out_of_scope,
-        *[item for item in selection.pruned if item.get("kind") == "script"],
+    script_by_seq = {
+        int(item.get("seq") or 0): item for item in digest.get("scripts") or []
+    }
+    nodes_by_new: dict[str, dict[str, Any]] = {}
+    for node in plan.get("nodes") or []:
+        atom = str(node.get("atom") or "")
+        if atom.startswith("new:"):
+            nodes_by_new[abstraction._snake(atom.split(":", 1)[1])] = node
+
+    pending: list[dict[str, Any]] = []
+    dropped_steps: list[dict[str, Any]] = [
+        {
+            "trace_seq": item.get("seq"),
+            "path": item.get("path"),
+            "action": "drop",
+            "reason": f"失败步骤不固化：{item.get('reason') or 'ok=false'}",
+            "kind": item.get("kind"),
+        }
+        for item in digest.get("failed_steps") or []
     ]
-    if workspace and base_dir and selection.script_seqs:
-        try:
-            materialized_result = atomize.materialize_script_atoms(
-                workspace=Path(workspace),
-                session_dir=base_dir,
-                scripts=[event for event in events if event.get("type") == "script"],
-                eid=eid,
-                intent=intent,
-                only_seqs=set(selection.script_seqs),
-                include_nodes=False,
+    created: list[dict[str, Any]] = []
+    new_atoms: dict[str, dict[str, Any]] = {}
+    abstraction_checks: list[dict[str, Any]] = []
+    for item in plan.get("scripts") or []:
+        seq = int(item.get("seq") or 0)
+        script = script_by_seq.get(seq)
+        if script is None:
+            continue
+        if item.get("action") != "abstract":
+            dropped_steps.append(
+                {
+                    "trace_seq": seq,
+                    "path": script.get("path"),
+                    "action": item.get("action"),
+                    "reason": item.get("reason") or "计划未保留",
+                    "kind": "script",
+                }
             )
-        except Exception as exc:
-            raise AgentExecError(
-                "atomize_failed",
-                f"脚本原子固化失败: {type(exc).__name__}: {exc}",
-            ) from exc
-        for item in materialized_result.get("atoms_created") or []:
+            continue
+        atom_name = str(item.get("as") or "")
+        plan_node = nodes_by_new.get(atom_name)
+        if plan_node is None:
+            dropped_steps.append(
+                {
+                    "trace_seq": seq,
+                    "path": script.get("path"),
+                    "action": "abstract",
+                    "reason": "抽象结果没有被任何节点使用",
+                    "kind": "script",
+                }
+            )
+            continue
+        try:
+            abstracted = abstraction.abstract_script(
+                llm,
+                intent=intent,
+                script=script,
+                plan_node=plan_node,
+                checks=list(plan.get("checks") or []),
+            )
+        except abstraction.AbstractionError as exc:
+            pending.append(
+                {
+                    "name": atom_name,
+                    "path": script.get("path"),
+                    "code_sha256": script.get("code_sha256"),
+                    "trace_seq": seq,
+                    "status": "pending",
+                    "kind": "script",
+                    "reason": exc.message,
+                }
+            )
+            continue
+        # Write the candidate module to the workspace pack, then gate it.  A
+        # rejected atom is removed from disk so nothing can silently use it.
+        info = abstraction.write_atom(
+            workspace=root,
+            eid=eid,
+            name=atom_name,
+            source=abstracted["source"],
+            contract=abstracted["contract"],
+            script=script,
+            description=abstracted["description"],
+            generality=abstraction.GeneralityReport(ok=False),
+        )
+        report = abstraction.generality_check(
+            module_path=Path(info["path"]),
+            source=abstracted["source"],
+            contract=abstracted["contract"],
+            session_dir=base_dir,
+            recorded_outputs=script.get("output_paths") or {},
+        )
+        has_source = any(
+            str(key).rstrip("?") == "source"
+            for key in (abstracted["contract"].get("inputs") or {})
+        )
+        if report.ok and has_source and not report.dynamic.get("produced"):
+            # A "general" atom that emits nothing for a source input cannot
+            # replay a real run; ask the abstraction LLM to fix its parser once.
+            feedback = (
+                "用合成 source 运行后没有产出任何声明的输出文件。"
+                "必须递归解析 source（例如 JSON 的 data.cards[].content[]），"
+                "不要假设 data 一定是 list；source 非空时不得联网。"
+                "样例 source：\n"
+                + abstraction._synthetic_source("repair")
+            )
             try:
-                seq = int(item.get("trace_seq") or 0)
-            except (TypeError, ValueError):
-                continue
-            materialized[seq] = dict(item)
-            atoms_created.append(dict(item))
-        pending.extend(materialized_result.get("pending") or [])
-        usable_seqs = {step.seq for step in selection.steps if step.kind != "script"}
-        usable_seqs.update(materialized)
-        missing = {step.seq for step in selection.steps if step.kind == "script"} - set(materialized)
-        if missing:
-            for seq in sorted(missing):
-                step = next((item for item in selection.steps if item.seq == seq), None)
-                if step is not None:
-                    pending.append(
-                        synthesize._pending(step, "脚本原子未能固化，节点已移除")
-                    )
-            selection.steps = [
-                step for step in selection.steps if step.seq not in missing
-            ]
-            selection.checks = [
-                spec
-                for spec in selection.checks
-                if int(spec.get("_producer_seq") or 0) not in missing
-                and int(spec.get("_fallback_seq") or 0) not in missing
-            ]
+                retried = abstraction.abstract_script(
+                    llm,
+                    intent=intent,
+                    script=script,
+                    plan_node=plan_node,
+                    checks=list(plan.get("checks") or []),
+                    feedback=feedback,
+                )
+            except abstraction.AbstractionError:
+                retried = None
+            if retried is not None:
+                abstracted = retried
+                info = abstraction.write_atom(
+                    workspace=root,
+                    eid=eid,
+                    name=atom_name,
+                    source=abstracted["source"],
+                    contract=abstracted["contract"],
+                    script=script,
+                    description=abstracted["description"],
+                    generality=abstraction.GeneralityReport(ok=False),
+                )
+                report = abstraction.generality_check(
+                    module_path=Path(info["path"]),
+                    source=abstracted["source"],
+                    contract=abstracted["contract"],
+                    session_dir=base_dir,
+                    recorded_outputs=script.get("output_paths") or {},
+                )
+        if not report.ok:
+            Path(info["path"]).unlink(missing_ok=True)
+            pending.append(
+                {
+                    "name": atom_name,
+                    "path": script.get("path"),
+                    "code_sha256": script.get("code_sha256"),
+                    "trace_seq": seq,
+                    "status": "pending",
+                    "kind": "script",
+                    "reason": "not_general",
+                    "generality": report.to_dict(),
+                }
+            )
+            dropped_steps.append(
+                {
+                    "trace_seq": seq,
+                    "path": script.get("path"),
+                    "action": "reject",
+                    "reason": "not_general",
+                    "violations": report.violations,
+                    "kind": "script",
+                }
+            )
+            continue
+        info = abstraction.write_atom(
+            workspace=root,
+            eid=eid,
+            name=atom_name,
+            source=abstracted["source"],
+            contract=abstracted["contract"],
+            script=script,
+            description=abstracted["description"],
+            generality=report,
+        )
+        new_atoms[atom_name] = info
+        created.append(info)
+        abstraction_checks.extend(abstracted.get("checks") or [])
 
+    abstraction.write_pack_manifest(root, eid, created)
+    if abstraction_checks:
+        produced = {
+            str(rel)
+            for info in new_atoms.values()
+            for rel in (info.get("output_paths") or {}).values()
+        }
+        produced_names = {Path(rel).name for rel in produced}
+
+        def _plan_check_mentions_new(spec: Mapping[str, Any]) -> bool:
+            rel = str(spec.get("artifact") or spec.get("path") or "").replace("\\", "/")
+            return rel in produced or Path(rel).name in produced_names
+
+        original_checks = list(plan.get("checks") or [])
+        merged = [
+            item for item in original_checks if not _plan_check_mentions_new(item)
+        ] + abstraction_checks
+        if not any(
+            item.get("type") in ("min_items", "freshness", "regex") for item in merged
+        ):
+            merged.extend(
+                item
+                for item in original_checks
+                if item.get("type") in ("min_items", "freshness", "regex")
+            )
+        plan["checks"] = merged
     try:
-        graph = synthesize.build_graph(
-            selection=selection,
-            materialized=materialized,
-            checks=selection.checks,
+        graph = abstraction.build_graph_from_plan(
+            plan=plan,
+            digest=digest,
+            session_dir=base_dir,
+            workspace=root,
             eid=eid,
             intent=intent,
             name=name,
+            new_atoms=new_atoms,
+            pending=pending,
+            dropped_steps=dropped_steps,
             registry=registry,
-            session_dir=base_dir,
         )
-    except synthesize.SynthesisError as exc:
-        raise AgentExecError(exc.code, exc.message, details=exc.details) from exc
-
-    # Stable de-dupe: one pending row per (kind, path, trace_seq).
-    deduped: list[dict[str, Any]] = []
-    seen: set[tuple[Any, ...]] = set()
-    for item in pending:
-        key = (item.get("kind"), item.get("path"), item.get("trace_seq"))
-        if key in seen:
+    except abstraction.AbstractionError as exc:
+        raise AgentExecError(
+            exc.code, exc.message, status=exc.status, details=exc.details
+        ) from exc
+    graph["atoms_created"] = created
+    graph["pending_atoms"] = pending
+    deduped_steps: list[dict[str, Any]] = []
+    seen_steps: set[tuple[Any, ...]] = set()
+    for item in dropped_steps:
+        key = (
+            item.get("trace_seq"),
+            item.get("path"),
+            item.get("node_id"),
+            item.get("action"),
+            item.get("reason"),
+        )
+        if key in seen_steps:
             continue
-        seen.add(key)
-        deduped.append(item)
-
-    graph["pending_atoms"] = deduped
-    graph["atoms_created"] = atoms_created
-    graph["out_of_scope"] = list(selection.out_of_scope)
-    graph["route"] = route
-    graph["scripts"] = [event for event in events if event.get("type") == "script"]
+        seen_steps.add(key)
+        deduped_steps.append(item)
+    graph["dropped_steps"] = deduped_steps
+    graph["digest"] = {
+        "atom_steps": len(digest.get("atom_steps") or []),
+        "scripts": len(digest.get("scripts") or []),
+    }
     return graph
 
 
@@ -1871,65 +2160,98 @@ def bind_checks_to_evidence(
     return bound
 
 
+
+
 def replay_graph(
     *,
     nodes: list[dict[str, Any]],
     registry: Any,
     sandbox: Path,
     checks: list[dict[str, Any]],
+    clean: bool = False,
 ) -> dict[str, Any]:
-    """Deterministic replay: execute atom nodes only, no LLM involved."""
+    """Deterministic replay: execute atom nodes only, no LLM involved.
+
+    With ``clean=True`` the replay runs in a fresh temporary workspace and
+    removes it afterwards; generated atoms therefore cannot read explore
+    artifacts/data.  Any attempted LLM call is counted and fails the replay.
+    """
     import shutil
+    import tempfile
+
+    from . import llm as llm_module
 
     sandbox = Path(sandbox)
-    if sandbox.exists():
+    cleanup = False
+    if clean:
+        sandbox = Path(tempfile.mkdtemp(prefix="pv-replay-clean-"))
+        cleanup = True
+    elif sandbox.exists():
         shutil.rmtree(sandbox)
-    sandbox.mkdir(parents=True, exist_ok=True)
+        sandbox.mkdir(parents=True, exist_ok=True)
+    else:
+        sandbox.mkdir(parents=True, exist_ok=True)
+
+    llm_calls = {"count": 0}
+    original_complete = llm_module.LLMClient.complete
+
+    def _forbidden(self, *args: Any, **kwargs: Any) -> str:
+        llm_calls["count"] += 1
+        raise llm_module.LLMError("重放期间禁止调用 LLM")
+
+    llm_module.LLMClient.complete = _forbidden  # type: ignore[method-assign]
     ctx = RunContext(workspace=str(sandbox), env={"FS_ROOT": str(sandbox)})
     observations: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
     started = time.monotonic()
-    for index, node in enumerate(nodes, 1):
-        atom_name = str(node.get("atom") or "")
-        step_id = str(node.get("id") or f"step{index}")
-        try:
-            atom = registry.get(atom_name)
-            params = resolve_templates(dict(node.get("params") or {}), ctx)
-            result = atom.invoke(ctx, params)
-        except Exception as exc:  # noqa: BLE001 - 重放失败要落成证据
-            errors.append(
-                {
-                    "step_id": step_id,
-                    "atom": atom_name,
-                    "error": f"{type(exc).__name__}: {exc}",
-                }
-            )
+    previous_cwd = Path.cwd()
+    try:
+        os.chdir(sandbox)
+        for index, node in enumerate(nodes, 1):
+            atom_name = str(node.get("atom") or "")
+            step_id = str(node.get("id") or f"step{index}")
+            try:
+                atom = registry.get(atom_name)
+                params = resolve_templates(dict(node.get("params") or {}), ctx)
+                result = atom.invoke(ctx, params)
+            except Exception as exc:  # noqa: BLE001 - 重放失败要落成证据
+                errors.append(
+                    {
+                        "step_id": step_id,
+                        "atom": atom_name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                observations.append(
+                    {
+                        "index": index,
+                        "step_id": step_id,
+                        "tool": atom_name,
+                        "params": dict(node.get("params") or {}),
+                        "ok": False,
+                        "result": {},
+                    }
+                )
+                continue
+            for var, spec in (node.get("capture") or {}).items():
+                path = spec.get("path") if isinstance(spec, Mapping) else spec
+                found = walk_path(result, split_path(str(path or var)))
+                if found is not MISSING:
+                    ctx.set(str(var), found)
             observations.append(
                 {
                     "index": index,
                     "step_id": step_id,
                     "tool": atom_name,
                     "params": dict(node.get("params") or {}),
-                    "ok": False,
-                    "result": {},
+                    "ok": True,
+                    "result": dict(result),
                 }
             )
-            continue
-        for var, spec in (node.get("capture") or {}).items():
-            path = spec.get("path") if isinstance(spec, Mapping) else spec
-            found = walk_path(result, split_path(str(path or var)))
-            if found is not MISSING:
-                ctx.set(str(var), found)
-        observations.append(
-            {
-                "index": index,
-                "step_id": step_id,
-                "tool": atom_name,
-                "params": dict(node.get("params") or {}),
-                "ok": True,
-                "result": dict(result),
-            }
-        )
+    finally:
+        os.chdir(previous_cwd)
+        llm_module.LLMClient.complete = original_complete  # type: ignore[method-assign]
+
     unbound = [
         str(item.get("id") or item.get("type"))
         for item in checks
@@ -1947,14 +2269,21 @@ def replay_graph(
     passed = (
         not errors
         and not unbound
-        and all(item["ok"] for item in results)
         and bool(checks)
+        and all(item["ok"] for item in results)
+        and llm_calls["count"] == 0
     )
-    return {
+    payload = {
         "status": "passed" if passed else "failed",
         "checks": results,
         "unbound": unbound,
         "errors": errors,
+        "llm_calls": llm_calls["count"],
+        "clean_workspace": cleanup,
+        "workspace": str(sandbox),
         "duration_ms": int((time.monotonic() - started) * 1000),
         "nodes": [node.get("id") for node in nodes],
     }
+    if cleanup:
+        shutil.rmtree(sandbox, ignore_errors=True)
+    return payload

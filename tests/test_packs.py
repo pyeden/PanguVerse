@@ -115,7 +115,7 @@ class TestPackRegistry:
             "web_browser",
             "web_research",
         ]
-        assert len(registry.atoms()) == 52
+        assert len(registry.atoms()) == 56
         assert registry.capabilities() == (
             "device",
             "process",
@@ -133,7 +133,7 @@ class TestPackRegistry:
 
     def test_manifest_is_reviewable(self):
         manifest = builtin_pack_registry(reload=True).manifest()
-        assert manifest["atom_count"] == 52
+        assert manifest["atom_count"] == 56
         assert {pack["name"] for pack in manifest["packs"]} == set(pack_names())
         for pack in manifest["packs"]:
             assert pack["version"] and pack["description"]

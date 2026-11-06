@@ -471,6 +471,7 @@ def crystallize(
     *,
     actor: str = "explore",
     registry: Any = None,
+    llm: Any = None,
 ) -> dict[str, Any]:
     from . import service
 
@@ -515,6 +516,15 @@ def crystallize(
         )
     if registry is None:
         registry = service.registry()
+    if llm is None:
+        llm = studio._llm_client()
+    if llm is None or getattr(llm, "available", True) is False:
+        raise StudioError(
+            "llm_required_for_crystallize",
+            "固化需要 LLM 做语义归纳（PANGUVERSE_API_KEY / OPENAI_API_KEY）；未配置时不做假固化",
+            status=503,
+            details={"llm": _llm_status(llm)},
+        )
     try:
         graph = agent_exec.build_crystallized_graph(
             events,
@@ -526,6 +536,7 @@ def crystallize(
             registry=registry,
             session_dir=session_dir,
             workspace=root,
+            llm=llm,
         )
     except agent_exec.AgentExecError as exc:
         raise StudioError(exc.code, exc.message, status=exc.status, details=exc.details) from exc
@@ -538,6 +549,22 @@ def crystallize(
     # 生产 registry 则必须带上本 workspace 的原子，否则新原子会被判“不存在”。
     validation_registry = registry if hasattr(registry, "packs") else None
 
+    try:
+        replay = agent_exec.replay_graph(
+            nodes=graph["nodes"],
+            registry=registry,
+            sandbox=session_dir / "replay",
+            checks=graph["checks"],
+            clean=True,
+        )
+    except Exception as exc:  # noqa: BLE001 - 重放异常也要落成 replay_failed
+        replay = {
+            "status": "failed",
+            "checks": [],
+            "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
+            "llm_calls": 0,
+            "clean_workspace": True,
+        }
     created = studio.create_draft_from_graph(
         root,
         intent=str(meta.get("intent") or ""),
@@ -549,21 +576,14 @@ def crystallize(
         domain_pack=str(meta.get("domain_pack") or ""),
         pending_atoms=graph["pending_atoms"],
         replay_checks=graph["checks"],
+        abstraction={
+            "plan": graph.get("abstraction_plan") or {},
+            "atoms_created": atoms_created,
+            "dropped_steps": graph.get("dropped_steps") or [],
+            "replay_llm_calls": int(replay.get("llm_calls") or 0),
+        },
         registry=validation_registry,
     )
-    try:
-        replay = agent_exec.replay_graph(
-            nodes=graph["nodes"],
-            registry=registry,
-            sandbox=session_dir / "replay",
-            checks=graph["checks"],
-        )
-    except Exception as exc:  # noqa: BLE001 - 重放异常也要落成 replay_failed
-        replay = {
-            "status": "failed",
-            "checks": [],
-            "errors": [{"error": f"{type(exc).__name__}: {exc}"}],
-        }
     recorded = studio.record_replay(root, created["wid"], replay)
     return {
         "wid": created["wid"],
@@ -575,7 +595,10 @@ def crystallize(
         "route": graph.get("route") or "",
         "synthesis": graph.get("synthesis") or {},
         "dropped_checks": graph.get("dropped_checks") or [],
+        "abstraction_plan": graph.get("abstraction_plan") or {},
+        "dropped_steps": graph.get("dropped_steps") or [],
         "replay": replay,
+        "llm_calls_replay": int(replay.get("llm_calls") or 0),
         "validation": created.get("validation") or {},
         "checks": graph["checks"],
         "graph": {"nodes": graph["nodes"], "edges": graph["edges"]},

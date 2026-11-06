@@ -118,6 +118,7 @@ class WebAPI:
         batches: BatchManager | None = None,
         explore_llm: Any = None,
         explore_registry: Any = None,
+        crystallize_llm: Any = None,
     ) -> None:
         self.root = service.resolve_workspace(workspace)
         self.jobs = jobs or JobManager()
@@ -137,6 +138,8 @@ class WebAPI:
         #: explore-first：注入假 LLM/原子库用于测试；None = 按环境/默认原子库
         self.explore_llm = explore_llm
         self.explore_registry = explore_registry
+        #: 固化语义归纳专用 LLM；None = 探索 LLM（测试注入）或环境变量客户端
+        self.crystallize_llm = crystallize_llm
         #: 调度线程（单进程）：只在 ``serve`` 里 start/stop；测试可手动调用
         self.scheduler = schedules.Scheduler(self.root, self.jobs, self.batches)
 
@@ -696,6 +699,7 @@ class WebAPI:
                         body,
                         actor=actor,
                         registry=self.explore_registry,
+                        llm=self.crystallize_llm or self.explore_llm,
                     )
                 )
             raise ApiError("not_found", "接口不存在")

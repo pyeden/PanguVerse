@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import errno
 import json
+import re
 from collections.abc import Mapping
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -367,6 +369,205 @@ def assert_file_contains(ctx: RunContext, path: str, text: str, encoding: str = 
     return {"size": len(content)}
 
 
+_ITEM_TAG_RE = re.compile(
+    r"<li\b|<article\b|class=[\"'](?:item|card|hot-item|news-item)[\"']", re.I
+)
+_TIME_FORMATS = (
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%dT%H:%M",
+    "%Y-%m-%d",
+    "%Y/%m/%d %H:%M:%S",
+    "%Y/%m/%d",
+    "%Y年%m月%d日",
+)
+
+
+def _count_items(text: str, pattern: str) -> int:
+    if pattern:
+        try:
+            return len(re.findall(pattern, text))
+        except re.error:
+            return 0
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return len(_ITEM_TAG_RE.findall(text))
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        for key in ("items", "data", "results", "list"):
+            value = data.get(key)
+            if isinstance(value, list):
+                return len(value)
+            if isinstance(value, dict):
+                for nested in ("items", "list", "content"):
+                    if isinstance(value.get(nested), list):
+                        return len(value[nested])
+        for value in data.values():
+            if isinstance(value, list):
+                return len(value)
+    return 0
+
+
+def _parse_time(raw: Any) -> datetime | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo is None else parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    except ValueError:
+        pass
+    for fmt in _TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _find_timestamp(text: str, pattern: str) -> datetime | None:
+    if pattern:
+        try:
+            match = re.search(pattern, text)
+        except re.error:
+            return None
+        if match:
+            return _parse_time(match.group(1) if match.groups() else match.group(0))
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        data = None
+    stack = [data] if data is not None else []
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            for key, value in item.items():
+                if str(key).lower() in (
+                    "fetched_at",
+                    "generated_at",
+                    "updated_at",
+                    "created_at",
+                    "timestamp",
+                    "date",
+                ):
+                    parsed = _parse_time(value)
+                    if parsed is not None:
+                        return parsed
+                if isinstance(value, (dict, list)):
+                    stack.append(value)
+        elif isinstance(item, list):
+            stack.extend(item)
+    return None
+
+
+@atom(
+    "assert_file_min_items",
+    description="断言 JSON/HTML/文本产物的条目数不少于 N（JSON 数组或 items 字段；文本按条目标签或正则计数）",
+    category="filesystem",
+    tags=("fs", "assert", "semantic"),
+    inputs={"path": "string", "min_items": "integer", "pattern": "string"},
+    outputs={"count": "integer"},
+    required=("path", "min_items"),
+    effects=("pure",),
+    domain="filesystem",
+)
+def assert_file_min_items(
+    ctx: RunContext, path: str, min_items: int = 1, pattern: str = ""
+) -> dict[str, Any]:
+    target = resolve_path(ctx, str(path))
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise _io_failure(exc, str(target)) from exc
+    count = _count_items(content, str(pattern or ""))
+    minimum = max(1, int(min_items))
+    if count < minimum:
+        raise StepFailure(
+            f"条目数不足: {path} 实际 {count}，要求 ≥ {minimum}",
+            expected=minimum,
+            actual=count,
+            path=str(target),
+        )
+    return {"count": count}
+
+
+@atom(
+    "assert_file_freshness",
+    description="断言产物内的时间戳足够新（JSON 的 fetched_at/generated_at 等，或用 regex 捕获）",
+    category="filesystem",
+    tags=("fs", "assert", "semantic"),
+    inputs={"path": "string", "max_age_seconds": "integer", "pattern": "string"},
+    outputs={"age_seconds": "integer"},
+    required=("path", "max_age_seconds"),
+    effects=("pure",),
+    domain="filesystem",
+)
+def assert_file_freshness(
+    ctx: RunContext, path: str, max_age_seconds: int = 86400, pattern: str = ""
+) -> dict[str, Any]:
+    target = resolve_path(ctx, str(path))
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise _io_failure(exc, str(target)) from exc
+    stamp = _find_timestamp(content, str(pattern or ""))
+    if stamp is None:
+        raise StepFailure(
+            f"找不到可解析的时间戳: {path}",
+            expected="ISO/中文日期时间",
+            actual=content[:200],
+            path=str(target),
+        )
+    age = int((datetime.now() - stamp).total_seconds())
+    if age > int(max_age_seconds):
+        raise StepFailure(
+            f"时间戳过旧: {path} 距今 {age}s，上限 {int(max_age_seconds)}s",
+            expected=f"≤ {int(max_age_seconds)}s",
+            actual=age,
+            path=str(target),
+        )
+    return {"age_seconds": age}
+
+
+@atom(
+    "assert_file_matches",
+    description="断言文件内容匹配正则",
+    category="filesystem",
+    tags=("fs", "assert", "semantic"),
+    inputs={"path": "string", "pattern": "string"},
+    outputs={"size": "integer"},
+    required=("path", "pattern"),
+    effects=("pure",),
+    domain="filesystem",
+)
+def assert_file_matches(ctx: RunContext, path: str, pattern: str) -> dict[str, Any]:
+    target = resolve_path(ctx, str(path))
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        raise _io_failure(exc, str(target)) from exc
+    try:
+        matched = re.search(str(pattern), content, re.M)
+    except re.error as exc:
+        raise StepFailure(
+            f"正则非法: {exc}", expected=pattern, actual="", path=str(target)
+        ) from exc
+    if matched is None:
+        raise StepFailure(
+            f"文件内容未匹配 {pattern!r}",
+            expected=pattern,
+            actual=content[:400],
+            path=str(target),
+        )
+    return {"size": len(content)}
+
+
 # --------------------------------------------------------------------------- #
 # 领域语义
 # --------------------------------------------------------------------------- #
@@ -520,6 +721,9 @@ def build_pack() -> Any:
         fs_delete,
         assert_file_exists,
         assert_file_contains,
+        assert_file_min_items,
+        assert_file_freshness,
+        assert_file_matches,
     ]
     for item in atoms:
         enrich(item, domain="filesystem", pack="local_fs")

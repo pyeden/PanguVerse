@@ -1000,6 +1000,7 @@ def create_draft_from_graph(
     domain_pack: str = "",
     pending_atoms: list[dict[str, Any]] | None = None,
     replay_checks: list[dict[str, Any]] | None = None,
+    abstraction: Mapping[str, Any] | None = None,
     registry: Any = None,
 ) -> dict[str, Any]:
     """Persist an explored (already executed) graph as a draft.
@@ -1039,6 +1040,10 @@ def create_draft_from_graph(
         "pending_atoms": list(pending_atoms or []),
         "replay_checks": list(replay_checks or []),
         "replay_status": "pending",
+        "abstraction_plan": copy.deepcopy((abstraction or {}).get("plan") or {}),
+        "atoms_created": copy.deepcopy((abstraction or {}).get("atoms_created") or []),
+        "dropped_steps": copy.deepcopy((abstraction or {}).get("dropped_steps") or []),
+        "llm_calls_replay": (abstraction or {}).get("replay_llm_calls"),
     }
     revision = {
         "wid": wid,
@@ -1060,6 +1065,10 @@ def create_draft_from_graph(
         "env_schema": env_schema,
         "explore_id": explore_id,
         "replay_checks": copy.deepcopy(replay_checks or []),
+        "abstraction_plan": copy.deepcopy((abstraction or {}).get("plan") or {}),
+        "atoms_created": copy.deepcopy((abstraction or {}).get("atoms_created") or []),
+        "dropped_steps": copy.deepcopy((abstraction or {}).get("dropped_steps") or []),
+        "llm_calls_replay": (abstraction or {}).get("replay_llm_calls"),
         "nodes": copy.deepcopy(nodes),
         "edges": copy.deepcopy(edges),
     }
@@ -1116,9 +1125,12 @@ def record_replay(
         "status": replay.get("status"),
         "checks": replay.get("checks") or [],
         "errors": replay.get("errors") or [],
+        "llm_calls": replay.get("llm_calls", 0),
+        "clean_workspace": replay.get("clean_workspace", False),
         "duration_ms": replay.get("duration_ms"),
         "at": time.time(),
     }
+    workflow["llm_calls_replay"] = int(replay.get("llm_calls") or 0)
     workflow["updated_at"] = time.time()
     _write_workflow(root, wid, workflow)
     _append_audit(

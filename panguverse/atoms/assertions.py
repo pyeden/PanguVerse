@@ -324,6 +324,37 @@ def assert_body_contains(ctx: RunContext, text: str, source: Any = None) -> dict
     return {"assertion": {"ok": True}}
 
 
+@atom(
+    "assert_text_matches",
+    description="断言任意文本/对象（默认 last_response）匹配正则",
+    category="assert",
+    tags=("assert", "core", "semantic"),
+    inputs={"pattern": "string", "source": "any（默认 last_response）", "text": "string"},
+    outputs={},
+    required=("pattern",),
+)
+def assert_text_matches(
+    ctx: RunContext, pattern: str, source: Any = None, text: str | None = None
+) -> dict[str, Any]:
+    if text is None:
+        resolved = resolve_source(ctx, source)
+        text = resolved if isinstance(resolved, str) else str(resolved or "")
+    try:
+        matched = re.search(str(pattern), text, re.S)
+    except re.error as exc:
+        raise AssertionFailed(
+            f"正则非法: {exc}", expected=pattern, actual="", path="text"
+        ) from exc
+    if matched is None:
+        raise AssertionFailed(
+            f"文本未匹配 {pattern!r}",
+            expected=pattern,
+            actual=text[:300],
+            path="text",
+        )
+    return {"match": matched.group(0)[:200]}
+
+
 # --------------------------------------------------------------------------- #
 # 辅助
 # --------------------------------------------------------------------------- #
