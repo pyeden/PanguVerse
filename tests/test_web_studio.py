@@ -704,12 +704,29 @@ def test_param_fill_is_port_contract_driven() -> None:
     ]
     assert param_fill.audit_param_gaps(nodes, registry) == []
 
-    # 占位符 + 路径的组合不能被网页 URL 覆盖；它仍是参数缺口（未解析 env）。
+    # 占位符 + 路径的组合不能被网页 URL 覆盖；它是 env 入参，不是参数缺口。
     composite = [{"id": "n2", "atom": "fake_fetch", "params": {"target_url": "${env.BASE_URL}/api"}}]
     assert param_fill.fill_url_params(composite, registry, "https://example.test/hot") == []
     assert composite[0]["params"]["target_url"] == "${env.BASE_URL}/api"
-    gaps = param_fill.audit_param_gaps(composite, registry)
-    assert gaps and gaps[0]["reason"] == "unresolved_env"
+    assert param_fill.audit_param_gaps(composite, registry) == []
+    env_inputs = param_fill.audit_env_inputs(composite, registry)
+    assert [(item["env"], item["status"]) for item in env_inputs] == [("BASE_URL", "info")]
+
+    # 带 |default: 的 env 占位符同样不是缺口，只是 default 型入参。
+    defaulted = [
+        {"id": "n4", "atom": "fake_fetch", "params": {"target_url": "${env.MAX_LATENCY_MS|default:2000|int}"}}
+    ]
+    assert param_fill.audit_param_gaps(defaulted, registry) == []
+    default_inputs = param_fill.audit_env_inputs(defaulted, registry)
+    assert default_inputs[0]["status"] == "default"
+    assert default_inputs[0]["default"] == "2000"
+
+    # 已经是目标 URL 时不产生 previous == value 的冗余记录。
+    same = [{"id": "n5", "atom": "fake_fetch", "params": {"target_url": "https://example.test/hot"}}]
+    assert param_fill.fill_url_params(same, registry, "https://example.test/hot") == []
+    assert same[0]["params"]["target_url"] == "https://example.test/hot"
 
     missing = [{"id": "n3", "atom": "fake_fetch", "params": {}}]
     assert param_fill.audit_param_gaps(missing, registry)[0]["reason"] == "missing"
+    blank = [{"id": "n6", "atom": "fake_fetch", "params": {"target_url": "   "}}]
+    assert param_fill.audit_param_gaps(blank, registry)[0]["reason"] == "empty"

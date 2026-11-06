@@ -4,7 +4,8 @@
 - 只认**原子声明的输入端口**（``Atom.input_ports()``），凡是必填且端口名带 ``url``
   （``url`` / ``page_url`` / ``target_url`` …）的端口都是目标；
 - 当前值缺失、为空、或**整个值就是一个 ``${env.X}`` 占位符**时，用已解析的 URL 覆盖；
-- 已经是字面量 URL 的端口也会被覆盖并记录（显式 URL 优先于模板默认值）；
+- 已经是字面量 URL 的端口也会被覆盖并记录（显式 URL 优先于模板默认值），
+  但**与目标 URL 相同**时不产生任何记录，避免 ``previous == value`` 的冗余审计；
 - ``${env.BASE_URL}/api/login`` 这类「占位符 + 路径」不覆盖，避免把接口地址改成网页地址；
 - 是否覆盖只看端口契约，不看 ``http_get_page`` / ``web_open`` 等原子名，新增带 url
   端口的原子会自动进入自动填充范围。
@@ -23,6 +24,9 @@ URL_PORT_RE = re.compile(r"(^|_)url$", re.IGNORECASE)
 #: 整个值就是一个环境变量占位符（允许过滤器）。
 ENV_ONLY_RE = re.compile(r"^\s*\$\{env\.[A-Za-z_][A-Za-z0-9_]*(?:\|[^{}]*)?\}\s*$")
 ENV_ANY_RE = re.compile(r"\$\{env\.([A-Za-z_][A-Za-z0-9_]*)")
+#: 占位符里的默认值过滤器，例如 ``${env.MAX_LATENCY_MS|default:2000|int}``。
+#: 带默认值的 env 入参在运行期有可用值，不算参数缺口。
+ENV_DEFAULT_RE = re.compile(r"\|\s*default\s*:\s*([^{}|]*)")
 HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 
 _MISSING = object()
@@ -97,6 +101,10 @@ def fill_url_params(
             current = params.get(param, _MISSING)
             if not should_fill(current):
                 continue
+            # 值已经是目标 URL 时不覆盖、不记录：planner 注入与参数填充同值时
+            # 不应出现 previous == value 的冗余审计项。
+            if current is not _MISSING and isinstance(current, str) and current.strip() == target:
+                continue
             record: dict[str, Any] = {
                 "node_id": str(node.get("id") or ""),
                 "atom": atom_name,
@@ -124,7 +132,12 @@ def _required_gap(node_id: str, atom_name: str, param: str, value: Any) -> dict[
 
 
 def audit_param_gaps(nodes: Iterable[Mapping[str, Any]], registry: Any) -> list[dict[str, Any]]:
-    """必填端口缺失 / 仍是未解析 ``${env.X}`` 的审计清单。"""
+    """只报「必填端口最终为空」的缺口。
+
+    ``${env.X}`` 占位符不是缺口：有 ``|default:`` 的运行期有默认值，没有默认值的
+    也只是需要用户提供环境变量，统一由 :func:`audit_env_inputs` 以 info 形式给出。
+    这样 ``api_testing`` 这类模板不会一次报出一串 ``unresolved_env`` 噪声。
+    """
     gaps: list[dict[str, Any]] = []
     for node in nodes:
         atom_name = str(node.get("atom") or "")
@@ -139,13 +152,58 @@ def audit_param_gaps(nodes: Iterable[Mapping[str, Any]], registry: Any) -> list[
             value = params.get(port.name, _MISSING)
             if value is _MISSING or value is None or (isinstance(value, str) and not value.strip()):
                 gaps.append(_required_gap(str(node.get("id") or ""), atom_name, port.name, value))
-                continue
-            if isinstance(value, str) and (ENV_ONLY_RE.match(value) or ENV_ANY_RE.search(value)):
-                gaps.append(_required_gap(str(node.get("id") or ""), atom_name, port.name, value))
     return gaps
 
 
+def audit_env_inputs(
+    nodes: Iterable[Mapping[str, Any]], registry: Any
+) -> list[dict[str, Any]]:
+    """必填端口里仍是 ``${env.X}`` 的输入清单（不是缺口）。
+
+    记录形如 ``{node_id, atom, param, env, value, status}``：
+
+    - ``status="default"``：占位符带 ``|default:``，运行期有默认值；
+    - ``status="info"``：没有默认值，仅提示需要环境变量。
+    """
+    inputs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for node in nodes:
+        atom_name = str(node.get("atom") or "")
+        if not atom_name or not registry.has(atom_name):
+            continue
+        atom = registry.get(atom_name)
+        params = node.get("params")
+        params = params if isinstance(params, Mapping) else {}
+        node_id = str(node.get("id") or "")
+        for port in atom.input_ports():
+            if not port.required:
+                continue
+            value = params.get(port.name, _MISSING)
+            if not isinstance(value, str):
+                continue
+            default_match = ENV_DEFAULT_RE.search(value)
+            for match in ENV_ANY_RE.finditer(value):
+                env_name = match.group(1)
+                key = (node_id, atom_name, port.name, env_name)
+                if key in seen:
+                    continue
+                seen.add(key)
+                entry: dict[str, Any] = {
+                    "node_id": node_id,
+                    "atom": atom_name,
+                    "param": port.name,
+                    "env": env_name,
+                    "value": value,
+                    "status": "default" if default_match else "info",
+                }
+                if default_match:
+                    entry["default"] = default_match.group(1).strip()
+                inputs.append(entry)
+    return inputs
+
+
 __all__ = [
+    "audit_env_inputs",
     "audit_param_gaps",
     "fill_url_params",
     "is_url_port",

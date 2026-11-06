@@ -482,6 +482,7 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
     analysis = IntentAnalysis(intent=text)
     urls = [match.group(0).rstrip(".,;:!?") for match in URL_RE.finditer(text)]
     analysis.url = urls[0] if urls else ""
+    resolution = None
     if analysis.url:
         # 显式 URL 永远优先；站点别名只在没有显式 URL 时参与解析。
         analysis.url_source = "explicit"
@@ -524,6 +525,13 @@ def analyze_intent(intent: str, *, domain_pack: str = "") -> IntentAnalysis:
         score = len(domain_hits) + len(actions) * 2
         if best is None or score > best[0]:
             best = (score, domain, actions)
+    if best is None and resolution is not None and not domain_pack:
+        # 站点别名也是领域线索：已知站点名天然说明目标是网页。
+        # 只在其他领域都没命中时兜底，避免「百度搜索接口」这类句子被抢到网页域。
+        alias_actions = [
+            action for action, words in _WEB_ACTION_WORDS.items() if _hits(text, words)
+        ]
+        best = (1 + len(alias_actions) * 2, "web_research", alias_actions)
     if best is None and domain_pack:
         # 显式选择领域包时领域词不一定出现（「打开百度网页」没有「浏览器」），
         # 仍要按该包的动作词表识别动作，否则会退化成整包模板乱配。

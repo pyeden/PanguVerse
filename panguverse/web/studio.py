@@ -63,6 +63,8 @@ _URL_KEY_RE = re.compile(
 STATES = ("draft", "review", "approved", "rejected")
 TRANSITIONS = ("review", "approved", "rejected")
 DEBUG_MODES = ("only", "from_start", "downstream")
+#: 站点别名只服务网页域；非网页域不暴露 url，也不改写接口/设备节点参数。
+_WEB_DOMAINS = frozenset({"web_research", "web_browser"})
 MAX_TEXT = 2000
 
 _STATUS_BY_CODE = {
@@ -693,7 +695,12 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
 
     # 生成阶段就做一次「参数可用性」审计：显式 URL / 站点别名解析出的 URL
     # 按原子输入端口自动填入所有带 url 的必填端口，不针对具体原子写特判。
+    # 站点别名只服务网页域：非网页域既不改写节点参数，也不对外暴露误导性的 url 字段。
     analysis = dict(bundle.analysis or {})
+    routed_domain = str(analysis.get("domain") or domain_pack or "")
+    if routed_domain not in _WEB_DOMAINS:
+        for key in ("url", "url_source", "site"):
+            analysis[key] = ""
     resolved_url = str(analysis.get("url") or "").strip()
     url_source = str(analysis.get("url_source") or "")
     autofilled = (
@@ -707,11 +714,13 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         else []
     )
     param_gaps = param_fill.audit_param_gaps(graph["nodes"], _registry())
+    env_inputs = param_fill.audit_env_inputs(graph["nodes"], _registry())
     param_audit = {
         "url": resolved_url,
         "url_source": url_source,
         "autofilled": autofilled,
         "param_gaps": param_gaps,
+        "env_inputs": env_inputs,
     }
 
     wid = new_wid()
@@ -796,11 +805,12 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "confidence": bundle.confidence,
         "assumptions": list(bundle.assumptions),
         "capability_gaps": list(bundle.capability_gaps),
-        "analysis": bundle.analysis,
+        "analysis": analysis,
         "url": resolved_url,
         "url_source": url_source,
         "autofilled": autofilled,
         "param_gaps": param_gaps,
+        "env_inputs": env_inputs,
         "param_audit": param_audit,
         "graph": graph,
         "validation": validation,

@@ -237,6 +237,56 @@ def test_create_draft_autofills_every_url_port(api: WebAPI) -> None:
     assert explicit["url"] == "https://example.com/hot"
     assert explicit["url_source"] == "explicit"
     assert all(item["source"] == "explicit" for item in explicit["autofilled"])
+    # planner 已注入同值时参数层不能重复记录 previous == value。
+    assert all(item.get("previous") != item["value"] for item in explicit["autofilled"])
+
+
+def test_site_alias_participates_in_domain_routing(api: WebAPI) -> None:
+    """站点别名本身就是网页线索：没有网页/网站等词也能路由到 web_research。"""
+    from panguverse.web import planner_gate
+
+    analysis = planner_gate.analyze_intent("打开微博热搜，提取热点新闻")
+    assert analysis.domain == "web_research"
+    assert analysis.url == "https://s.weibo.com/top/summary"
+    assert analysis.url_source == "site_alias"
+    assert {"fetch", "text"} <= set(analysis.actions)
+
+    status, body = call(
+        api, "POST", "/api/studio/drafts", {"intent": "打开微博热搜，提取热点新闻"}
+    )
+    assert status == 201, body
+    assert body["domain_pack"] == "web_research"
+    assert body["url"] == "https://s.weibo.com/top/summary"
+    assert body["url_source"] == "site_alias"
+    assert body["autofilled"], body
+    assert all(item["value"] == body["url"] for item in body["autofilled"])
+    assert body["param_gaps"] == []
+    assert body["validation"]["ok"] is True
+
+
+
+def test_non_web_domain_hides_site_alias_url(api: WebAPI) -> None:
+    """非网页域不对外暴露站点别名 url，也不改写接口节点参数。"""
+    status, body = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "测试百度搜索接口，获取热点新闻列表", "domain_pack": "api_testing"},
+    )
+    assert status == 201, body
+    assert body["domain_pack"] == "api_testing"
+    assert body["url"] == ""
+    assert body["url_source"] == ""
+    assert body["analysis"]["url"] == ""
+    assert body["param_audit"]["url"] == ""
+    assert body["autofilled"] == []
+    assert body["param_gaps"] == []
+    assert body["env_inputs"], body
+    assert {item["status"] for item in body["env_inputs"]} <= {"default", "info"}
+    assert any(item["status"] == "default" for item in body["env_inputs"])
+    for node in body["graph"]["nodes"]:
+        for value in node["params"].values():
+            assert "top.baidu.com" not in str(value)
 
 
 def test_create_draft_autofills_web_browser_url_params(api: WebAPI) -> None:
