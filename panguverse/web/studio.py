@@ -983,6 +983,156 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     }
 
 
+def create_draft_from_graph(
+    root: Path,
+    *,
+    intent: str,
+    name: str,
+    nodes: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+    actor: str = "explore",
+    explore_id: str = "",
+    domain_pack: str = "",
+    pending_atoms: list[dict[str, Any]] | None = None,
+    replay_checks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Persist an explored (already executed) graph as a draft.
+
+    与 :func:`create_draft` 共用同一套落库/版本/审计/校验逻辑，但**不调用规划器**：
+    节点来自真实执行轨迹，参数是观测到的实际值。
+    """
+    clean_intent = _clean_text(intent, field="intent", required=True, limit=500)
+    if not nodes:
+        raise StudioError("bad_request", "探索轨迹没有可固化的原子调用")
+    resolved_name = str(name or clean_intent)[:80]
+    wid = new_wid()
+    now = time.time()
+    env_schema = _env_schema(nodes)
+    assumptions = [f"来源探索：{explore_id}"] if explore_id else []
+    workflow = {
+        "wid": wid,
+        "name": resolved_name,
+        "intent": clean_intent,
+        "domain_pack": domain_pack,
+        "planner": "explore",
+        "plan_source": "explore",
+        "confidence": 1.0,
+        "assumptions": assumptions,
+        "capability_gaps": [],
+        "param_audit": {"url": "", "url_source": "explore", "autofilled": [], "param_gaps": [], "env_inputs": [], "assumptions": assumptions},
+        "state": "draft",
+        "current_rev": 0,
+        "locked": [],
+        "published_ref": "",
+        "env_schema": env_schema,
+        "created_at": now,
+        "updated_at": now,
+        "created_by": actor,
+        "origin": "explore",
+        "explore_id": explore_id,
+        "pending_atoms": list(pending_atoms or []),
+        "replay_checks": list(replay_checks or []),
+        "replay_status": "pending",
+    }
+    revision = {
+        "wid": wid,
+        "rev": 0,
+        "origin": "explore",
+        "created_by": actor,
+        "created_at": now,
+        "message": "探索成功轨迹固化草稿",
+        "base_rev": None,
+        "name": resolved_name,
+        "intent": clean_intent,
+        "domain_pack": domain_pack,
+        "planner": "explore",
+        "plan_source": "explore",
+        "confidence": 1.0,
+        "assumptions": assumptions,
+        "capability_gaps": [],
+        "param_audit": workflow["param_audit"],
+        "env_schema": env_schema,
+        "explore_id": explore_id,
+        "nodes": copy.deepcopy(nodes),
+        "edges": copy.deepcopy(edges),
+    }
+    _write_revision(root, wid, revision)
+    _write_workflow(root, wid, workflow)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "draft_created",
+            "actor": actor,
+            "wid": wid,
+            "from": None,
+            "to": "draft",
+            "rev": 0,
+            "origin": "explore",
+            "note": f"探索 {explore_id} 固化；节点 {len(nodes)}；待封装脚本 {len(pending_atoms or [])}",
+        },
+    )
+    validation = validate_nodes(
+        root,
+        wid=wid,
+        rev=0,
+        nodes=nodes,
+        edges=edges,
+        intent=clean_intent,
+        env_schema=env_schema,
+        assumptions=assumptions,
+        available_env=None,
+        domain_pack=domain_pack,
+    )
+    return {
+        "wid": wid,
+        "rev": 0,
+        "state": "draft",
+        "origin": "explore",
+        "explore_id": explore_id,
+        "nodes": nodes,
+        "edges": edges,
+        "pending_atoms": list(pending_atoms or []),
+        "validation": validation,
+        "replay_status": "pending",
+    }
+
+
+def record_replay(
+    root: Path, wid: str, replay: Mapping[str, Any], *, actor: str = "explore"
+) -> dict[str, Any]:
+    """记录固化后的无 LLM 重放结果；失败时发布门禁拒绝。"""
+    workflow = read_workflow(root, wid)
+    status = "replay_passed" if str(replay.get("status")) == "passed" else "replay_failed"
+    workflow["replay_status"] = status
+    workflow["replay"] = {
+        "status": replay.get("status"),
+        "checks": replay.get("checks") or [],
+        "errors": replay.get("errors") or [],
+        "duration_ms": replay.get("duration_ms"),
+        "at": time.time(),
+    }
+    workflow["updated_at"] = time.time()
+    _write_workflow(root, wid, workflow)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "explore_replay",
+            "actor": actor,
+            "wid": wid,
+            "rev": int(workflow.get("current_rev") or 0),
+            "origin": "explore",
+            "note": f"无 LLM 重放：{status}",
+        },
+    )
+    return {
+        "wid": wid,
+        "rev": int(workflow.get("current_rev") or 0),
+        "state": workflow.get("state"),
+        "replay_status": status,
+        "replay": workflow["replay"],
+    }
+
+
 def list_drafts(
     root: Path, *, status: str | None = None, domain_pack: str | None = None
 ) -> dict[str, Any]:
@@ -1063,6 +1213,10 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
         "current_rev": workflow.get("current_rev"),
         "rev": target_rev,
         "origin": revision.get("origin"),
+        "explore_id": workflow.get("explore_id") or revision.get("explore_id") or "",
+        "pending_atoms": list(workflow.get("pending_atoms") or []),
+        "replay_status": workflow.get("replay_status") or "",
+        "replay": dict(workflow.get("replay") or {}),
         "created_by": revision.get("created_by"),
         "created_at": revision.get("created_at"),
         "message": revision.get("message"),
@@ -1841,6 +1995,13 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
     rev = _as_rev(data.get("rev"))
     message = _clean_text(data.get("message"), field="message", required=True)
     workflow = read_workflow(root, wid)
+    if workflow.get("origin") == "explore" and workflow.get("replay_status") == "replay_failed":
+        raise StudioError(
+            "replay_failed",
+            "固化流程无 LLM 重放未通过，不能发布",
+            status=409,
+            details={"replay": workflow.get("replay") or {}},
+        )
     if workflow.get("state") != "approved":
         raise StudioError("not_approved", "只有 approved 状态的工作流才能发布")
     if rev != int(workflow.get("current_rev") or 0):
@@ -2742,6 +2903,7 @@ __all__ = [
     "apply_diff",
     "audit_tail",
     "create_draft",
+    "create_draft_from_graph",
     "debug_workflow",
     "get_debug_session",
     "get_workflow",
@@ -2751,6 +2913,7 @@ __all__ = [
     "publish",
     "read_revision",
     "read_workflow",
+    "record_replay",
     "replan",
     "review",
     "transition_state",

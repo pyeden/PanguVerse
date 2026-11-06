@@ -16,7 +16,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
 from ..report import html_report, junit
-from . import artifacts, executions, reports, schedules, service, studio, triggers
+from . import artifacts, executions, explore, reports, schedules, service, studio, triggers
 from .artifacts import ArtifactError
 from .auth import AuthManager, build_cookie
 from .batches import BatchManager
@@ -116,6 +116,8 @@ class WebAPI:
         auth: AuthManager | None = None,
         insight_llm: Any = None,
         batches: BatchManager | None = None,
+        explore_llm: Any = None,
+        explore_registry: Any = None,
     ) -> None:
         self.root = service.resolve_workspace(workspace)
         self.jobs = jobs or JobManager()
@@ -132,6 +134,9 @@ class WebAPI:
         self.auth = auth
         #: 注入用的 LLM client（A44 假 client）；``None`` = 按环境变量自动判定
         self.insight_llm = insight_llm
+        #: explore-first：注入假 LLM/原子库用于测试；None = 按环境/默认原子库
+        self.explore_llm = explore_llm
+        self.explore_registry = explore_registry
         #: 调度线程（单进程）：只在 ``serve`` 里 start/stop；测试可手动调用
         self.scheduler = schedules.Scheduler(self.root, self.jobs, self.batches)
 
@@ -639,6 +644,56 @@ class WebAPI:
         if not rest:
             raise ApiError("not_found", "接口不存在")
         actor = self._actor(headers)
+
+        # explore-first：POST /api/studio/explore + 会话/产物/固化路由
+        if rest[0] == "explore":
+            if len(rest) == 1:
+                if method == "POST":
+                    started = explore.start_explore(
+                        self.root,
+                        body,
+                        actor=actor,
+                        llm=self.explore_llm,
+                        registry=self.explore_registry,
+                    )
+                    return json_response(started, status=202)
+                if method == "GET":
+                    return json_response(
+                        explore.list_sessions(
+                            self.root,
+                            limit=_int_query(query, "limit", 50, maximum=200),
+                        )
+                    )
+            if len(rest) == 2 and method == "GET":
+                return json_response(
+                    explore.get_session(
+                        self.root, rest[1], cursor=_cursor_query(query, "cursor", 0)
+                    )
+                )
+            if len(rest) == 3 and rest[2] == "artifact" and method == "GET":
+                data, content_type, filename = explore.read_artifact(
+                    self.root, rest[1], _first(query, "path") or ""
+                )
+                return Response(
+                    status=200,
+                    body=data,
+                    content_type=content_type,
+                    headers={
+                        "Cache-Control": "no-store",
+                        "Content-Disposition": f'inline; filename="{filename}"',
+                    },
+                )
+            if len(rest) == 3 and rest[2] == "crystallize" and method == "POST":
+                return json_response(
+                    explore.crystallize(
+                        self.root,
+                        rest[1],
+                        body,
+                        actor=actor,
+                        registry=self.explore_registry,
+                    )
+                )
+            raise ApiError("not_found", "接口不存在")
 
         # GET /api/studio/debug/{session_id}?cursor= —— 增量读取异步调试会话
         if rest[0] == "debug":
