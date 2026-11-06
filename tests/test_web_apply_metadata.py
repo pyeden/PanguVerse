@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 
-from panguverse.web import studio
 from panguverse.web.api import WebAPI
 
 WEB_INTENT = "打开百度网站，提取今天的热点新闻"
