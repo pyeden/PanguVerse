@@ -330,6 +330,8 @@ def _run_session(
             emit=writer.append,
             allow_scripts=bool(meta.get("allow_scripts")),
             max_steps=int(meta.get("max_steps") or 12),
+            intent=str(meta.get("intent") or ""),
+            domain_pack=str(meta.get("domain_pack") or ""),
         )
         agent.run(str(meta.get("intent") or ""), meta.get("criteria") or [])
     except agent_exec.AgentExecError as exc:
@@ -500,6 +502,8 @@ def crystallize(
             intent=str(meta.get("intent") or ""),
             checks=agent_exec.checks_from_success(success),
             name=str(data.get("name") or ""),
+            domain_pack=str(meta.get("domain_pack") or ""),
+            registry=registry,
         )
     except agent_exec.AgentExecError as exc:
         raise StudioError(exc.code, exc.message, status=exc.status, details=exc.details) from exc
@@ -536,6 +540,8 @@ def crystallize(
         "explore_id": eid,
         "atoms_created": [],
         "pending_atoms": graph["pending_atoms"],
+        "out_of_scope": graph.get("out_of_scope") or [],
+        "route": graph.get("route") or "",
         "replay": replay,
         "validation": draft.get("validation") or {},
         "graph": {"nodes": graph["nodes"], "edges": graph["edges"]},

@@ -420,6 +420,75 @@ def test_explore_script_path_traversal_is_rejected(tmp_path: Path, hot_server: s
     assert not (tmp_path / "ws" / ".panguverse" / "escape.py").exists()
 
 
+def test_tool_catalog_narrows_scope_by_intent() -> None:
+    from panguverse.axe.agent_exec import tool_catalog_for_intent
+    from panguverse.core.registry import default_registry
+
+    registry = default_registry()
+    web_names = {
+        item["name"]
+        for item in tool_catalog_for_intent(
+            registry, "打开百度网站，提取今天的热点新闻", allow_scripts=True
+        )
+    }
+    assert "web_open" in web_names
+    assert "http_request" in web_names
+    assert "fs_write_text" in web_names
+    assert "android_devices" not in web_names
+    assert "ios_sim_list" not in web_names
+
+    api_names = {
+        item["name"]
+        for item in tool_catalog_for_intent(
+            registry, "测试接口健康检查", domain_pack="api_testing", allow_scripts=True
+        )
+    }
+    assert "http_request" in api_names
+    assert "assert_json" in api_names
+    assert "fs_write_text" in api_names
+    assert "web_open" not in api_names
+    assert "android_devices" not in api_names
+
+
+def test_crystallize_filters_out_of_scope_atoms() -> None:
+    from panguverse.axe.agent_exec import build_crystallized_graph
+    from panguverse.core.registry import default_registry
+
+    events = [
+        {
+            "seq": 1,
+            "type": "tool_call",
+            "tool": "android_devices",
+            "params": {},
+        },
+        {"seq": 2, "type": "tool_result", "tool": "android_devices", "ok": True, "digest": {}},
+        {
+            "seq": 3,
+            "type": "tool_call",
+            "tool": "http_request",
+            "params": {"url": "https://top.baidu.com/board?tab=realtime", "method": "GET"},
+        },
+        {"seq": 4, "type": "tool_result", "tool": "http_request", "ok": True, "digest": {"status_code": 200}},
+    ]
+    graph = build_crystallized_graph(
+        events,
+        eid="e-12345678",
+        intent="打开百度网站，提取今天的热点新闻",
+        checks=[
+            {"id": "status", "type": "status_code", "equals": 200, "step": 1},
+            {"id": "hot", "type": "text_contains", "value": "热搜", "step": 2},
+        ],
+        registry=default_registry(),
+    )
+    assert [node["atom"] for node in graph["nodes"]] == ["http_request"]
+    assert graph["nodes"][0]["params"]["url"] == "https://top.baidu.com/board?tab=realtime"
+    assert [item["name"] for item in graph["out_of_scope"]] == ["android_devices"]
+    assert any(
+        item.get("status") == "out_of_scope" and item.get("name") == "android_devices"
+        for item in graph["pending_atoms"]
+    )
+
+
 def test_crystallize_keeps_script_steps_as_pending_atoms() -> None:
     events = [
         {"seq": 1, "type": "tool_call", "tool": "web_open", "params": {"url": "http://x"}},
@@ -447,6 +516,7 @@ def test_crystallize_keeps_script_steps_as_pending_atoms() -> None:
             "code_sha256": "a" * 64,
             "exit_code": 0,
             "status": "pending",
+            "kind": "script",
             "reason": "P0 只固化已有原子，脚本步骤待 P1 封装",
             "trace_seq": 3,
         }

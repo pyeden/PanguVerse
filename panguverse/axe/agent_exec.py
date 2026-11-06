@@ -97,8 +97,16 @@ def tool_entry_from_atom(atom: Any) -> dict[str, Any]:
     }
 
 
-def build_tool_catalog(registry: Any, *, allow_scripts: bool = True) -> list[dict[str, Any]]:
-    """Tool catalog = registry atoms + built-in exploration tools."""
+def build_tool_catalog(
+    registry: Any,
+    *,
+    allow_scripts: bool = True,
+    allowed_names: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    """Tool catalog = registry atoms + built-in exploration tools.
+
+    ``allowed_names`` 非空时只暴露这些原子（用于按意图/领域收窄）。
+    """
     catalog: list[dict[str, Any]] = []
     try:
         atoms = list(registry.list())
@@ -106,8 +114,11 @@ def build_tool_catalog(registry: Any, *, allow_scripts: bool = True) -> list[dic
         atoms = list(registry or [])
     for atom in atoms:
         entry = tool_entry_from_atom(atom)
-        if entry["name"]:
-            catalog.append(entry)
+        if not entry["name"]:
+            continue
+        if allowed_names is not None and entry["name"] not in allowed_names:
+            continue
+        catalog.append(entry)
     catalog.append(
         {
             "name": "artifact_read",
@@ -130,6 +141,76 @@ def build_tool_catalog(registry: Any, *, allow_scripts: bool = True) -> list[dic
             }
         )
     return catalog
+
+
+WEB_ROUTES = frozenset({"web_browser", "web_research"})
+API_ROUTES = frozenset({"api_testing", "api"})
+DEVICE_ROUTES = frozenset({"android_adb", "ios_sim"})
+CORE_DOMAINS = frozenset({"core"})
+FS_DOMAINS = frozenset({"filesystem"})
+
+
+def route_analysis(intent: str, domain_pack: str = "") -> Any:
+    """用 planner_gate 的领域路由（尊重显式 domain_pack）分析意图。"""
+    try:
+        from ..web.planner_gate import analyze_intent
+
+        return analyze_intent(str(intent or ""), domain_pack=str(domain_pack or ""))
+    except Exception:  # noqa: BLE001 - 路由失败时退回「非设备域」保守目录
+        return None
+
+
+def _route_atom_domains(analysis: Any) -> set[str] | None:
+    route = str(getattr(analysis, "domain", "") or "")
+    if route in DEVICE_ROUTES:
+        return {route}
+    if route in API_ROUTES:
+        return {"api"}
+    if route in WEB_ROUTES:
+        return {"web_browser", "web_research"}
+    if route in CORE_DOMAINS | FS_DOMAINS:
+        return {route}
+    if route:
+        return {route}
+    return None
+
+
+def allowed_atom_names(registry: Any, analysis: Any) -> set[str] | None:
+    """按路由域收窄原子：路由域 + core + local_fs；设备域仅设备意图可见。"""
+    domains = _route_atom_domains(analysis)
+    names: set[str] = set()
+    for atom in list(getattr(registry, "list", lambda: [])() or []):
+        name = str(getattr(atom, "name", "") or "")
+        domain = str(getattr(atom, "domain", "") or "")
+        if not name:
+            continue
+        if domains is None:
+            # 没有明确路由：只排除设备域，避免网页任务误用 android/ios。
+            if domain in DEVICE_ROUTES:
+                continue
+            names.add(name)
+            continue
+        if domain in domains or domain in CORE_DOMAINS or domain in FS_DOMAINS:
+            names.add(name)
+        # 网页任务需要通用 HTTP 能力；只放行 http_request，不暴露 api_testing 的断言/提取原子。
+        elif domains & WEB_ROUTES and name == "http_request":
+            names.add(name)
+    return names
+
+
+def tool_catalog_for_intent(
+    registry: Any,
+    intent: str,
+    *,
+    domain_pack: str = "",
+    allow_scripts: bool = True,
+) -> list[dict[str, Any]]:
+    analysis = route_analysis(intent, domain_pack)
+    return build_tool_catalog(
+        registry,
+        allow_scripts=allow_scripts,
+        allowed_names=allowed_atom_names(registry, analysis),
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -516,6 +597,8 @@ class ExploreAgent:
         max_steps: int = 12,
         total_timeout: float = 300.0,
         clock: Callable[[], float] = time.monotonic,
+        intent: str = "",
+        domain_pack: str = "",
     ) -> None:
         self.sandbox = Path(sandbox)
         self.registry = registry
@@ -525,7 +608,14 @@ class ExploreAgent:
         self.max_steps = max(1, min(50, int(max_steps)))
         self.total_timeout = max(1.0, float(total_timeout))
         self.clock = clock
-        self.catalog = build_tool_catalog(registry, allow_scripts=allow_scripts)
+        self.intent = str(intent or "")
+        self.domain_pack = str(domain_pack or "")
+        self.catalog = tool_catalog_for_intent(
+            registry,
+            self.intent,
+            domain_pack=self.domain_pack,
+            allow_scripts=allow_scripts,
+        )
         self.tool_names = {entry["name"] for entry in self.catalog}
         self.observations: list[dict[str, Any]] = []
         self.scripts: list[dict[str, Any]] = []
@@ -544,6 +634,15 @@ class ExploreAgent:
                 "未配置时不做假执行",
                 status=503,
             )
+        if str(intent or "") != self.intent:
+            self.intent = str(intent or "")
+            self.catalog = tool_catalog_for_intent(
+                self.registry,
+                self.intent,
+                domain_pack=self.domain_pack,
+                allow_scripts=self.allow_scripts,
+            )
+            self.tool_names = {entry["name"] for entry in self.catalog}
         checks_spec = normalize_checks(success_criteria)
         feedback = ""
         saw_final = False
@@ -1024,8 +1123,10 @@ def build_crystallized_graph(
     intent: str,
     checks: list[dict[str, Any]],
     name: str = "",
+    domain_pack: str = "",
+    registry: Any = None,
 ) -> dict[str, Any]:
-    """Turn a successful trace into graph nodes/edges plus pending scripts."""
+    """Turn a successful trace into graph nodes/edges plus pending/out-of-scope steps."""
     calls: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     scripts: list[dict[str, Any]] = []
@@ -1053,21 +1154,51 @@ def build_crystallized_graph(
     if not successful:
         raise AgentExecError("bad_request", "探索轨迹没有成功的原子调用可固化")
 
+    analysis = route_analysis(intent, domain_pack) if registry is not None else None
+    allowed = allowed_atom_names(registry, analysis) if registry is not None else None
+    route = str(getattr(analysis, "domain", "") or "") if analysis is not None else ""
+    kept: list[tuple[int, dict[str, Any]]] = []
+    out_of_scope: list[dict[str, Any]] = []
+    for order, call in enumerate(successful, 1):
+        if allowed is None or call["tool"] in allowed:
+            kept.append((order, call))
+            continue
+        out_of_scope.append(
+            {
+                "name": call["tool"],
+                "path": "",
+                "status": "out_of_scope",
+                "kind": "out_of_scope",
+                "reason": (
+                    f"原子 {call['tool']} 不属于路由域 {route or '未知'}"
+                    "（仅保留路由域 + core + local_fs），已排除出画布"
+                ),
+                "trace_seq": call["seq"],
+                "params": call["actual_params"],
+            }
+        )
+    if not kept:
+        raise AgentExecError(
+            "bad_request",
+            f"轨迹中的原子均不属于路由域 {route or '未知'}，没有可固化节点",
+        )
+
     call_order = {call["seq"]: index for index, call in enumerate(successful, 1)}
-    order_to_node: dict[int, str] = {
-        index: f"s{index}_{re.sub(r'[^A-Za-z0-9_]+', '_', call['tool'])}"
-        for index, call in enumerate(successful, 1)
+    order_to_node = {
+        order: f"s{new_index}_{re.sub(r'[^A-Za-z0-9_]+', '_', call['tool'])}"
+        for new_index, (order, call) in enumerate(kept, 1)
     }
-    seq_to_node = {call["seq"]: order_to_node[i] for i, call in enumerate(successful, 1)}
+    seq_to_node = {call["seq"]: order_to_node[order] for order, call in kept}
+    calls_by_node = {order_to_node[order]: call for order, call in kept}
     nodes: list[dict[str, Any]] = []
-    for index, call in enumerate(successful, 1):
-        node_id = order_to_node[index]
+    for new_index, (order, call) in enumerate(kept, 1):
+        node_id = order_to_node[order]
         nodes.append(
             {
                 "id": node_id,
                 "atom": call["tool"],
                 "name": call["tool"],
-                "description": f"来自探索 {eid} 第 {index} 步（trace seq={call['seq']}）",
+                "description": f"来自探索 {eid} 第 {new_index} 步（trace seq={call['seq']}）",
                 "params": {},
                 "capture": {},
                 "when": None,
@@ -1089,8 +1220,8 @@ def build_crystallized_graph(
     # must be attached to their producer node before templates are built.
     captures_by_node: dict[str, dict[str, Any]] = {node["id"]: node["capture"] for node in nodes}
     node_by_id = {node["id"]: node for node in nodes}
-    for index, call in enumerate(successful, 1):
-        node_id = order_to_node[index]
+    for node in nodes:
+        call = calls_by_node[node["id"]]
         params = {}
         for key, value in call["params"].items():
             params[key] = _crystallize_param(
@@ -1098,10 +1229,10 @@ def build_crystallized_graph(
                 nodes_by_seq=seq_to_node,
                 order_to_node=order_to_node,
                 capture_by_node=captures_by_node,
-                captures=node_by_id[node_id]["capture"],
-                current_node=node_id,
+                captures=node["capture"],
+                current_node=node["id"],
             )
-        node_by_id[node_id]["params"] = params
+        node["params"] = params
 
     edges: list[dict[str, Any]] = []
     for left, right in zip(nodes, nodes[1:]):
@@ -1130,31 +1261,39 @@ def build_crystallized_graph(
         artifact = str(item.get("artifact") or "")
         match = _ARTIFACT_SEQ_RE.match(artifact)
         if match:
-            node_id = call_order.get(int(match.group(1)))
+            original_order = call_order.get(int(match.group(1)))
+            node_id = order_to_node.get(original_order) if original_order else None
             if node_id:
-                item["step_id"] = order_to_node[node_id]
+                item["step_id"] = node_id
         replay_checks.append(item)
 
-    pending_atoms = [
-        {
-            "name": re.sub(r"[^A-Za-z0-9_]+", "_", Path(str(item.get("path") or "script")).stem),
-            "path": str(item.get("path") or ""),
-            "code_sha256": str(item.get("code_sha256") or ""),
-            "exit_code": item.get("exit_code"),
-            "status": "pending",
-            "reason": "P0 只固化已有原子，脚本步骤待 P1 封装",
-            "trace_seq": item.get("seq"),
-        }
-        for item in scripts
-    ]
+    pending_atoms: list[dict[str, Any]] = []
+    for item in scripts:
+        pending_atoms.append(
+            {
+                "name": re.sub(
+                    r"[^A-Za-z0-9_]+", "_", Path(str(item.get("path") or "script")).stem
+                ),
+                "path": str(item.get("path") or ""),
+                "code_sha256": str(item.get("code_sha256") or ""),
+                "exit_code": item.get("exit_code"),
+                "status": "pending",
+                "kind": "script",
+                "reason": "P0 只固化已有原子，脚本步骤待 P1 封装",
+                "trace_seq": item.get("seq"),
+            }
+        )
+    pending_atoms.extend(out_of_scope)
     return {
         "nodes": nodes,
         "edges": edges,
         "checks": replay_checks,
         "pending_atoms": pending_atoms,
+        "out_of_scope": out_of_scope,
         "scripts": scripts,
         "intent": intent,
         "name": name or intent,
+        "route": route,
     }
 
 
