@@ -212,12 +212,12 @@ export function RunDetailPage() {
             ) : null}
           </section>
 
-          <section className="panel run-artifacts-panel">
+          <section className="panel run-artifacts-panel" data-testid="run-artifacts-panel">
             <SectionHeader
               title="产出物"
               description="本次运行交付的结果；收藏在产出物页，可下载或生成只读分享链接。"
               icon="archive"
-              actions={<a className="inline-link" href={href(withQuery('/artifacts', { run: rid }))}>全部产出物 <Icon name="arrow" size={12} /></a>}
+              actions={<a className="inline-link" data-testid="run-artifacts-link" href={href(withQuery('/artifacts', { run: rid }))}>全部产出物 <Icon name="arrow" size={12} /></a>}
             />
             {runArtifactsQuery.isLoading ? <Loading label="正在读取产出物…" /> : null}
             {runArtifactsQuery.error ? (
@@ -233,19 +233,33 @@ export function RunDetailPage() {
               </div>
             ) : null}
             {!runArtifactsQuery.isLoading && !runArtifactsQuery.error && !(runArtifactsQuery.data?.items || []).length && !artifactWarning ? (
-              <div className="run-artifact-empty"><Icon name="archive" size={18} /><span>本次运行没有产出物。节点声明 <code>produces</code> 后才会收集。</span></div>
+              <div className="run-artifact-empty" data-testid="run-artifact-empty">
+                <Icon name="archive" size={18} />
+                <span>本次运行没有可登记的产出物（report.html/report.json/junit.xml/plan.json）</span>
+              </div>
             ) : null}
             {(runArtifactsQuery.data?.items || []).length ? (
               <div className="run-artifact-list">
                 {(runArtifactsQuery.data?.items || []).map((artifact) => (
-                  <a className="run-artifact-row" key={artifact.artifact_id} href={href(withQuery('/artifacts', { run: rid, focus: artifact.artifact_id }))}>
-                    <span className="run-artifact-type"><Icon name={artifact.type === 'image' ? 'eye' : artifact.type === 'markdown' ? 'report' : 'file'} size={15} /></span>
-                    <span className="run-artifact-copy">
-                      <strong>{artifact.name}</strong>
-                      <small><Badge tone="neutral">{artifact.type}</Badge> {formatBytes(artifact.bytes)} · {artifact.node_id || 'unknown'} · {formatTime(artifact.created_at)}</small>
-                    </span>
-                    <Icon name="arrow" size={14} />
-                  </a>
+                  <div className="run-artifact-row" key={artifact.artifact_id} data-testid={`run-artifact-item-${artifact.artifact_id}`} data-run-id={rid}>
+                    <a className="run-artifact-main" href={href(withQuery('/artifacts', { run: rid, focus: artifact.artifact_id }))}>
+                      <span className="run-artifact-type"><Icon name={artifact.type === 'image' ? 'eye' : artifact.type === 'markdown' ? 'report' : 'file'} size={15} /></span>
+                      <span className="run-artifact-copy">
+                        <strong>{artifact.name}</strong>
+                        <small><Badge tone="neutral">{artifact.type}</Badge> {formatBytes(artifact.bytes)} · {artifact.node_id || 'unknown'} · {formatTime(artifact.created_at)}</small>
+                      </span>
+                      <Icon name="arrow" size={14} />
+                    </a>
+                    <a
+                      className="btn btn-ghost btn-sm run-artifact-download"
+                      href={api.artifactDownloadUrl(artifact.artifact_id)}
+                      download={artifact.name}
+                      aria-label={`下载 ${artifact.name}`}
+                      data-testid={`run-artifact-download-${artifact.artifact_id}`}
+                    >
+                      <Icon name="download" size={14} /><span>下载</span>
+                    </a>
+                  </div>
                 ))}
               </div>
             ) : null}

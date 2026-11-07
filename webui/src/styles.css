@@ -2461,3 +2461,14 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
   .explore-criterion .input, .explore-criterion .mono { grid-column: 2 / -1; }
   .explore-summary > div { flex: 1 1 120px; justify-content: space-between; }
 }
+
+/* ── 产出物入口：运行详情 / 报告 / 执行账本 ─────────────────────────── */
+.run-artifact-main { display: flex; align-items: center; gap: 9px; flex: 1; min-width: 0; color: inherit; }
+.run-artifact-main:hover strong { text-decoration: underline; }
+.run-artifact-download { flex: 0 0 auto; }
+.report-artifacts-entry { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px; background: rgba(151, 174, 212, .03); }
+.report-artifacts-entry > div { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.report-artifacts-entry strong { font-size: 10px; }
+.report-artifacts-entry span { color: var(--dim); font-size: 9px; }
+.run-artifacts-mini { display: inline-flex; align-items: center; gap: 3px; margin-top: 3px; color: var(--dim); font-size: 8.5px; }
+.run-artifacts-mini:hover { color: var(--cyan); }

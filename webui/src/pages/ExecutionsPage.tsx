@@ -460,6 +460,7 @@ function ExecutionRow({ execution, onOpen, onCancel }: { execution: Execution; o
       <td data-label="开始时间"><span className="nowrap muted">{relativeTime(execution.started_at || execution.created_at)}</span></td>
       <td className="execution-actions-col">
         <div className="row-actions">
+          {execution.run_id ? <a className="btn btn-ghost btn-sm" data-testid="execution-artifacts-link" data-run-id={execution.run_id} href={href(withQuery('/artifacts', { run: execution.run_id }))}><Icon name="archive" size={13} />产出物</a> : null}
           {execution.run_id ? <a className="btn btn-ghost btn-sm" href={href(execution.project_id ? `/p/${execution.project_id}/runs/${execution.run_id}` : `/history?focus=${execution.run_id}`)}>报告</a> : null}
           <Button size="sm" variant="ghost" onClick={onOpen}>详情</Button>
           {execution.cancellable ? <Button size="sm" variant="danger" icon="close" onClick={onCancel} data-testid={`cancel-execution-${execution.eid || execution.run_id || execution.job_id}`}>取消</Button> : null}

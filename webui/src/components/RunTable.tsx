@@ -1,7 +1,7 @@
 import { Icon } from './Icon'
 import { Badge, EmptyState, StatusBadge } from './ui'
 import { formatDuration, relativeTime, runCounts, runWhen, shortId, statusOf } from '../shared/utils'
-import { href } from '../shared/router'
+import { href, withQuery } from '../shared/router'
 import type { Project, RunSummary } from '../shared/types'
 
 export function RunTable({
@@ -70,6 +70,11 @@ export function RunTable({
                 </td>
                 <td data-label="执行">
                   <a className="mono run-id-link" href={runHref}>{shortId(run.run_id, 12)}</a>
+                  {run.run_id ? (
+                    <a className="run-artifacts-mini" data-testid="run-artifacts-link" data-run-id={run.run_id} href={href(withQuery('/artifacts', { run: run.run_id }))} aria-label={`查看执行 ${run.run_id} 的产出物`}>
+                      <Icon name="archive" size={11} />产出物
+                    </a>
+                  ) : null}
                 </td>
                 <td data-label="结果"><span className="mono">{counts.total ? `${counts.passed}/${counts.total}` : '—'}</span></td>
                 <td data-label="耗时"><span className="mono nowrap">{formatDuration(run.duration_ms)}</span></td>

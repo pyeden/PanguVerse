@@ -72,6 +72,14 @@ export function ReportsPage() {
   const projectsQuery = useQuery({ queryKey: ['projects', 'with-archived'], queryFn: () => api.projects(true) })
   const selectedReport = (reportsQuery.data?.reports || []).find((item) => item.run_id === selectedId)
   const insightQuery = useQuery({ queryKey: ['insight', selectedId], queryFn: () => api.insight(selectedId), enabled: !!selectedId })
+  // 产出物数量只是附加信息：接口未就绪 / 读取失败时静默降级为「直接查看」。
+  const reportArtifactsQuery = useQuery({
+    queryKey: ['report-artifacts', selectedId],
+    queryFn: () => api.artifacts(new URLSearchParams({ run: selectedId, limit: '1' })),
+    enabled: !!selectedId,
+    retry: false,
+  })
+  const reportArtifactCount = reportArtifactsQuery.error ? null : reportArtifactsQuery.data?.total ?? null
   const generate = useMutation({
     mutationFn: () => api.generateInsight(selectedId, true),
     onSuccess: async () => {
@@ -278,6 +286,14 @@ export function ReportsPage() {
               <div><span>AI 总结</span><strong>{selectedReport.has_insight ? (selectedReport.insight_source || '缓存') : '未生成'}</strong></div>
             </div>
             <Progress value={selectedReport.total ? ((selectedReport.passed || 0) / selectedReport.total) * 100 : 0} tone={selectedStatus === 'passed' ? 'ok' : 'bad'} />
+            <div className="report-artifacts-entry" data-testid="report-artifacts-entry">
+              <div>
+                <Icon name="archive" size={16} />
+                <strong>产出物</strong>
+                <span>{reportArtifactsQuery.isLoading ? '正在统计…' : reportArtifactCount === null ? '统计不可用，可直接查看' : reportArtifactCount ? `已登记 ${reportArtifactCount} 项` : '暂无已登记产出物'}</span>
+              </div>
+              <a className="btn btn-ghost btn-sm" data-testid="report-artifacts-link-detail" data-run-id={selectedId} href={href(withQuery('/artifacts', { run: selectedId }))}>查看产出物 <Icon name="arrow" size={13} /></a>
+            </div>
             <SignatureBlock report={selectedReport} />
             {!selectedReport.voided ? (
               <div className="report-detail-actions">
@@ -462,6 +478,7 @@ function ReportCard({ report, projects, onOpen, onSign, onVoid }: { report: Repo
       <div className="report-card-foot">
         <span className="muted">{report.voided_at ? `作废于 ${relativeTime(report.voided_at)}` : report.signed_at ? `签署于 ${relativeTime(report.signed_at)}` : '等待人工签署'}</span>
         <div className="row-actions">
+          <a className="btn btn-ghost btn-sm" data-testid="report-artifacts-link" data-run-id={report.run_id} href={href(withQuery('/artifacts', { run: report.run_id }))}><Icon name="archive" size={13} />产出物</a>
           <Button size="sm" variant="ghost" icon="eye" onClick={onOpen}>预览</Button>
           {!report.voided ? <Button size="sm" variant="ghost" icon={report.signed ? 'refresh' : 'edit'} onClick={onSign} data-testid={`sign-report-${report.run_id}`}>{report.signed ? '重签' : '签署'}</Button> : null}
           {!report.voided ? <Button size="sm" variant="ghost" icon="trash" onClick={onVoid} data-testid={`void-report-${report.run_id}`}>作废</Button> : null}
