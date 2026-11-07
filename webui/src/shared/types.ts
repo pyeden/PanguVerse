@@ -256,6 +256,13 @@ export interface Artifact {
   project_id?: string
   name: string
   type: 'markdown' | 'image' | 'json' | 'xml' | 'text' | 'file' | string
+  /** 平台运行报告（report）与任务交付物（deliverable）。旧数据可能缺失。 */
+  kind?: 'report' | 'deliverable' | string
+  /** 任务内部相对路径；旧 manifest 可能只有 file。 */
+  path?: string
+  file?: string
+  step_id?: string
+  case_id?: string
   bytes: number
   sha256?: string
   node_id?: string

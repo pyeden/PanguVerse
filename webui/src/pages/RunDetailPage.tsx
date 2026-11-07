@@ -16,7 +16,9 @@ import {
   statusOf,
   classForStatus,
 } from '../shared/utils'
-import type { AnyRecord } from '../shared/types'
+import type { AnyRecord, Artifact } from '../shared/types'
+import { artifactHint, splitArtifacts } from '../shared/artifacts'
+import { ArtifactPreviewModal } from '../components/ArtifactPreview'
 import { Icon } from '../components/Icon'
 import {
   Badge,
@@ -51,6 +53,7 @@ export function RunDetailPage() {
   const [saveOpen, setSaveOpen] = useState(false)
   const [taskName, setTaskName] = useState('')
   const [rerunOpen, setRerunOpen] = useState(false)
+  const [previewArtifactId, setPreviewArtifactId] = useState('')
 
   const runQuery = useQuery({ queryKey: ['run', rid], queryFn: () => api.run(rid), enabled: !!rid })
   const insightQuery = useQuery({ queryKey: ['insight', rid], queryFn: () => api.insight(rid), enabled: !!rid })
@@ -122,6 +125,50 @@ export function RunDetailPage() {
   // 后端 warning detail 可能仍以「本次运行没有产出物」开头；收集失败不是「没有声明产出」，
   // 报告页统一去掉这个误导前缀，只保留真正的失败原因。
   const cleanPhaseDetail = (detail?: string) => (detail || '').replace(/^本次运行没有产出物[；;]\s*/, '')
+  const runArtifacts: Artifact[] = runArtifactsQuery.data?.items || []
+  const { reports: reportArtifacts, deliverables: taskOutputs } = splitArtifacts(runArtifacts)
+  const artifactsSettled = !runArtifactsQuery.isLoading && !runArtifactsQuery.error
+
+  const renderArtifactRow = (artifact: Artifact, kind: 'report' | 'deliverable') => (
+    <div
+      className={`run-artifact-row is-${kind}`}
+      key={artifact.artifact_id}
+      data-testid={`run-artifact-item-${artifact.artifact_id}`}
+      data-run-id={rid}
+      data-artifact-kind={kind}
+    >
+      <button
+        type="button"
+        className="run-artifact-main"
+        onClick={() => setPreviewArtifactId(artifact.artifact_id)}
+        aria-label={`预览 ${artifact.name}`}
+        data-testid={`run-artifact-preview-${artifact.artifact_id}`}
+      >
+        <span className="run-artifact-type"><Icon name={artifact.type === 'image' ? 'eye' : artifact.type === 'markdown' ? 'report' : 'file'} size={15} /></span>
+        <span className="run-artifact-copy">
+          <strong>{artifact.name}</strong>
+          <small><Badge tone="neutral">{artifact.type}</Badge> {formatBytes(artifact.bytes)} · {artifact.node_id || 'unknown'} · {formatTime(artifact.created_at)}</small>
+          <span className="run-artifact-hint">{artifactHint(artifact.name)}</span>
+        </span>
+        <span
+          className="run-artifact-kind"
+          data-testid={kind === 'report' ? 'artifact-kind-report' : 'artifact-kind-deliverable'}
+        >
+          <Badge tone={kind === 'report' ? 'ai' : 'cyan'}>{kind === 'report' ? '执行报告' : '任务产出'}</Badge>
+        </span>
+        <Icon name="eye" size={13} />
+      </button>
+      <a
+        className="btn btn-ghost btn-sm run-artifact-download"
+        href={api.artifactDownloadUrl(artifact.artifact_id)}
+        download={artifact.name}
+        aria-label={`下载 ${artifact.name}`}
+        data-testid={`run-artifact-download-${artifact.artifact_id}`}
+      >
+        <Icon name="download" size={14} /><span>下载</span>
+      </a>
+    </div>
+  )
 
   const caseQuery = caseSearch.trim().toLowerCase()
   const filteredCases = cases.filter((item) => {
@@ -215,7 +262,7 @@ export function RunDetailPage() {
           <section className="panel run-artifacts-panel" data-testid="run-artifacts-panel">
             <SectionHeader
               title="产出物"
-              description="本次运行交付的结果；收藏在产出物页，可下载或生成只读分享链接。"
+              description="执行报告回答「怎么跑的」，任务产出回答「跑出了什么」；均可就地预览或下载。"
               icon="archive"
               actions={<a className="inline-link" data-testid="run-artifacts-link" href={href(withQuery('/artifacts', { run: rid }))}>全部产出物 <Icon name="arrow" size={12} /></a>}
             />
@@ -223,7 +270,7 @@ export function RunDetailPage() {
             {runArtifactsQuery.error ? (
               <div className="notice-inline warn-note">
                 <Icon name="warning" size={14} />
-                <div><strong>产出物接口未就绪或读取失败</strong><p>接口上线后，本 run 的 summary_md / 截图会自动列在这里。</p></div>
+                <div><strong>产出物接口未就绪或读取失败</strong><p>接口上线后，本 run 的报告与任务产出会自动列在这里。</p></div>
               </div>
             ) : null}
             {artifactWarning ? (
@@ -232,40 +279,64 @@ export function RunDetailPage() {
                 <div><strong>产物收集失败（见警告明细）</strong><p>{cleanPhaseDetail(artifactPhase?.detail) || '产物收集阶段返回 warning，运行结论不受影响。'}</p></div>
               </div>
             ) : null}
-            {!runArtifactsQuery.isLoading && !runArtifactsQuery.error && !(runArtifactsQuery.data?.items || []).length && !artifactWarning ? (
-              <div className="run-artifact-empty" data-testid="run-artifact-empty">
-                <Icon name="archive" size={18} />
-                <span>本次运行没有可登记的产出物（report.html/report.json/junit.xml/plan.json）</span>
-              </div>
-            ) : null}
-            {(runArtifactsQuery.data?.items || []).length ? (
-              <div className="run-artifact-list">
-                {(runArtifactsQuery.data?.items || []).map((artifact) => (
-                  <div className="run-artifact-row" key={artifact.artifact_id} data-testid={`run-artifact-item-${artifact.artifact_id}`} data-run-id={rid}>
-                    <a className="run-artifact-main" href={href(withQuery('/artifacts', { run: rid, focus: artifact.artifact_id }))}>
-                      <span className="run-artifact-type"><Icon name={artifact.type === 'image' ? 'eye' : artifact.type === 'markdown' ? 'report' : 'file'} size={15} /></span>
-                      <span className="run-artifact-copy">
-                        <strong>{artifact.name}</strong>
-                        <small><Badge tone="neutral">{artifact.type}</Badge> {formatBytes(artifact.bytes)} · {artifact.node_id || 'unknown'} · {formatTime(artifact.created_at)}</small>
-                      </span>
-                      <Icon name="arrow" size={14} />
-                    </a>
-                    <a
-                      className="btn btn-ghost btn-sm run-artifact-download"
-                      href={api.artifactDownloadUrl(artifact.artifact_id)}
-                      download={artifact.name}
-                      aria-label={`下载 ${artifact.name}`}
-                      data-testid={`run-artifact-download-${artifact.artifact_id}`}
-                    >
-                      <Icon name="download" size={14} /><span>下载</span>
-                    </a>
+
+            <div className="run-artifact-groups">
+              <div className="run-artifact-group is-report" data-testid="run-execution-artifacts">
+                <div className="run-artifact-group-head">
+                  <div>
+                    <strong><Icon name="report" size={14} />执行报告</strong>
+                    <p>怎么跑的 · 运行报告、计划与 JUnit 结果</p>
                   </div>
-                ))}
+                  <div className="run-artifact-group-actions">
+                    <Badge tone="ai">{reportArtifacts.length} 项</Badge>
+                    <a
+                      className="inline-link"
+                      href="#run-cases"
+                      data-testid="run-report-steps-entry"
+                      onClick={(event) => {
+                        event.preventDefault()
+                        document.getElementById('run-cases')?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                      }}
+                    >节点/步骤明细 <Icon name="arrow" size={12} /></a>
+                  </div>
+                </div>
+                {artifactsSettled && !reportArtifacts.length ? (
+                  <div className="run-artifact-empty" data-testid="run-execution-artifacts-empty">
+                    <Icon name="report" size={18} />
+                    <span data-testid="run-artifact-empty">无执行报告 · 正常情况下 report.html / report.json / junit.xml / plan.json 会列在这里</span>
+                  </div>
+                ) : null}
+                {reportArtifacts.length ? (
+                  <div className="run-artifact-list">
+                    {reportArtifacts.map((artifact) => renderArtifactRow(artifact, 'report'))}
+                  </div>
+                ) : null}
               </div>
-            ) : null}
+
+              <div className="run-artifact-group is-deliverable" data-testid="run-task-outputs">
+                <div className="run-artifact-group-head">
+                  <div>
+                    <strong><Icon name="archive" size={14} />任务产出</strong>
+                    <p>跑出了什么 · 本次流程声明的交付文件</p>
+                  </div>
+                  <Badge tone="cyan">{taskOutputs.length} 项</Badge>
+                </div>
+                {artifactsSettled && !taskOutputs.length ? (
+                  <div className="run-artifact-empty" data-testid="run-task-outputs-empty">
+                    <Icon name="archive" size={18} />
+                    <span>本流程没有声明任务产出</span>
+                  </div>
+                ) : null}
+                {taskOutputs.length ? (
+                  <div className="run-artifact-list">
+                    {taskOutputs.map((artifact) => renderArtifactRow(artifact, 'deliverable'))}
+                  </div>
+                ) : null}
+              </div>
+            </div>
           </section>
 
-          <section className="panel cases-panel">
+          <section className="panel cases-panel" id="run-cases">
             <SectionHeader
               title={`用例明细`}
               description={`${cases.length} 个用例 · ${summary.steps || 0} 个步骤`}
@@ -399,6 +470,8 @@ export function RunDetailPage() {
       >
         <div className="confirm-body">将用本次报告还原的配置重新提交运行。环境值从磁盘真实配置读取，不使用页面上的打码值。</div>
       </Modal>
+
+      <ArtifactPreviewModal artifactId={previewArtifactId} onClose={() => setPreviewArtifactId('')} />
     </div>
   )
 }

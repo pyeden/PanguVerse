@@ -2472,3 +2472,37 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .report-artifacts-entry span { color: var(--dim); font-size: 9px; }
 .run-artifacts-mini { display: inline-flex; align-items: center; gap: 3px; margin-top: 3px; color: var(--dim); font-size: 8.5px; }
 .run-artifacts-mini:hover { color: var(--cyan); }
+
+/* ── 产出物双分区：执行报告 / 任务产出 ─────────────────────────────── */
+.run-artifact-main { background: none; border: 0; padding: 0; text-align: left; font: inherit; cursor: pointer; }
+.run-artifact-groups { display: flex; flex-direction: column; gap: 10px; }
+.run-artifact-group { border: 1px solid var(--line); border-radius: 10px; padding: 9px 10px; background: rgba(151, 174, 212, .02); }
+.run-artifact-group.is-report { border-left: 2px solid rgba(94, 234, 212, .45); }
+.run-artifact-group.is-deliverable { border-left: 2px solid rgba(167, 139, 250, .45); }
+.run-artifact-group-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; margin-bottom: 7px; }
+.run-artifact-group-head > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.run-artifact-group-head strong { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; }
+.run-artifact-group-head p { margin: 0; color: var(--dim); font-size: 9px; }
+.run-artifact-group-actions { display: flex; align-items: center; gap: 7px; flex: 0 0 auto; flex-wrap: wrap; }
+.run-artifact-hint { color: var(--dim); font-size: 8.5px; }
+.run-artifact-kind { flex: 0 0 auto; }
+.run-artifact-row.is-report .run-artifact-type { color: var(--cyan); }
+.run-artifact-row.is-deliverable .run-artifact-type { color: #a78bfa; }
+
+.report-artifacts { display: flex; flex-direction: column; gap: 9px; }
+.report-artifacts-entry { display: flex; flex-direction: column; align-items: stretch; gap: 9px; padding: 0; border: 0; background: none; }
+.report-artifacts-entry > .report-artifact-group { display: flex; flex-direction: column; align-items: stretch; gap: 6px; padding: 9px 10px; border: 1px solid var(--line); border-radius: 9px; background: rgba(151, 174, 212, .03); }
+.report-artifact-group.is-deliverable { border-left: 2px solid rgba(167, 139, 250, .45); }
+.report-artifact-group.is-report { border-left: 2px solid rgba(94, 234, 212, .45); }
+.report-artifact-group-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.report-artifact-group-head > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.report-artifacts-entry .report-artifact-group-head strong { display: inline-flex; align-items: center; gap: 5px; font-size: 10px; color: var(--fg); }
+.report-artifacts-entry .report-artifact-group-head span { color: var(--dim); font-size: 9px; }
+
+.report-card-artifacts { display: flex; gap: 10px; margin-top: 7px; padding-top: 7px; border-top: 1px dashed var(--line); color: var(--dim); font-size: 8.5px; }
+.report-card-artifacts span { display: inline-flex; align-items: center; gap: 3px; }
+
+@media (max-width: 620px) {
+  .run-artifact-group-head, .report-artifact-group-head { flex-direction: column; align-items: flex-start; }
+  .run-artifact-group-actions { flex-wrap: wrap; }
+}

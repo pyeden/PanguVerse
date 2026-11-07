@@ -2,8 +2,10 @@ import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
-import { formatDuration, formatTime, rateOf, relativeTime, shortId, statusLabel, statusOf, classForStatus } from '../shared/utils'
-import type { ReportSummary } from '../shared/types'
+import { formatBytes, formatDuration, formatTime, rateOf, relativeTime, shortId, statusLabel, statusOf, classForStatus } from '../shared/utils'
+import type { Artifact, ReportSummary } from '../shared/types'
+import { artifactHint, artifactKind, splitArtifacts } from '../shared/artifacts'
+import { ArtifactPreviewModal } from '../components/ArtifactPreview'
 import { Icon } from '../components/Icon'
 import {
   Badge,
@@ -58,6 +60,7 @@ export function ReportsPage() {
   const [force, setForce] = useState(false)
   const [voidReason, setVoidReason] = useState('')
   const [actionError, setActionError] = useState('')
+  const [previewArtifactId, setPreviewArtifactId] = useState('')
 
   const params = useMemo(() => {
     const next = new URLSearchParams({ offset: String(offset), limit: String(pageSize), status: statusFilter })
@@ -72,14 +75,34 @@ export function ReportsPage() {
   const projectsQuery = useQuery({ queryKey: ['projects', 'with-archived'], queryFn: () => api.projects(true) })
   const selectedReport = (reportsQuery.data?.reports || []).find((item) => item.run_id === selectedId)
   const insightQuery = useQuery({ queryKey: ['insight', selectedId], queryFn: () => api.insight(selectedId), enabled: !!selectedId })
-  // 产出物数量只是附加信息：接口未就绪 / 读取失败时静默降级为「直接查看」。
+  // 产出物接口未就绪 / 读取失败时静默降级：详情仍可打开「完整报告」。
   const reportArtifactsQuery = useQuery({
     queryKey: ['report-artifacts', selectedId],
-    queryFn: () => api.artifacts(new URLSearchParams({ run: selectedId, limit: '1' })),
+    queryFn: () => api.artifacts(new URLSearchParams({ run: selectedId, limit: '100' })),
     enabled: !!selectedId,
     retry: false,
   })
-  const reportArtifactCount = reportArtifactsQuery.error ? null : reportArtifactsQuery.data?.total ?? null
+  // 卡片上的两类数量：一次拉取最近产出物，按 run_id 分组，避免每张卡片各发一个请求。
+  const allArtifactsQuery = useQuery({
+    queryKey: ['artifact-kind-counts'],
+    queryFn: () => api.artifacts(new URLSearchParams({ limit: '500' })),
+    retry: false,
+    staleTime: 30_000,
+  })
+  const artifactCounts = useMemo(() => {
+    const map = new Map<string, { report: number; deliverable: number }>()
+    for (const item of allArtifactsQuery.data?.items || []) {
+      if (!item.run_id) continue
+      const counts = map.get(item.run_id) || { report: 0, deliverable: 0 }
+      if (artifactKind(item) === 'report') counts.report += 1
+      else counts.deliverable += 1
+      map.set(item.run_id, counts)
+    }
+    return map
+  }, [allArtifactsQuery.data])
+  const selectedArtifacts: Artifact[] = reportArtifactsQuery.data?.items || []
+  const { reports: selectedReportArtifacts, deliverables: selectedDeliverables } = splitArtifacts(selectedArtifacts)
+  const selectedArtifactsSettled = !reportArtifactsQuery.isLoading && !reportArtifactsQuery.error
   const generate = useMutation({
     mutationFn: () => api.generateInsight(selectedId, true),
     onSuccess: async () => {
@@ -160,6 +183,38 @@ export function ReportsPage() {
     setActionError('')
   }, [signTarget, voidTarget])
 
+  const renderArtifactRow = (artifact: Artifact, kind: 'report' | 'deliverable') => (
+    <div className={`run-artifact-row is-${kind}`} key={artifact.artifact_id} data-testid={`report-artifact-item-${artifact.artifact_id}`} data-artifact-kind={kind}>
+      <button
+        type="button"
+        className="run-artifact-main"
+        onClick={() => setPreviewArtifactId(artifact.artifact_id)}
+        aria-label={`预览 ${artifact.name}`}
+        data-testid={`report-artifact-preview-${artifact.artifact_id}`}
+      >
+        <span className="run-artifact-type"><Icon name={artifact.type === 'image' ? 'eye' : artifact.type === 'markdown' ? 'report' : 'file'} size={15} /></span>
+        <span className="run-artifact-copy">
+          <strong>{artifact.name}</strong>
+          <small><Badge tone="neutral">{artifact.type}</Badge> {formatBytes(artifact.bytes)} · {artifact.node_id || 'unknown'} · {formatTime(artifact.created_at)}</small>
+          <span className="run-artifact-hint">{artifactHint(artifact.name)}</span>
+        </span>
+        <span className="run-artifact-kind" data-testid={kind === 'report' ? 'artifact-kind-report' : 'artifact-kind-deliverable'}>
+          <Badge tone={kind === 'report' ? 'ai' : 'cyan'}>{kind === 'report' ? '执行报告' : '任务产出'}</Badge>
+        </span>
+        <Icon name="eye" size={13} />
+      </button>
+      <a
+        className="btn btn-ghost btn-sm run-artifact-download"
+        href={api.artifactDownloadUrl(artifact.artifact_id)}
+        download={artifact.name}
+        aria-label={`下载 ${artifact.name}`}
+        data-testid={`report-artifact-download-${artifact.artifact_id}`}
+      >
+        <Icon name="download" size={14} /><span>下载</span>
+      </a>
+    </div>
+  )
+
   return (
     <div className="page reports-page">
       <PageHeader
@@ -220,6 +275,7 @@ export function ReportsPage() {
             key={report.run_id}
             report={report}
             projects={projects}
+            artifactCounts={artifactCounts.get(report.run_id)}
             onOpen={() => updateQuery({ run: report.run_id })}
             onSign={() => openSign(report)}
             onVoid={() => openVoid(report)}
@@ -286,13 +342,57 @@ export function ReportsPage() {
               <div><span>AI 总结</span><strong>{selectedReport.has_insight ? (selectedReport.insight_source || '缓存') : '未生成'}</strong></div>
             </div>
             <Progress value={selectedReport.total ? ((selectedReport.passed || 0) / selectedReport.total) * 100 : 0} tone={selectedStatus === 'passed' ? 'ok' : 'bad'} />
-            <div className="report-artifacts-entry" data-testid="report-artifacts-entry">
-              <div>
-                <Icon name="archive" size={16} />
-                <strong>产出物</strong>
-                <span>{reportArtifactsQuery.isLoading ? '正在统计…' : reportArtifactCount === null ? '统计不可用，可直接查看' : reportArtifactCount ? `已登记 ${reportArtifactCount} 项` : '暂无已登记产出物'}</span>
+            <div className="report-artifacts" data-testid="report-artifacts-entry">
+              <div className="report-artifact-group is-deliverable" data-testid="report-deliverables">
+                <div className="report-artifact-group-head">
+                  <div>
+                    <strong><Icon name="archive" size={15} />任务产出</strong>
+                    <span>跑出了什么 · {reportArtifactsQuery.isLoading ? '正在读取…' : `${selectedDeliverables.length} 项`}</span>
+                  </div>
+                  <a className="inline-link" data-testid="report-deliverables-link" data-run-id={selectedId} href={href(withQuery('/artifacts', { run: selectedId }))}>全部产出物 <Icon name="arrow" size={12} /></a>
+                </div>
+                {reportArtifactsQuery.isLoading ? <Loading label="正在读取产出物…" /> : null}
+                {selectedArtifactsSettled && !selectedDeliverables.length ? (
+                  <div className="run-artifact-empty" data-testid="report-deliverables-empty">
+                    <Icon name="archive" size={17} />
+                    <span>本流程没有声明任务产出</span>
+                  </div>
+                ) : null}
+                {selectedDeliverables.length ? (
+                  <div className="run-artifact-list">
+                    {selectedDeliverables.map((artifact) => renderArtifactRow(artifact, 'deliverable'))}
+                  </div>
+                ) : null}
               </div>
-              <a className="btn btn-ghost btn-sm" data-testid="report-artifacts-link-detail" data-run-id={selectedId} href={href(withQuery('/artifacts', { run: selectedId }))}>查看产出物 <Icon name="arrow" size={13} /></a>
+
+              <div className="report-artifact-group is-report" data-testid="report-execution-artifacts">
+                <div className="report-artifact-group-head">
+                  <div>
+                    <strong><Icon name="report" size={15} />执行报告</strong>
+                    <span>怎么跑的 · {reportArtifactsQuery.isLoading ? '正在读取…' : `${selectedReportArtifacts.length} 项`}</span>
+                  </div>
+                  <a className="inline-link" data-testid="report-artifacts-link-detail" data-run-id={selectedId} href={href(withQuery('/artifacts', { run: selectedId }))}>查看产出物 <Icon name="arrow" size={12} /></a>
+                </div>
+                {reportArtifactsQuery.isLoading ? <Loading label="正在读取产出物…" /> : null}
+                {selectedArtifactsSettled && !selectedReportArtifacts.length ? (
+                  <div className="run-artifact-empty" data-testid="report-execution-artifacts-empty">
+                    <Icon name="report" size={17} />
+                    <span>无执行报告</span>
+                  </div>
+                ) : null}
+                {selectedReportArtifacts.length ? (
+                  <div className="run-artifact-list">
+                    {selectedReportArtifacts.map((artifact) => renderArtifactRow(artifact, 'report'))}
+                  </div>
+                ) : null}
+              </div>
+
+              {reportArtifactsQuery.error ? (
+                <div className="notice-inline warn-note">
+                  <Icon name="warning" size={14} />
+                  <div><strong>产出物接口未就绪或读取失败</strong><p>仍可通过下方的完整报告与 HTML 入口查看结果。</p></div>
+                </div>
+              ) : null}
             </div>
             <SignatureBlock report={selectedReport} />
             {!selectedReport.voided ? (
@@ -412,6 +512,8 @@ export function ReportsPage() {
           {actionError ? <div className="step-error"><Icon name="warning" size={14} />{actionError}</div> : null}
         </div>
       </Modal>
+
+      <ArtifactPreviewModal artifactId={previewArtifactId} onClose={() => setPreviewArtifactId('')} />
     </div>
   )
 }
@@ -445,7 +547,7 @@ function SignatureBlock({ report }: { report: ReportSummary }) {
   return <div className="signature-block"><div className="signature-head"><Badge tone="warn">未签署</Badge><span>报告尚未形成人工结论</span></div><p className="muted">AI 总结只是建议；人工签署后才生效。</p></div>
 }
 
-function ReportCard({ report, projects, onOpen, onSign, onVoid }: { report: ReportSummary; projects: any[]; onOpen: () => void; onSign: () => void; onVoid: () => void }) {
+function ReportCard({ report, projects, artifactCounts, onOpen, onSign, onVoid }: { report: ReportSummary; projects: any[]; artifactCounts?: { report: number; deliverable: number }; onOpen: () => void; onSign: () => void; onVoid: () => void }) {
   const status = report.status ? statusOf({ run_id: report.run_id, summary: report.summary, conclusion: report.conclusion }) : 'done'
   const counts = { passed: report.passed || 0, total: report.total || 0 }
   const rate = rateOf(counts.passed, counts.total)
@@ -473,6 +575,15 @@ function ReportCard({ report, projects, onOpen, onSign, onVoid }: { report: Repo
           <span>{formatDuration(report.duration_ms)}</span>
           <span>{report.conclusion?.verdict || statusLabel(status)}</span>
           <span>{report.trigger || 'manual'}</span>
+        </div>
+        <div
+          className="report-card-artifacts"
+          data-testid={`report-card-artifact-counts-${report.run_id}`}
+          data-report-count={artifactCounts ? artifactCounts.report : ''}
+          data-deliverable-count={artifactCounts ? artifactCounts.deliverable : ''}
+        >
+          <span><Icon name="report" size={11} />执行报告 {artifactCounts ? artifactCounts.report : '—'}</span>
+          <span><Icon name="archive" size={11} />任务产出 {artifactCounts ? artifactCounts.deliverable : '—'}</span>
         </div>
       </button>
       <div className="report-card-foot">
