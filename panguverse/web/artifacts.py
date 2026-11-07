@@ -66,6 +66,14 @@ DEFAULT_PRODUCES = {
     "ui_tree": "xml",
     "links": "json",
 }
+#: 每次运行都会重写的报告类产出物：源文件 → (产物名, 类型, node_id)。
+#: 名称保持稳定，重复登记时按名称覆盖而不堆叠。
+RUN_OUTPUT_SPECS: tuple[tuple[str, str, str, str], ...] = (
+    ("report.html", "report.html", "text", "report"),
+    ("report.json", "report.json", "json", "report"),
+    ("junit.xml", "junit.xml", "xml", "report"),
+    ("plan.json", "plan.json", "json", "plan"),
+)
 #: 原子输出键与 produces 名字不一致时的映射（不改变原子语义）
 PRODUCES_ALIASES = {
     "web_screenshot": {"screenshot": ("path",)},
@@ -401,6 +409,16 @@ def _safe_name(name: str) -> str:
     return cleaned[:80]
 
 
+def _safe_file_name(name: str | None) -> str:
+    """只接受运行目录内的普通文件名（不含路径分隔符/穿越片段）。"""
+    text = str(name or "").strip()
+    if not text or text == MANIFEST_NAME or _looks_like_traversal(text):
+        return ""
+    if Path(text).name != text or not re.fullmatch(r"[A-Za-z0-9._-]{1,120}", text):
+        return ""
+    return text
+
+
 def _extension(name: str, artifact_type: str, data: bytes) -> str:
     if artifact_type == "image":
         return _image_ext(data) or ".bin"
@@ -472,6 +490,7 @@ def _store(
     case_id: str = "",
     declared_type: str | None = None,
     replace: bool = False,
+    file_name: str | None = None,
 ) -> dict[str, Any]:
     data = _to_bytes(root, value, declared_type)
     artifact_type = infer_type(name, data, declared_type)
@@ -501,7 +520,10 @@ def _store(
     )
     digest = hashlib.sha256(data).hexdigest()
     truncated = len(data) > MAX_ARTIFACT_BYTES
-    filename = artifact_name + _extension(artifact_name, artifact_type, data)
+    # 报告类产出物保留原始文件名（report.html 等），其余仍由类型决定后缀。
+    filename = _safe_file_name(file_name) or (
+        artifact_name + _extension(artifact_name, artifact_type, data)
+    )
     if not truncated:
         _atomic_write(run_dir / filename, data)
     record = {
@@ -642,6 +664,112 @@ def record_insight(
 
 
 # --------------------------------------------------------------------------- #
+# 运行报告类产出物（每次运行自动登记）
+# --------------------------------------------------------------------------- #
+def _runs_root(root: Path) -> Path:
+    """与 service.runs_root 同规则：优先 ``<root>/runs``，兼容旧布局。"""
+    primary = Path(root) / "runs"
+    return primary if primary.is_dir() else Path(root) / STATE_DIRNAME / "runs"
+
+
+def _report_meta(run_dir: Path) -> dict[str, Any]:
+    try:
+        data = json.loads((run_dir / "report.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    meta = data.get("meta") if isinstance(data, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
+def record_run_outputs(
+    root: Path,
+    run_id: str,
+    *,
+    project_id: str | None = None,
+    run_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """把一次运行的报告文件登记为产出物（按名称覆盖，失败只返回 warnings）。
+
+    只扫描固定白名单（report.html / report.json / junit.xml / plan.json），
+    运行目录里的轨迹、临时文件和回归子目录不会被登记。
+    """
+    validated = validate_run_id(run_id)
+    directory = Path(run_dir) if run_dir is not None else _runs_root(root) / validated
+    if not directory.is_dir():
+        return {"count": 0, "artifacts": [], "warnings": []}
+
+    raw_project = project_id or _report_meta(directory).get("project_id")
+    try:
+        project = normalize_project(raw_project) or UNCLASSIFIED
+    except ArtifactError:
+        project = UNCLASSIFIED
+
+    manifest_path = _manifest_path(root, project, validated)
+    registered: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for source, name, declared_type, node_id in RUN_OUTPUT_SPECS:
+        path = directory / source
+        if not path.is_file():
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as exc:
+            warnings.append(f"{source} 读取失败: {exc}")
+            continue
+        try:
+            with _LOCK:
+                manifest = _load_manifest(manifest_path, project, validated)
+                record = _store(
+                    root,
+                    project,
+                    validated,
+                    manifest,
+                    name,
+                    data,
+                    node_id=node_id,
+                    declared_type=declared_type,
+                    replace=True,
+                    file_name=source,
+                )
+        except (OSError, ArtifactError, ValueError) as exc:
+            warnings.append(f"{source} 登记失败: {exc}")
+            continue
+        registered.append(record)
+    return {"count": len(registered), "artifacts": registered, "warnings": warnings}
+
+
+def _run_manifest_paths(root: Path, run_id: str) -> list[Path]:
+    try:
+        return sorted(artifacts_root(root).glob(f"*/{run_id}/{MANIFEST_NAME}"))
+    except OSError:
+        return []
+
+
+def ensure_run_artifacts(
+    root: Path,
+    run_id: str,
+    *,
+    project_id: str | None = None,
+    run_dir: str | Path | None = None,
+) -> dict[str, Any]:
+    """历史 run 惰性回填：无 manifest 且运行目录存在时才登记报告文件。
+
+    不伪造不存在的 run：运行目录缺失或没有任何白名单文件时只返回空结果。
+    """
+    validated = validate_run_id(run_id)
+    empty = {"count": 0, "artifacts": [], "warnings": [], "created": False}
+    if _run_manifest_paths(root, validated):
+        return empty
+    directory = Path(run_dir) if run_dir is not None else _runs_root(root) / validated
+    if not directory.is_dir():
+        return empty
+    result = record_run_outputs(
+        root, validated, project_id=project_id, run_dir=directory
+    )
+    return {**result, "created": bool(result.get("count"))}
+
+
+# --------------------------------------------------------------------------- #
 # 查询
 # --------------------------------------------------------------------------- #
 def _iter_records(root: Path) -> list[dict[str, Any]]:
@@ -690,8 +818,17 @@ def list_artifacts(
     type_filter = str(type).strip() if type else None
     if type_filter and type_filter not in KNOWN_TYPES:
         raise ArtifactError("bad_request", f"type 非法: {type_filter}")
+    records = _iter_records(root)
+    if run_filter is not None:
+        # 历史 run 可能只有 runs/<id>/ 而没有产出物 manifest：首次查询时惰性回填。
+        if not any(record.get("run_id") == run_filter for record in records) and not _run_manifest_paths(
+            root, run_filter
+        ):
+            with contextlib.suppress(Exception):  # 回填失败不应让列表接口 500
+                ensure_run_artifacts(root, run_filter)
+            records = _iter_records(root)
     items = []
-    for record in _iter_records(root):
+    for record in records:
         if project_filter is not None:
             actual = record.get("project_id") or UNCLASSIFIED
             if actual != project_filter:
@@ -1007,12 +1144,14 @@ __all__ = [
     "KNOWN_TYPES",
     "MAX_ARTIFACT_BYTES",
     "MAX_INLINE_BYTES",
+    "RUN_OUTPUT_SPECS",
     "ArtifactError",
     "artifact_bytes",
     "artifacts_root",
     "collect_run",
     "create_share",
     "download_artifact",
+    "ensure_run_artifacts",
     "find_artifact",
     "get_artifact",
     "infer_type",
@@ -1020,6 +1159,7 @@ __all__ = [
     "mime_for",
     "normalize_project",
     "record_insight",
+    "record_run_outputs",
     "resolve_share",
     "revoke_all_shares",
     "revoke_share",

@@ -14,6 +14,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -591,3 +592,188 @@ def test_a6_cross_project_download_returns_404(web: WebClient) -> None:
         "GET", f"/api/artifacts/{aid}/download?project=p-aaa111"
     )
     assert status == 200 and body == b"# secret"
+
+
+# --------------------------------------------------------------------------- #
+# A10 每次运行自动登记报告类产出物 + 历史 run 惰性回填
+# --------------------------------------------------------------------------- #
+_REPORT_HTML = "<!doctype html><html><body><h1>run report</h1></body></html>"
+_JUNIT_XML = '<testsuite name="PanguVerse" tests="1"><testcase name="c1"/></testsuite>'
+_PLAN_JSON = '{"source": "studio", "cases": [{"id": "c1"}]}'
+
+
+def _write_run_dir(
+    root: Path,
+    run_id: str,
+    *,
+    project: str | None = None,
+    report_html: str = _REPORT_HTML,
+    with_noise: bool = False,
+) -> Path:
+    run_dir = root / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    report = {"run_id": run_id, "meta": {"project_id": project} if project else {}}
+    (run_dir / "report.json").write_text(json.dumps(report), encoding="utf-8")
+    (run_dir / "report.html").write_text(report_html, encoding="utf-8")
+    (run_dir / "junit.xml").write_text(_JUNIT_XML, encoding="utf-8")
+    (run_dir / "plan.json").write_text(_PLAN_JSON, encoding="utf-8")
+    if with_noise:
+        # 非白名单文件/目录：不应登记
+        (run_dir / "trace.json").write_text('{"steps": []}', encoding="utf-8")
+        (run_dir / "steps.jsonl").write_text("not an artifact\n", encoding="utf-8")
+        (run_dir / "report.json.tmp").write_text("tmp", encoding="utf-8")
+        (run_dir / "regression").mkdir()
+        (run_dir / "regression" / "report.json").write_text("{}", encoding="utf-8")
+    return run_dir
+
+
+def _manifest_for(root: Path, project: str, run_id: str) -> dict[str, Any]:
+    path = root / ".panguverse" / "artifacts" / project / run_id / "manifest.json"
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_a10_record_run_outputs_registers_four_reports(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    run_dir = _write_run_dir(root, "4f265f46cbae", project="p-abcdef12", with_noise=True)
+
+    result = artifacts.record_run_outputs(root, "4f265f46cbae")
+    assert result["count"] == 4, result
+    by_name = {item["name"]: item for item in result["artifacts"]}
+    assert set(by_name) == {"report.html", "report.json", "junit.xml", "plan.json"}
+    assert by_name["report.html"]["type"] == "text"
+    assert by_name["report.html"]["file"] == "report.html"
+    assert by_name["report.json"]["type"] == "json"
+    assert by_name["junit.xml"]["type"] == "xml"
+    assert by_name["plan.json"]["type"] == "json"
+    assert all(item["project_id"] == "p-abcdef12" for item in by_name.values())
+    assert by_name["report.html"]["bytes"] == len(_REPORT_HTML.encode())
+    assert by_name["report.html"]["sha256"] == hashlib.sha256(
+        _REPORT_HTML.encode()
+    ).hexdigest()
+
+    manifest = _manifest_for(root, "p-abcdef12", "4f265f46cbae")
+    assert len(manifest["artifacts"]) == 4
+    stored = {item["file"] for item in manifest["artifacts"]}
+    assert stored == {"report.html", "report.json", "junit.xml", "plan.json"}
+    # 临时/无关文件不登记
+    assert not any("trace" in item["file"] for item in manifest["artifacts"])
+    assert (run_dir / "report.html").exists()
+
+    # 下载/预览可用（html 按 text 存储，仍可原样下载与内联预览）
+    aid = by_name["report.html"]["artifact_id"]
+    data, filename, mime = artifacts.download_artifact(root, aid)
+    assert data == _REPORT_HTML.encode() and filename == "report.html"
+    assert mime == "text/plain; charset=utf-8"
+    detail = artifacts.get_artifact(root, aid)
+    assert detail["content"] == _REPORT_HTML
+    assert detail["download_url"].endswith("/download")
+
+
+def test_a10_record_run_outputs_is_idempotent_by_name(tmp_path: Path) -> None:
+    root = tmp_path / "ws"
+    root.mkdir()
+    _write_run_dir(root, "aaaabbbbcccc")
+
+    first = artifacts.record_run_outputs(root, "aaaabbbbcccc")
+    first_ids = {item["name"]: item["artifact_id"] for item in first["artifacts"]}
+    # 重复调用：同名覆盖，不堆叠、不换 id
+    second = artifacts.record_run_outputs(root, "aaaabbbbcccc")
+    second_ids = {item["name"]: item["artifact_id"] for item in second["artifacts"]}
+    assert first_ids == second_ids
+    manifest = _manifest_for(root, "unclassified", "aaaabbbbcccc")
+    assert len(manifest["artifacts"]) == 4
+    assert sorted(item["name"] for item in manifest["artifacts"]) == [
+        "junit.xml",
+        "plan.json",
+        "report.html",
+        "report.json",
+    ]
+
+    # 内容更新后仍是同一条记录（sha256/bytes 刷新，文件覆盖）
+    (root / "runs" / "aaaabbbbcccc" / "report.html").write_text("<html>v2</html>", encoding="utf-8")
+    third = artifacts.record_run_outputs(root, "aaaabbbbcccc")
+    by_name = {item["name"]: item for item in third["artifacts"]}
+    assert by_name["report.html"]["artifact_id"] == first_ids["report.html"]
+    assert by_name["report.html"]["sha256"] == hashlib.sha256(b"<html>v2</html>").hexdigest()
+    manifest = _manifest_for(root, "unclassified", "aaaabbbbcccc")
+    assert len(manifest["artifacts"]) == 4
+
+
+def test_a10_legacy_run_is_backfilled_lazily_via_api(web: WebClient) -> None:
+    _write_run_dir(web.workspace, "4f265f46cbae", with_noise=True)
+
+    status, data = web.get_json("/api/artifacts?run=4f265f46cbae")
+    assert status == 200, data
+    assert data["total"] == 4, data
+    names = {item["name"]: item for item in data["items"]}
+    assert set(names) == {"report.html", "report.json", "junit.xml", "plan.json"}
+    ids = {item["artifact_id"] for item in data["items"]}
+
+    # 第二次查询不再重复登记
+    status, again = web.get_json("/api/artifacts?run=4f265f46cbae")
+    assert status == 200 and again["total"] == 4
+    assert {item["artifact_id"] for item in again["items"]} == ids
+
+    # 下载与预览可用
+    aid = names["report.html"]["artifact_id"]
+    status, headers, body = web.request("GET", f"/api/artifacts/{aid}/download")
+    assert status == 200 and body == _REPORT_HTML.encode()
+    assert "report.html" in (headers.get("Content-Disposition") or "")
+    status, detail = web.get_json(f"/api/artifacts/{aid}")
+    assert status == 200 and detail["content"] == _REPORT_HTML
+    status, share = web.post_json(f"/api/artifacts/{aid}/share", {"ttl": "1h"})
+    assert status == 201
+    status, _headers, page = web.request("GET", f"/api/share/{share['url_token']}")
+    assert status == 200 and b"run report" in page
+
+    # run 详情接口仍可读
+    status, detail = web.get_json("/api/runs/4f265f46cbae")
+    assert status == 200 and detail["report"]["run_id"] == "4f265f46cbae"
+
+
+def test_a10_ensure_does_not_fake_missing_run(web: WebClient) -> None:
+    result = artifacts.ensure_run_artifacts(web.workspace, "deadbeef1234")
+    assert result["count"] == 0 and result["created"] is False
+    assert not (web.workspace / "runs" / "deadbeef1234").exists()
+    assert not (web.workspace / ".panguverse" / "artifacts").exists()
+
+    status, data = web.get_json("/api/artifacts?run=deadbeef1234")
+    assert status == 200 and data["total"] == 0
+    assert not (web.workspace / ".panguverse" / "artifacts").exists()
+
+
+def test_a10_missing_optional_reports_are_skipped(web: WebClient) -> None:
+    run_dir = web.workspace / "runs" / "abcdabcdabcd"
+    run_dir.mkdir(parents=True)
+    (run_dir / "report.json").write_text('{"meta": {}}', encoding="utf-8")
+    (run_dir / "plan.json").write_text('{"cases": []}', encoding="utf-8")
+    result = artifacts.record_run_outputs(web.workspace, "abcdabcdabcd")
+    assert result["count"] == 2
+    assert {item["name"] for item in result["artifacts"]} == {"report.json", "plan.json"}
+    assert result["warnings"] == []
+
+
+def test_a10_run_registers_report_outputs_end_to_end(web: WebClient) -> None:
+    _scenario_with_links(web)
+    status, queued = web.post_json("/api/runs", {"mode": "scenario", "scenario": "art.yaml"})
+    assert status == 202, queued
+    job = web.wait_job(queued["job_id"])
+    assert job["status"] == "done", job
+    run_id = job["run_id"]
+
+    status, listing = web.get_json(f"/api/artifacts?run={run_id}")
+    assert status == 200, listing
+    names = {item["name"] for item in listing["items"]}
+    assert {"report.html", "report.json", "junit.xml", "plan.json"} <= names
+    by_name = {item["name"]: item for item in listing["items"]}
+    assert by_name["report.html"]["type"] == "text"
+    assert by_name["junit.xml"]["type"] == "xml"
+
+    phases = [phase for phase in job["phases"] if phase["name"] == "artifacts"]
+    assert phases and phases[-1]["status"] == "ok", phases
+    assert "已登记" in phases[-1]["detail"]
+
+    # 再查一次不重复登记
+    status, again = web.get_json(f"/api/artifacts?run={run_id}")
+    assert status == 200 and again["total"] == listing["total"]

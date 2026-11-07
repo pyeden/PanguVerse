@@ -881,22 +881,45 @@ def _execute(
     )
     artifacts["plan"] = str(plan_path)
     job.add_phase("report", "ok", f"产物目录 {out_dir}")
-    # 产出物收集是**旁路**：失败只告警，绝不改变运行结论（契约 A7）
+    # 产出物收集/登记是**旁路**：失败只告警，绝不改变运行结论（契约 A7）
+    artifact_count = 0
+    artifact_warnings: list[str] = []
     try:
         from . import artifacts as artifacts_mod
-
-        collected = artifacts_mod.collect_run(
-            root, run, project_id=(attribution or {}).get("project_id")
-        )
-        count = int(collected.get("count") or 0)
-        warnings = [str(item) for item in collected.get("warnings") or []]
-        detail = f"已收集 {count} 个产出物" if count else "本次运行没有产出物"
-        if warnings:
-            job.add_phase("artifacts", "warning", f"{detail}；" + "；".join(warnings))
+    except Exception as exc:  # noqa: BLE001 - A7：产出物模块异常不得影响运行结论
+        artifacts_mod = None
+        artifact_warnings.append(f"产出物模块不可用: {sanitize_message(exc)}")
+    if artifacts_mod is not None:
+        try:
+            collected = artifacts_mod.collect_run(
+                root, run, project_id=(attribution or {}).get("project_id")
+            )
+        except Exception as exc:  # noqa: BLE001 - A7
+            artifact_warnings.append(f"产出物收集失败: {sanitize_message(exc)}")
         else:
-            job.add_phase("artifacts", "ok" if count else "skipped", detail)
-    except Exception as exc:  # noqa: BLE001 - A7：收集失败不得影响运行结论
-        job.add_phase("artifacts", "warning", f"产出物收集失败: {sanitize_message(exc)}")
+            artifact_count += int(collected.get("count") or 0)
+            artifact_warnings.extend(str(item) for item in collected.get("warnings") or [])
+        # 每次运行的报告文件（report.html/json、junit.xml、plan.json）自动登记；
+        # 同名覆盖，重复运行/重复调用都不会堆叠。
+        try:
+            outputs = artifacts_mod.record_run_outputs(
+                root,
+                run_id,
+                project_id=(attribution or {}).get("project_id"),
+                run_dir=out_dir,
+            )
+        except Exception as exc:  # noqa: BLE001 - A7
+            artifact_warnings.append(f"运行产出物登记失败: {sanitize_message(exc)}")
+        else:
+            artifact_count += int(outputs.get("count") or 0)
+            artifact_warnings.extend(str(item) for item in outputs.get("warnings") or [])
+    if artifact_warnings:
+        detail = f"已登记 {artifact_count} 个产出物；" + "；".join(artifact_warnings)
+        job.add_phase("artifacts", "warning", detail)
+    elif artifact_count:
+        job.add_phase("artifacts", "ok", f"已登记 {artifact_count} 个产出物")
+    else:
+        job.add_phase("artifacts", "skipped", "本次运行没有产出物")
     cancelled = bool(job.cancel_requested)
     if cancelled:
         job.cancel("用户取消")
