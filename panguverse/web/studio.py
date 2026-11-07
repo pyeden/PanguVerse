@@ -621,25 +621,54 @@ def _semantic_checks(
     available_env: Iterable[str] | None,
     checks: Mapping[str, Any] | None,
     domain_pack: str = "",
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """意图覆盖 / 环境就绪 / 能力缺口三类语义检查（默认全开）。"""
+    explore: bool = False,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any]]:
+    """意图覆盖 / 环境就绪 / 能力缺口三类语义检查（默认全开）。
+
+    ``explore=True`` 时覆盖率只作 advisory：探索固化图的节点来自真实执行
+    轨迹，是否可用由无 LLM 重放与 checks 决定，不再用 60% 阈值误伤。
+    """
     enabled = {"intent": True, "env": True, "capability": True}
     if isinstance(checks, Mapping):
         for key in enabled:
             if key in checks and checks[key] is False:
                 enabled[key] = False
 
-    coverage = planner_gate.intent_coverage(nodes, intent)
+    coverage = planner_gate.intent_coverage(nodes, intent, equivalents=explore)
+    coverage["gate"] = "advisory" if explore else "blocking"
     errors: list[dict[str, Any]] = []
+    warnings: list[dict[str, Any]] = []
     if enabled["intent"] and intent and coverage["total"] and coverage["ratio"] < 0.6:
-        errors.append(
-            _semantic_issue(
-                "intent_mismatch",
-                f"意图覆盖率过低：{coverage['matched']}/{coverage['total']}"
-                f"（{coverage['ratio']:.0%}），当前图与意图不匹配",
-                hint="删除无关节点，或重新规划；阈值 60%",
-            )
+        message = (
+            f"意图覆盖率偏低：{coverage['matched']}/{coverage['total']}"
+            f"（{coverage['ratio']:.0%}）"
         )
+        if explore:
+            unmatched = "、".join(coverage["unmatched_nodes"]) or "无"
+            warning = {
+                "code": "intent_coverage_advisory",
+                "level": "warning",
+                "message": f"{message}，未匹配节点：{unmatched}；探索流程以重放结果为准",
+                "node_id": "",
+                "ratio": coverage["ratio"],
+                "matched": coverage["matched"],
+                "total": coverage["total"],
+                "unmatched": list(coverage["unmatched_nodes"]),
+                "unmatched_details": list(coverage["unmatched_details"]),
+                "hint": "探索可能选用了等价原子或新增原子；如需强化可从重放结果与原子映射入手",
+            }
+            warnings.append(warning)
+            coverage["warnings"] = [warning["message"]] + [
+                detail["reason"] for detail in coverage["unmatched_details"]
+            ]
+        else:
+            errors.append(
+                _semantic_issue(
+                    "intent_mismatch",
+                    f"{message}，当前图与意图不匹配",
+                    hint="删除无关节点，或重新规划；阈值 60%",
+                )
+            )
 
     missing_env: list[str] = []
     if enabled["env"] and available_env is not None:
@@ -667,7 +696,7 @@ def _semantic_checks(
                 )
             )
 
-    return errors, {
+    return errors, warnings, {
         "coverage": coverage,
         "missing_env": missing_env,
         "capability_gaps": capability_gaps,
@@ -687,6 +716,8 @@ def validate_nodes(
     available_env: Iterable[str] | None = None,
     checks: Mapping[str, Any] | None = None,
     domain_pack: str = "",
+    origin: str = "",
+    explore_id: str = "",
     registry: Any = None,
 ) -> dict[str, Any]:
     nodes = list(nodes)
@@ -699,7 +730,8 @@ def validate_nodes(
     result = plan.check(registry, known_variables=set(env_keys))
     errors = [_issue_dict(issue) for issue in result.errors]
     warnings = [_issue_dict(issue) for issue in result.warnings]
-    semantic, detail = _semantic_checks(
+    explore = str(origin) == "explore" or bool(explore_id)
+    semantic, semantic_warnings, detail = _semantic_checks(
         nodes=nodes,
         intent=intent,
         env_schema=env_keys,
@@ -707,8 +739,10 @@ def validate_nodes(
         available_env=available_env,
         checks=checks,
         domain_pack=domain_pack,
+        explore=explore,
     )
     errors.extend(semantic)
+    warnings.extend(semantic_warnings)
     error_nodes = {item.get("node_id") for item in errors if item.get("node_id")}
     affected = _downstream_nodes(nodes, edges, error_nodes)
     return {
@@ -1100,6 +1134,8 @@ def create_draft_from_graph(
         assumptions=assumptions,
         available_env=None,
         domain_pack=domain_pack,
+        origin="explore",
+        explore_id=explore_id,
         registry=registry,
     )
     return {
@@ -1374,6 +1410,8 @@ def _node_payload(root: Path, wid: str, revision: Mapping[str, Any], workflow: d
         assumptions=revision.get("assumptions") or [],
         available_env=set(service.load_last_env(root)),
         domain_pack=str(workflow.get("domain_pack") or ""),
+        origin=str(workflow.get("origin") or ""),
+        explore_id=str(workflow.get("explore_id") or ""),
     )
     return {
         "wid": wid,
@@ -1955,6 +1993,8 @@ def review(root: Path, wid: str, payload: Any) -> dict[str, Any]:
             assumptions=target.get("assumptions") or [],
             available_env=set(_baseline_env(root)),
             domain_pack=str(workflow.get("domain_pack") or ""),
+            origin=str(workflow.get("origin") or ""),
+            explore_id=str(workflow.get("explore_id") or ""),
         ),
         "audit_tail": audit_tail(root, wid, limit=20),
     }
@@ -2017,13 +2057,31 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
     rev = _as_rev(data.get("rev"))
     message = _clean_text(data.get("message"), field="message", required=True)
     workflow = read_workflow(root, wid)
-    if workflow.get("origin") == "explore" and workflow.get("replay_status") == "replay_failed":
-        raise StudioError(
-            "replay_failed",
-            "固化流程无 LLM 重放未通过，不能发布",
-            status=409,
-            details={"replay": workflow.get("replay") or {}},
-        )
+    origin = str(workflow.get("origin") or "")
+    explore = origin == "explore" or bool(workflow.get("explore_id"))
+    if explore:
+        replay_status = str(workflow.get("replay_status") or "")
+        replay = workflow.get("replay") or {}
+        checks = replay.get("checks") if isinstance(replay, Mapping) else None
+        failed_checks = [
+            item
+            for item in (checks or [])
+            if isinstance(item, Mapping) and item.get("ok") is False
+        ]
+        if replay_status == "replay_failed" or failed_checks:
+            raise StudioError(
+                "replay_failed",
+                "固化流程无 LLM 重放未通过，不能发布",
+                status=409,
+                details={"replay": replay, "failed_checks": failed_checks},
+            )
+        if replay_status != "replay_passed":
+            raise StudioError(
+                "replay_pending",
+                "固化流程尚无通过的无 LLM 重放，不能发布",
+                status=409,
+                details={"replay": replay},
+            )
     if workflow.get("state") != "approved":
         raise StudioError("not_approved", "只有 approved 状态的工作流才能发布")
     if rev != int(workflow.get("current_rev") or 0):
@@ -2040,12 +2098,19 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
         assumptions=revision.get("assumptions") or [],
         available_env=set(_baseline_env(root)),
         domain_pack=str(workflow.get("domain_pack") or ""),
+        origin=origin,
+        explore_id=str(workflow.get("explore_id") or ""),
     )
-    blocking = [
-        item
-        for item in validation.get("errors") or []
-        if item.get("code") in {"intent_mismatch", "capability_gap"}
-    ]
+    # 探索固化的发布门禁只看无 LLM 重放（已在上方校验），
+    # 覆盖率与能力缺口仅作 advisory，避免误伤真实跑通的轨迹。
+    if explore:
+        blocking: list[dict[str, Any]] = []
+    else:
+        blocking = [
+            item
+            for item in validation.get("errors") or []
+            if item.get("code") in {"intent_mismatch", "capability_gap"}
+        ]
     if blocking:
         first = blocking[0]
         raise StudioError(

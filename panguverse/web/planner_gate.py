@@ -779,23 +779,46 @@ def _is_helper(node: Mapping[str, Any]) -> bool:
     return str(node.get("atom") or "") in _HELPER_ATOMS
 
 
-def intent_coverage(nodes: Iterable[Mapping[str, Any]], intent: str) -> dict[str, Any]:
+#: 等价原子：意图请求某个能力时，这些原子视为同一能力的不同实现。
+#: 探索轨迹可能选用更底层的通用原子（如 ``http_request`` 代替
+#: ``http_get_page``），不应因此被判为与意图无关。
+_ATOM_EQUIVALENTS: dict[str, frozenset[str]] = {
+    "http_get_page": frozenset({"http_request"}),
+    "http_request": frozenset({"http_get_page"}),
+}
+
+
+def _atom_matches_request(atom: str, requested: set[str]) -> bool:
+    if atom in requested:
+        return True
+    return any(atom in _ATOM_EQUIVALENTS.get(name, frozenset()) for name in requested)
+
+
+def intent_coverage(
+    nodes: Iterable[Mapping[str, Any]], intent: str, *, equivalents: bool = False
+) -> dict[str, Any]:
     """意图覆盖率：每个非 helper 节点是否映射到意图动作/实体词。
 
     - helper 节点（断言/日志/变量）不计入分母（它们服务于动作节点）；
-    - 覆盖率 < 60% 由工作台判为 ``intent_mismatch`` 阻断发布。
+    - ``equivalents=True``（探索固化诊断）时，动作原子按 ``_ATOM_EQUIVALENTS``
+      做等价匹配（如 http_request ≈ fetch）；普通草稿仍按精确原子判定；
+    - 覆盖率 < 60% 时：普通草稿由工作台判为 ``intent_mismatch`` 阻断发布，
+      探索固化流程只给 advisory（以无 LLM 重放结果为准）。
+    - 未匹配节点附带 ``unmatched_details``（原子、预测原子集、原因），供前端展示。
     """
     analysis = analyze_intent(intent or "")
     nodes = list(nodes)
     actionable = [node for node in nodes if not _is_helper(node)]
     matched: list[str] = []
     unmatched: list[str] = []
+    unmatched_details: list[dict[str, Any]] = []
     requested = set(analysis.requested_atoms)
+    predicted = sorted(requested)
     terms = [term.lower() for term in analysis.terms if len(term) >= 2 and term not in _STOP_TERMS]
     for node in actionable:
         atom = str(node.get("atom") or "")
         text = _node_text(node)
-        ok = atom in requested
+        ok = _atom_matches_request(atom, requested) if equivalents else atom in requested
         if not ok:
             ok = any(term in text for term in terms)
         node_id = str(node.get("id") or "")
@@ -803,6 +826,22 @@ def intent_coverage(nodes: Iterable[Mapping[str, Any]], intent: str) -> dict[str
             matched.append(node_id)
         else:
             unmatched.append(node_id)
+            reason = f"atom {atom or '?'} 不在预测原子集"
+            if predicted:
+                reason += "（" + ", ".join(predicted) + "）"
+            reason += "；探索可能选用了等价原子或新增原子"
+            unmatched_details.append(
+                {
+                    "node_id": node_id,
+                    "atom": atom,
+                    "reason": reason,
+                    "predicted_atoms": predicted,
+                    "new_atom": bool(node.get("new_atom")),
+                    "role": str((node.get("extra") or {}).get("role") or "")
+                    if isinstance(node.get("extra"), Mapping)
+                    else "",
+                }
+            )
     total = len(actionable)
     ratio = 1.0 if total == 0 else round(len(matched) / total, 4)
     return {
@@ -811,6 +850,7 @@ def intent_coverage(nodes: Iterable[Mapping[str, Any]], intent: str) -> dict[str
         "ratio": ratio,
         "matched_nodes": matched,
         "unmatched_nodes": unmatched,
+        "unmatched_details": unmatched_details,
         "domain": analysis.domain,
     }
 

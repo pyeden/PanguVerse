@@ -822,6 +822,8 @@ class WebAPI:
             available_env=available_env,
             checks=data.get("checks"),
             domain_pack=str(workflow.get("domain_pack") or ""),
+            origin=str(workflow.get("origin") or ""),
+            explore_id=str(workflow.get("explore_id") or ""),
         )
 
     # ------------------------------------------------------------------ #
