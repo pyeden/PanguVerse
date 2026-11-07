@@ -60,6 +60,10 @@ SHARE_TTLS = {
 }
 TEXT_TYPES = {"markdown", "json", "xml", "text"}
 KNOWN_TYPES = TEXT_TYPES | {"image", "file"}
+#: 产出物分类：执行报告（怎么跑的） vs 任务产出（跑出了什么）。
+CATEGORY_EXECUTION = "execution"
+CATEGORY_TASK_OUTPUT = "task_output"
+ARTIFACT_CATEGORIES = {CATEGORY_EXECUTION, CATEGORY_TASK_OUTPUT}
 UNCLASSIFIED = "unclassified"
 DEFAULT_PRODUCES = {
     "summary_md": "markdown",
@@ -494,6 +498,7 @@ def _store(
     file_name: str | None = None,
     source_path: str | None = None,
     kind: str = "deliverable",
+    category: str = CATEGORY_TASK_OUTPUT,
 ) -> dict[str, Any]:
     data = _to_bytes(root, value, declared_type)
     artifact_type = infer_type(name, data, declared_type)
@@ -543,6 +548,9 @@ def _store(
         "file": "" if truncated else filename,
         "truncated": truncated,
         "created_at": time.time(),
+        "category": (
+            CATEGORY_EXECUTION if category == CATEGORY_EXECUTION else CATEGORY_TASK_OUTPUT
+        ),
         "kind": "report" if kind == "report" else "deliverable",
         "path": source_path or filename,
         "_dir": str(run_dir),
@@ -781,6 +789,7 @@ def collect_run(
                             declared_type=declared_type or DEFAULT_PRODUCES.get(name),
                             source_path=source_path,
                             kind="deliverable",
+                            category=CATEGORY_TASK_OUTPUT,
                         )
                 except _ArtifactSourceMissing as exc:
                     warnings.append(f"artifact_source_missing: {atom_name}.{name}: {exc}")
@@ -792,13 +801,31 @@ def collect_run(
     return {"count": len(collected), "artifacts": collected, "warnings": warnings}
 
 
-def artifact_kind(record: Mapping[str, Any]) -> str:
-    """平台运行报告 vs 任务交付物；旧 manifest 没有 kind 时按名字回退。"""
+def artifact_category(record: Mapping[str, Any]) -> str:
+    """执行报告 vs 任务产出；旧 manifest 没有 category 时按 kind/名字回退。"""
+    category = str(record.get("category") or "")
+    if category in ARTIFACT_CATEGORIES:
+        return category
     kind = str(record.get("kind") or "")
-    if kind in {"report", "deliverable"}:
-        return kind
+    if kind == "report":
+        return CATEGORY_EXECUTION
+    if kind == "deliverable":
+        return CATEGORY_TASK_OUTPUT
     name = str(record.get("name") or "")
-    return "report" if name in {spec[1] for spec in RUN_OUTPUT_SPECS} else "deliverable"
+    return (
+        CATEGORY_EXECUTION
+        if name in {spec[1] for spec in RUN_OUTPUT_SPECS}
+        else CATEGORY_TASK_OUTPUT
+    )
+
+
+def artifact_kind(record: Mapping[str, Any]) -> str:
+    """兼容旧调用：执行报告 → report，任务产出 → deliverable。"""
+    return (
+        "report"
+        if artifact_category(record) == CATEGORY_EXECUTION
+        else "deliverable"
+    )
 
 
 def record_insight(
@@ -830,6 +857,7 @@ def record_insight(
                 node_id="insight",
                 declared_type="markdown",
                 replace=True,
+                category=CATEGORY_TASK_OUTPUT,
             )
         return record
     except (OSError, ArtifactError, ValueError):
@@ -905,6 +933,7 @@ def record_run_outputs(
                     file_name=source,
                     source_path=source,
                     kind="report",
+                    category=CATEGORY_EXECUTION,
                 )
         except (OSError, ArtifactError, ValueError) as exc:
             warnings.append(f"{source} 登记失败: {exc}")
@@ -918,6 +947,42 @@ def _run_manifest_paths(root: Path, run_id: str) -> list[Path]:
         return sorted(artifacts_root(root).glob(f"*/{run_id}/{MANIFEST_NAME}"))
     except OSError:
         return []
+
+
+def sync_report_artifact_groups(
+    run_dir: str | Path, task_outputs: list[dict[str, Any]] | None = None
+) -> bool:
+    """把运行目录 report.json 的 artifacts 分为 execution / task_outputs 两组。
+
+    只改报告视图，不改变运行结论；文件不存在或格式不对时静默返回 False。
+    """
+    directory = Path(run_dir)
+    report_path = directory / "report.json"
+    try:
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    if not isinstance(report, dict):
+        return False
+    execution = {
+        source: source
+        for source in ("report.html", "report.json", "junit.xml", "plan.json")
+        if (directory / source).is_file()
+    }
+    outputs = {
+        str(item.get("name")): str(item.get("path") or item.get("file"))
+        for item in (task_outputs or [])
+        if isinstance(item, dict) and item.get("name") and (item.get("path") or item.get("file"))
+    }
+    report["artifacts"] = {"execution": execution, "task_outputs": outputs}
+    try:
+        _atomic_write(
+            report_path,
+            json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8"),
+        )
+    except OSError:
+        return False
+    return True
 
 
 def ensure_run_artifacts(
@@ -970,6 +1035,11 @@ def _iter_records(root: Path) -> list[dict[str, Any]]:
                 continue
             record = dict(item)
             record.setdefault("project_id", data.get("project_id"))
+            record["category"] = artifact_category(record)
+            record.setdefault(
+                "download_url",
+                f"/api/artifacts/{record.get('artifact_id')}/download",
+            )
             record["_dir"] = str(manifest_path.parent)
             records.append(record)
     return records
@@ -981,6 +1051,7 @@ def list_artifacts(
     project: str | None = None,
     run: str | None = None,
     type: str | None = None,
+    category: str | None = None,
     offset: int = 0,
     limit: int = 50,
 ) -> dict[str, Any]:
@@ -993,6 +1064,9 @@ def list_artifacts(
     type_filter = str(type).strip() if type else None
     if type_filter and type_filter not in KNOWN_TYPES:
         raise ArtifactError("bad_request", f"type 非法: {type_filter}")
+    category_filter = str(category).strip() if category else None
+    if category_filter and category_filter not in ARTIFACT_CATEGORIES:
+        raise ArtifactError("bad_request", f"category 非法: {category_filter}")
     records = _iter_records(root)
     if run_filter is not None:
         # 历史 run 可能只有 runs/<id>/ 而没有产出物 manifest：首次查询时惰性回填。
@@ -1011,6 +1085,8 @@ def list_artifacts(
         if run_filter is not None and record.get("run_id") != run_filter:
             continue
         if type_filter is not None and record.get("type") != type_filter:
+            continue
+        if category_filter is not None and record.get("category") != category_filter:
             continue
         items.append(record)
     items.sort(key=lambda item: (-float(item.get("created_at") or 0), str(item.get("artifact_id"))))

@@ -406,6 +406,7 @@ class WebAPI:
                             project=_first(query, "project"),
                             run=_first(query, "run"),
                             type=_first(query, "type"),
+                            category=_first(query, "category"),
                             offset=_offset_query(query, "offset", 0),
                             limit=_int_query(query, "limit", 50, maximum=200),
                         )

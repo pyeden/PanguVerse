@@ -238,16 +238,35 @@ def _step_detail(step: dict[str, Any], detail_id: str) -> str:
     return f'<tr class="detail-row"><td colspan="6"><div class="detail" id="{_e(detail_id)}">{"".join(chunks)}</div></td></tr>'
 
 
+def _artifact_links(group: Any) -> str:
+    if not isinstance(group, dict):
+        return ""
+    return "".join(
+        f'<li><code>{_e(str(name))}</code> → {_e(str(path))}</li>'
+        for name, path in group.items()
+    )
+
+
 def _footer(report: dict[str, Any]) -> str:
     generated = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     artifacts = report.get("artifacts") or {}
-    links = "".join(
-        f'<li><code>{_e(str(name))}</code> → {_e(str(path))}</li>' for name, path in artifacts.items()
-    )
+    if isinstance(artifacts, dict) and any(
+        key in artifacts for key in ("execution", "task_outputs")
+    ):
+        execution = _artifact_links(artifacts.get("execution"))
+        task_outputs = _artifact_links(artifacts.get("task_outputs"))
+        sections = ""
+        if execution:
+            sections += f'<h3>执行报告</h3><ul>{execution}</ul>'
+        if task_outputs:
+            sections += f'<h3>任务产出</h3><ul>{task_outputs}</ul>'
+    else:
+        links = _artifact_links(artifacts)
+        sections = f"<ul>{links}</ul>" if links else ""
     return f"""
 <footer>
   <p>生成时间 {_e(generated)} · 退出码 {_e(str(report.get('conclusion', {}).get('exit_code', 0)))}</p>
-  {f'<ul>{links}</ul>' if links else ''}
+  {sections}
   <p class="sub">PanguVerse · 执行 → 观察 → 沉淀 → 进化</p>
 </footer>"""
 

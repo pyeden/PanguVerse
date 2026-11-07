@@ -285,10 +285,33 @@ def test_workflow_task_collects_deliverables(web: WebClient) -> None:
     assert by_name["news_data"]["type"] == "json"
     assert by_name["report_html"]["type"] == "text"
     assert by_name["report_md"]["type"] == "markdown"
+    assert by_name["news_data"]["category"] == "task_output"
     assert by_name["news_data"]["node_id"] == "s1_hot_report"
     assert by_name["report_html"]["path"] == "report.html"
     assert by_name["report_md"]["path"] == "report.md"
+    assert by_name["report.html"]["category"] == "execution"
+    for item in by_name.values():
+        assert item["download_url"].endswith("/download")
+        assert isinstance(item["created_at"], (int, float))
     assert "missing_deliverable" not in by_name
+
+    # category 过滤
+    status, only_task = web.get_json(f"/api/artifacts?run={run_id}&category=task_output")
+    assert status == 200, only_task
+    assert {item["name"] for item in only_task["items"]} == {
+        "news_data",
+        "report_html",
+        "report_md",
+    }
+    assert all(item["category"] == "task_output" for item in only_task["items"])
+    status, only_exec = web.get_json(f"/api/artifacts?run={run_id}&category=execution")
+    assert status == 200, only_exec
+    assert {"report.html", "report.json", "junit.xml", "plan.json"} <= {
+        item["name"] for item in only_exec["items"]
+    }
+    assert all(item["category"] == "execution" for item in only_exec["items"])
+    status, bad = web.get_json(f"/api/artifacts?run={run_id}&category=nope")
+    assert status == 400 and bad["error"]["code"] == "bad_request"
 
     # 下载字节 == 运行 workspace 原文件；sha256 与 manifest 一致
     for name, relative in (
@@ -314,20 +337,44 @@ def test_workflow_task_collects_deliverables(web: WebClient) -> None:
     assert status == 200, detail
     report = detail["report"]
     assert report["summary"]["success"] is True
-    artifact_names = set(report["artifacts"])
-    assert {"report.html", "news_data", "report_html", "report_md"} <= artifact_names
-    assert report["artifacts"]["report_md"] == "report.md"
-    deliverables = {item["name"]: item for item in report["deliverables"]}
-    assert set(deliverables) == {"news_data", "report_html", "report_md"}
-    assert deliverables["report_html"] == {
-        "name": "report_html",
-        "type": "text",
-        "node_id": "s1_hot_report",
-        "path": "report.html",
-        "artifact_id": by_name["report_html"]["artifact_id"],
-        "bytes": by_name["report_html"]["bytes"],
-        "sha256": by_name["report_html"]["sha256"],
+    assert set(report["artifacts"]) == {"execution", "task_outputs"}
+    assert {"report.html", "report.json", "junit.xml", "plan.json"} <= set(
+        report["artifacts"]["execution"]
+    )
+    assert set(report["artifacts"]["task_outputs"]) == {
+        "news_data",
+        "report_html",
+        "report_md",
     }
+    assert report["artifacts"]["task_outputs"]["report_md"] == "report.md"
+
+    execution = {item["name"]: item for item in report["execution"]}
+    task_outputs = {item["name"]: item for item in report["task_outputs"]}
+    assert {"report.html", "report.json", "junit.xml", "plan.json"} <= set(execution)
+    assert all(item["category"] == "execution" for item in execution.values())
+    assert set(task_outputs) == {"news_data", "report_html", "report_md"}
+    assert all(item["category"] == "task_output" for item in task_outputs.values())
+    for item in report["task_outputs"]:
+        for key in (
+            "category",
+            "name",
+            "type",
+            "bytes",
+            "node_id",
+            "created_at",
+            "download_url",
+        ):
+            assert item.get(key) not in (None, ""), (key, item)
+    assert task_outputs["report_html"]["node_id"] == "s1_hot_report"
+    assert task_outputs["report_html"]["path"] == "report.html"
+    assert task_outputs["report_html"]["artifact_id"] == by_name["report_html"]["artifact_id"]
+    assert report["deliverables"] == report["task_outputs"]
+
+    # 执行明细仍在 execution 报告中（时间线 + 每步状态/参数/输出摘要）
+    steps = report["cases"][0]["steps"]
+    assert [step["step_id"] for step in steps] == ["s1_hot_report"]
+    assert steps[0]["status"] == "passed"
+    assert "outputs" in steps[0] and "inputs" in steps[0]
 
     # 缺产物只 warning，不影响结论
     phase = [item for item in job["phases"] if item["name"] == "artifacts"][-1]
@@ -396,3 +443,85 @@ def test_legacy_atom_produces_still_collected(web: WebClient) -> None:
     assert item["node_id"] == "legacy_report"
     assert item["type"] == "markdown"
     assert item["path"] == "legacy.md"
+
+
+def test_run_without_task_outputs_has_execution_only(web: WebClient) -> None:
+    """没有原子 produces 的运行：只有执行报告，task_outputs 为空。"""
+    (web.workspace / "plain.yaml").write_text(
+        "name: plain\n"
+        "cases:\n"
+        "  - id: c1\n"
+        "    name: plain\n"
+        "    steps:\n"
+        "      - id: set\n"
+        "        use: set_var\n"
+        "        with:\n"
+        "          name: marker\n"
+        "          value: 1\n",
+        encoding="utf-8",
+    )
+    status, queued = web.post_json(
+        "/api/runs", {"mode": "scenario", "scenario": "plain.yaml"}
+    )
+    assert status == 202, queued
+    job = web.wait_job(queued["job_id"])
+    assert job["status"] == "done", job
+    run_id = job["run_id"]
+
+    status, listing = web.get_json(f"/api/artifacts?run={run_id}")
+    assert status == 200, listing
+    assert listing["total"] == 4, listing
+    assert all(item["category"] == "execution" for item in listing["items"])
+    assert {item["name"] for item in listing["items"]} == {
+        "report.html",
+        "report.json",
+        "junit.xml",
+        "plan.json",
+    }
+    status, task_only = web.get_json(f"/api/artifacts?run={run_id}&category=task_output")
+    assert status == 200 and task_only["total"] == 0
+
+    status, detail = web.get_json(f"/api/runs/{run_id}")
+    assert status == 200, detail
+    report = detail["report"]
+    assert report["task_outputs"] == []
+    assert report["artifacts"]["task_outputs"] == {}
+    assert {"report.html", "report.json", "junit.xml", "plan.json"} <= set(
+        report["artifacts"]["execution"]
+    )
+    assert all(item["category"] == "execution" for item in report["execution"])
+
+    disk = json.loads(
+        (web.workspace / "runs" / run_id / "report.json").read_text(encoding="utf-8")
+    )
+    assert set(disk["artifacts"]) == {"execution", "task_outputs"}
+    assert disk["artifacts"]["task_outputs"] == {}
+
+
+def test_legacy_run_backfill_is_execution_only(web: WebClient) -> None:
+    """历史 run 惰性回填只登记执行报告，不会被误判为任务产出。"""
+    run_id = "aaaabbbbdddd"
+    run_dir = web.workspace / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "report.json").write_text(
+        json.dumps({"run_id": run_id, "meta": {}, "summary": {}, "cases": []}),
+        encoding="utf-8",
+    )
+    (run_dir / "report.html").write_text("<html>legacy</html>", encoding="utf-8")
+    (run_dir / "junit.xml").write_text("<testsuite/>", encoding="utf-8")
+    (run_dir / "plan.json").write_text('{"cases": []}', encoding="utf-8")
+
+    status, listing = web.get_json(f"/api/artifacts?run={run_id}")
+    assert status == 200, listing
+    assert listing["total"] == 4, listing
+    assert {item["category"] for item in listing["items"]} == {"execution"}
+
+    status, detail = web.get_json(f"/api/runs/{run_id}")
+    assert status == 200, detail
+    assert detail["report"]["task_outputs"] == []
+    assert {item["name"] for item in detail["report"]["execution"]} == {
+        "report.html",
+        "report.json",
+        "junit.xml",
+        "plan.json",
+    }

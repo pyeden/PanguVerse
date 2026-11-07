@@ -908,6 +908,13 @@ def _execute(
         else:
             artifact_count += int(collected.get("count") or 0)
             artifact_warnings.extend(str(item) for item in collected.get("warnings") or [])
+            # report.json 的 artifacts 分两组落盘；随后登记的报告副本也带分组。
+            try:
+                artifacts_mod.sync_report_artifact_groups(
+                    out_dir, list(collected.get("artifacts") or [])
+                )
+            except Exception as exc:  # noqa: BLE001 - 报告分组是旁路
+                artifact_warnings.append(f"报告产出物分组失败: {sanitize_message(exc)}")
         # 每次运行的报告文件（report.html/json、junit.xml、plan.json）自动登记；
         # 同名覆盖，重复运行/重复调用都不会堆叠。
         try:
@@ -1199,40 +1206,65 @@ def get_run(root: Path, run_id: str) -> dict[str, Any]:
     return {"report": report, "plan": plan}
 
 
+def _artifact_payload(item: dict[str, Any]) -> dict[str, Any]:
+    """UI 稳定字段：category/name/type/bytes/node_id/created_at/download_url。"""
+    return {
+        "category": item.get("category"),
+        "name": item.get("name"),
+        "type": item.get("type"),
+        "bytes": item.get("bytes"),
+        "node_id": item.get("node_id"),
+        "created_at": item.get("created_at"),
+        "download_url": item.get("download_url")
+        or f"/api/artifacts/{item.get('artifact_id')}/download",
+        "path": item.get("path") or item.get("file"),
+        "artifact_id": item.get("artifact_id"),
+        "sha256": item.get("sha256"),
+    }
+
+
 def _attach_run_artifacts(root: Path, run_id: str, report: dict[str, Any]) -> None:
-    """把平台运行报告与任务交付物分开挂到 run 详情（只读，不改磁盘 report.json）。"""
+    """按「执行报告 / 任务产出」两组挂到 run 详情（只读，不改磁盘 report.json）。"""
     try:
         from . import artifacts as artifacts_mod
 
         listing = artifacts_mod.list_artifacts(root, run=run_id, limit=200)
         items = [dict(item) for item in listing.get("items") or []]
     except Exception:  # noqa: BLE001 - 产出物旁路失败不影响 run 详情
-        report["artifacts"] = []
+        report["artifacts"] = {"execution": {}, "task_outputs": {}}
+        report["execution"] = []
+        report["task_outputs"] = []
         report["deliverables"] = []
         return
-    deliverables = [
-        {
-            "name": item.get("name"),
-            "type": item.get("type"),
-            "node_id": item.get("node_id"),
-            "path": item.get("path") or item.get("file"),
-            "artifact_id": item.get("artifact_id"),
-            "bytes": item.get("bytes"),
-            "sha256": item.get("sha256"),
-        }
+
+    execution = [
+        _artifact_payload(item)
         for item in items
-        if artifacts_mod.artifact_kind(item) == "deliverable"
+        if item.get("category") == "execution"
     ]
-    # 保持 report.artifacts 的既有契约（name → path 映射，报告渲染依赖它）：
-    # 平台运行报告与任务交付物都列在同一张表里，deliverables 再单独给出结构化清单。
-    artifacts_map = dict(report.get("artifacts") or {})
-    for item in items:
-        name = str(item.get("name") or "")
-        if not name:
-            continue
-        artifacts_map[name] = item.get("path") or item.get("file") or ""
-    report["artifacts"] = artifacts_map
-    report["deliverables"] = deliverables
+    task_outputs = [
+        _artifact_payload(item)
+        for item in items
+        if item.get("category") == "task_output"
+    ]
+    # report.artifacts 分为两组（name → path）；同时保留结构化的 execution /
+    # task_outputs 清单，UI 不再需要把两类产物混在一张平铺表里。
+    report["artifacts"] = {
+        "execution": {
+            str(item.get("name")): item.get("path") or item.get("file") or ""
+            for item in execution
+            if item.get("name")
+        },
+        "task_outputs": {
+            str(item.get("name")): item.get("path") or item.get("file") or ""
+            for item in task_outputs
+            if item.get("name")
+        },
+    }
+    report["execution"] = execution
+    report["task_outputs"] = task_outputs
+    # 兼容上一版字段：deliverables 是 task_outputs 的别名。
+    report["deliverables"] = task_outputs
 
 
 def run_artifact(root: Path, run_id: str, filename: str) -> Path:
