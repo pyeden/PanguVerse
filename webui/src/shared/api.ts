@@ -750,7 +750,34 @@ export function normalizeValidation(payload: AnyRecord): Validation {
         const ratio = coverageRaw.ratio === undefined || coverageRaw.ratio === null
           ? (total > 0 ? matched / total : 0)
           : Number(coverageRaw.ratio)
-        return { matched, total, ratio: Number.isFinite(ratio) ? ratio : 0 }
+        const gate = typeof coverageRaw.gate === 'string' ? coverageRaw.gate.toLowerCase() : undefined
+        const unmatchedDetails = Array.isArray(coverageRaw.unmatched_details)
+          ? coverageRaw.unmatched_details.map((item: unknown, index: number) => {
+              if (typeof item === 'string') return { node_id: `unmatched-${index}`, reason: item }
+              const record = item as AnyRecord
+              return {
+                ...record,
+                node_id: record.node_id === undefined || record.node_id === null ? undefined : String(record.node_id),
+                atom: record.atom === undefined || record.atom === null ? undefined : String(record.atom),
+                reason: record.reason === undefined || record.reason === null ? undefined : String(record.reason),
+                predicted_atoms: Array.isArray(record.predicted_atoms) ? record.predicted_atoms.map(String) : undefined,
+                new_atom: record.new_atom === true,
+                role: record.role === undefined || record.role === null ? undefined : String(record.role),
+              }
+            })
+          : []
+        const unmatchedNodes = Array.isArray(coverageRaw.unmatched_nodes)
+          ? coverageRaw.unmatched_nodes.map(String)
+          : []
+        return {
+          matched,
+          total,
+          ratio: Number.isFinite(ratio) ? ratio : 0,
+          gate,
+          unmatched_details: unmatchedDetails,
+          unmatched_nodes: unmatchedNodes,
+          warnings: Array.isArray(coverageRaw.warnings) ? coverageRaw.warnings.map(String) : [],
+        }
       })()
     : null
   const missingEnv = Array.isArray(payload.missing_env)

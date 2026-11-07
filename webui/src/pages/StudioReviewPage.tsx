@@ -3,8 +3,10 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, studioApi, isStudioMock, onStudioMockChange, normalizeDiff } from '../shared/api'
 import { navigate, href, useRoute } from '../shared/router'
 import { formatTime, pretty, relativeTime } from '../shared/utils'
+import { blockingValidationErrors } from '../shared/coverage'
 import type { AnyRecord, DiffItem, Risk, StudioDiff, TriggerKind } from '../shared/types'
 import { Icon } from '../components/Icon'
+import { CoverageLine } from '../components/CoverageLine'
 import { TriggerPanel } from '../components/TriggerPanel'
 import {
   Badge,
@@ -85,7 +87,9 @@ export function StudioReviewPage({ wid }: { wid: string }) {
   const acceptedIds = items.filter((item) => decisions[item.id] !== 'reject').map((item) => item.id)
   const requiredRisks = risks.filter((risk) => risk.requires_ack !== false)
   const allRisksAcked = requiredRisks.every((risk, index) => acked[risk.id || `risk-${index}`])
-  const blockingErrors = validationQuery.data?.errors || []
+  const coverage = validationQuery.data?.coverage || null
+  const isExplore = workflow?.origin === 'explore' || Boolean(workflow?.explore_id)
+  const blockingErrors = blockingValidationErrors(validationQuery.data?.errors || [], coverage, isExplore)
   const warnings = validationQuery.data?.warnings || []
   const state = workflow?.state || 'draft'
   const publishedRef = localPublishedRef || workflow?.published_ref || ''
@@ -352,12 +356,7 @@ export function StudioReviewPage({ wid }: { wid: string }) {
           <div className="validation-columns">
             <div>
               <h3 className="subsection-title">校验问题</h3>
-              {validationQuery.data?.coverage ? (
-                <div className={`coverage-line ${validationQuery.data.coverage.ratio < 0.6 ? 'bad' : 'ok'}`}>
-                  <span>意图覆盖率</span>
-                  <strong className="mono">{validationQuery.data.coverage.matched}/{validationQuery.data.coverage.total} = {validationQuery.data.coverage.ratio.toFixed(2)}</strong>
-                </div>
-              ) : null}
+              {coverage ? <CoverageLine coverage={coverage} isExplore={isExplore} /> : null}
               {validationQuery.data?.missing_env?.length ? (
                 <div className="digest-block"><span className="io-label">missing_env</span><div className="digest-chips">{validationQuery.data.missing_env.map((key) => <code key={key}>{key}</code>)}</div></div>
               ) : null}

@@ -25,6 +25,7 @@ import { api, debugReasonDetail, debugReasonLabel, isStudioMock, onStudioMockCha
 import { navigate, href, useRoute } from '../shared/router'
 import { errorText, formatDuration, pretty, statusLabel } from '../shared/utils'
 import { contractText, effectsText, isNewAtomNode, readNewAtomCache } from '../shared/atomContracts'
+import { COVERAGE_ADVISORY_NOTE, blockingValidationErrors, coverageGate, coverageTone } from '../shared/coverage'
 import type {
   AnyRecord,
   Atom,
@@ -40,6 +41,7 @@ import type {
   Workflow,
 } from '../shared/types'
 import { Icon } from '../components/Icon'
+import { CoverageLine } from '../components/CoverageLine'
 import { TriggerPanel, WorkflowRunsPanel } from '../components/TriggerPanel'
 import {
   Badge,
@@ -1044,7 +1046,6 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     return map
   }, [errors])
   const state = workflow?.state || 'draft'
-  const blockingErrors = errors.length > 0
   const filteredAtoms = useMemo(() => {
     const query = addSearch.trim().toLowerCase()
     return atoms.filter((atom) => !query || `${atom.name} ${atom.description || ''} ${atom.category}`.toLowerCase().includes(query)).slice(0, 40)
@@ -1080,6 +1081,10 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const autofilled = Array.isArray(paramAudit.autofilled) ? paramAudit.autofilled : []
   const paramGaps = Array.isArray(paramAudit.param_gaps) ? paramAudit.param_gaps : []
   const coverage = validation.coverage || null
+  const isExplore = workflow.origin === 'explore' || Boolean(workflow.explore_id)
+  const coverageGateValue = coverage ? coverageGate(coverage, isExplore) : null
+  const blockingErrorList = blockingValidationErrors(errors, coverage, isExplore)
+  const blockingErrors = blockingErrorList.length > 0
   const missingEnv = validation.missing_env || []
   const selectedUpstreamBlocked = debugStep && debugStep.status === 'failed' ? upstreamBlockedFor(debugStep.node_id) : []
 
@@ -1118,9 +1123,16 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         </div>
         <div className="studio-top-actions">
           {coverage ? (
-            <span className={`validation-pill ${coverage.ratio < 0.6 ? 'bad' : 'ok'}`} title={`意图覆盖率 ${coverage.matched}/${coverage.total}`}>
+            <span
+              className={`validation-pill ${coverageTone(coverage, isExplore)}`}
+              title={coverageGateValue === 'advisory'
+                ? `意图覆盖率 ${coverage.matched}/${coverage.total}；${COVERAGE_ADVISORY_NOTE}`
+                : `意图覆盖率 ${coverage.matched}/${coverage.total}`}
+              data-coverage-gate={coverageGateValue || undefined}
+              data-testid="canvas-coverage-pill"
+            >
               <Icon name="atoms" size={14} />
-              覆盖 {coverage.matched}/{coverage.total}
+              覆盖 {coverage.matched}/{coverage.total}{coverageGateValue === 'advisory' ? ' · 参考' : ''}
             </span>
           ) : null}
           <span className={`validation-pill ${blockingErrors ? 'bad' : warnings.length ? 'warn' : 'ok'}`} title={blockingErrors ? '存在校验错误，不能提交审阅' : '校验通过'}>
@@ -1136,7 +1148,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
             icon="git"
             loading={submitReview.isPending}
             disabled={blockingErrors}
-            title={blockingErrors ? `先修复 ${errors.length} 个校验错误` : '提交审阅'}
+            title={blockingErrors ? `先修复 ${blockingErrorList.length} 个校验错误` : '提交审阅'}
             onClick={() => state === 'draft' ? submitReview.mutate() : navigate(`/studio/${wid}/review?base=${Math.max(0, currentRev - 1)}&rev=${currentRev}`)}
           >
             {state === 'draft' ? '提交审阅' : '打开审阅'}
@@ -1725,10 +1737,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               <div className="validation-digest">
                 <div className="param-section-head"><span>语义校验</span><span>{coverage ? `${Math.round(coverage.ratio * 100)}%` : '未提供'}</span></div>
                 {coverage ? (
-                  <div className={`coverage-line ${coverage.ratio < 0.6 ? 'bad' : 'ok'}`}>
-                    <span>意图覆盖率</span>
-                    <strong className="mono">{coverage.matched}/{coverage.total} = {coverage.ratio.toFixed(2)}</strong>
-                  </div>
+                  <CoverageLine coverage={coverage} isExplore={isExplore} />
                 ) : <p className="muted">后端未返回 coverage；无法判断意图覆盖。</p>}
                 {missingEnv.length ? (
                   <div className="digest-block">

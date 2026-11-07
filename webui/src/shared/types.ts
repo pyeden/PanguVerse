@@ -407,10 +407,26 @@ export interface Risk {
   acknowledged?: boolean
 }
 
+export interface CoverageUnmatchedDetail {
+  node_id?: string
+  atom?: string
+  reason?: string
+  predicted_atoms?: string[]
+  new_atom?: boolean
+  role?: string
+  [key: string]: any
+}
+
 export interface CoverageStat {
   matched: number
   total: number
   ratio: number
+  /** 发布门禁：探索固化流程为 advisory，普通草稿为 blocking。 */
+  gate?: 'advisory' | 'blocking' | string
+  /** 未匹配节点的原子与原因，供前端折叠展示。 */
+  unmatched_details?: CoverageUnmatchedDetail[]
+  unmatched_nodes?: string[]
+  warnings?: string[]
 }
 
 export interface CapabilityGap {
