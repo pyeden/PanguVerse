@@ -31,6 +31,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -491,6 +492,8 @@ def _store(
     declared_type: str | None = None,
     replace: bool = False,
     file_name: str | None = None,
+    source_path: str | None = None,
+    kind: str = "deliverable",
 ) -> dict[str, Any]:
     data = _to_bytes(root, value, declared_type)
     artifact_type = infer_type(name, data, declared_type)
@@ -540,6 +543,8 @@ def _store(
         "file": "" if truncated else filename,
         "truncated": truncated,
         "created_at": time.time(),
+        "kind": "report" if kind == "report" else "deliverable",
+        "path": source_path or filename,
         "_dir": str(run_dir),
     }
     if existing is not None:
@@ -553,10 +558,105 @@ def _store(
     return _public_record(record)
 
 
+def _relative_output(value: Any) -> str | None:
+    text = str(value or "").replace("\\", "/").strip()
+    if "\n" in text or "\r" in text or len(text) > 4096:
+        return None
+    while text.startswith("./"):
+        text = text[2:]
+    if not text or text.startswith("/") or ".." in Path(text).parts:
+        return None
+    return text
+
+
+def _run_workspace(root: Path, run_id: str) -> Path:
+    """本次运行的持久工作目录：``<runs>/<run_id>/workspace``。"""
+    return _runs_root(root) / run_id / "workspace"
+
+
+def _workspace_output(base: Path, relative: str | None) -> Path | None:
+    if not relative:
+        return None
+    try:
+        base_abs = Path(base).resolve()
+        target = (base_abs / relative).resolve()
+        target.relative_to(base_abs)
+        return target if target.is_file() else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _locate_output(root: Path, workspace: Path, relative: str | None) -> Path | None:
+    """相对产物路径的解析顺序：run workspace → 工作区根 → ``.panguverse``。
+
+    旧原子把路径写成相对 ``.panguverse``（如 ``artifacts/web/a.png``），新原子
+    写在 run workspace；两套布局都要能读到。
+    """
+    for base in (workspace, root, Path(root) / STATE_DIRNAME, artifacts_root(root)):
+        found = _workspace_output(base, relative)
+        if found is not None:
+            return found
+    return None
+
+
+def _produce_specs(raw: Any) -> list[tuple[str, dict[str, Any]]]:
+    """节点 produces → ``[(key, {"path", "type"})]``（兼容字符串简写）。"""
+    if not isinstance(raw, Mapping):
+        return []
+    out: list[tuple[str, dict[str, Any]]] = []
+    for key, value in raw.items():
+        spec: dict[str, Any] = {"path": None, "type": None}
+        if isinstance(value, Mapping):
+            spec["path"] = _relative_output(value.get("path") or value.get("file"))
+            spec["type"] = str(value.get("type") or "").strip() or None
+        elif isinstance(value, str):
+            spec["path"] = _relative_output(value)
+        out.append((str(key), spec))
+    return out
+
+
+def _looks_like_file_ref(
+    value: str, declared_type: str | None, declared_path: str | None
+) -> bool:
+    if declared_path:
+        return True
+    if declared_type == "image":
+        return True
+    return Path(str(value or "")).suffix.lower() in {
+        ".json",
+        ".html",
+        ".htm",
+        ".md",
+        ".xml",
+        ".txt",
+        ".csv",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".svg",
+    }
+
+
 def collect_run(
-    root: Path, run: Any, *, project_id: str | None = None
+    root: Path,
+    run: Any,
+    *,
+    project_id: str | None = None,
+    workspace: str | Path | None = None,
+    registry: Any = None,
 ) -> dict[str, Any]:
-    """收集一次运行里所有声明了 ``produces`` 的步骤输出（失败只返回 warnings）。"""
+    """收集一次运行的任务交付物（失败只返回 warnings，绝不影响运行结论）。
+
+    解析顺序（从强到弱）：
+
+    1. **节点 produces**（固化时写入的 key → 相对路径/类型）；
+    2. 原子 ``Atom.produces``（旧原子/旧工作流的语义声明）。
+
+    原子解析用该 workspace 的 registry（``.panguverse/packs`` 里的新原子），
+    不会因为全局 registry 缺新原子而整段跳过；相对路径以本次运行 workspace 为根。
+    """
     meta = getattr(run, "meta", None)
     meta = meta if isinstance(meta, dict) else {}
     raw_project = project_id or meta.get("project_id")
@@ -567,6 +667,18 @@ def collect_run(
     run_id = validate_run_id(str(getattr(run, "run_id", "") or ""))
     warnings: list[str] = []
     collected: list[dict[str, Any]] = []
+    base_workspace = Path(workspace) if workspace is not None else _run_workspace(root, run_id)
+    if not base_workspace.is_dir():
+        base_workspace = Path(root)
+
+    active_registry = registry
+    if active_registry is None:
+        try:
+            from ..core.workspace_packs import workspace_registry
+
+            active_registry = workspace_registry(root, _registry())
+        except Exception:  # noqa: BLE001 - registry 失败时退回全局库
+            active_registry = _registry()
 
     manifest_path = _manifest_path(root, project, run_id)
     try:
@@ -586,23 +698,73 @@ def collect_run(
             if status in ("failed", "error", "skipped"):
                 continue
             atom_name = str(getattr(step, "atom", "") or "")
-            try:
-                atom = _registry().get(atom_name)
-            except Exception:  # noqa: BLE001 - 未注册原子不阻断收集
-                continue
-            produces = tuple(getattr(atom, "produces", ()) or ())
-            if not produces:
-                continue
             outputs = getattr(step, "outputs", None)
             outputs = outputs if isinstance(outputs, dict) else {}
-            for name in produces:
-                if atom_name == "android_ui_dump" and str(name) == "ui_tree":
-                    value = _ui_tree_value(outputs)
-                else:
-                    value = _resolve_output_value(atom_name, str(name), outputs)
-                if value is None or (isinstance(value, str) and not value.strip()):
-                    warnings.append(f"{atom_name}.{name} 没有输出值，已跳过")
+            step_id = str(getattr(step, "step_id", "") or "")
+
+            produces = getattr(step, "produces", None)
+            if not isinstance(produces, Mapping) or not produces:
+                extra = getattr(step, "extra", None)
+                produces = extra.get("produces") if isinstance(extra, Mapping) else None
+
+            specs = _produce_specs(produces)
+            from_node = bool(specs)
+            atom = None
+            if not specs:
+                try:
+                    atom = active_registry.get(atom_name)
+                except Exception:  # noqa: BLE001 - 未注册原子不阻断收集
+                    warnings.append(f"atom_not_found: {atom_name}（无法解析 produces）")
                     continue
+                specs = [
+                    (str(name), {"path": None, "type": DEFAULT_PRODUCES.get(str(name))})
+                    for name in (getattr(atom, "produces", ()) or ())
+                ]
+            if not specs:
+                continue
+
+            for name, spec in specs:
+                declared_type = spec.get("type")
+                declared_path = spec.get("path")
+                if atom_name == "android_ui_dump" and name == "ui_tree":
+                    raw_value = _ui_tree_value(outputs)
+                else:
+                    raw_value = _resolve_output_value(atom_name, name, outputs)
+
+                path_text = None
+                if isinstance(raw_value, str):
+                    candidate = _relative_output(raw_value)
+                    if candidate and _locate_output(root, base_workspace, candidate):
+                        path_text = candidate
+                if path_text is None and declared_path and _locate_output(
+                    root, base_workspace, declared_path
+                ):
+                    path_text = declared_path
+
+                if path_text is not None:
+                    source = _locate_output(root, base_workspace, path_text)
+                    try:
+                        data = source.read_bytes() if source is not None else b""
+                    except OSError as exc:
+                        warnings.append(f"deliverable_unreadable: {atom_name}.{name}: {exc}")
+                        continue
+                    value: Any = data
+                    source_path = path_text
+                else:
+                    if raw_value is None or (isinstance(raw_value, str) and not raw_value.strip()):
+                        warnings.append(f"deliverable_missing: {atom_name}.{name} 没有输出值，已跳过")
+                        continue
+                    if isinstance(raw_value, str) and _looks_like_file_ref(
+                        raw_value, declared_type, declared_path
+                    ):
+                        warnings.append(
+                            f"artifact_source_missing: {atom_name}.{name}: "
+                            f"{declared_path or raw_value}"
+                        )
+                        continue
+                    value = raw_value
+                    source_path = declared_path
+
                 try:
                     with _LOCK:
                         manifest = _load_manifest(manifest_path, project, run_id)
@@ -611,12 +773,14 @@ def collect_run(
                             project,
                             run_id,
                             manifest,
-                            str(name),
+                            name,
                             value,
-                            node_id=atom_name,
-                            step_id=str(getattr(step, "step_id", "") or ""),
+                            node_id=step_id if from_node else atom_name,
+                            step_id=step_id,
                             case_id=case_id,
-                            declared_type=DEFAULT_PRODUCES.get(str(name)),
+                            declared_type=declared_type or DEFAULT_PRODUCES.get(name),
+                            source_path=source_path,
+                            kind="deliverable",
                         )
                 except _ArtifactSourceMissing as exc:
                     warnings.append(f"artifact_source_missing: {atom_name}.{name}: {exc}")
@@ -626,6 +790,15 @@ def collect_run(
                     continue
                 collected.append(record)
     return {"count": len(collected), "artifacts": collected, "warnings": warnings}
+
+
+def artifact_kind(record: Mapping[str, Any]) -> str:
+    """平台运行报告 vs 任务交付物；旧 manifest 没有 kind 时按名字回退。"""
+    kind = str(record.get("kind") or "")
+    if kind in {"report", "deliverable"}:
+        return kind
+    name = str(record.get("name") or "")
+    return "report" if name in {spec[1] for spec in RUN_OUTPUT_SPECS} else "deliverable"
 
 
 def record_insight(
@@ -730,6 +903,8 @@ def record_run_outputs(
                     declared_type=declared_type,
                     replace=True,
                     file_name=source,
+                    source_path=source,
+                    kind="report",
                 )
         except (OSError, ArtifactError, ValueError) as exc:
             warnings.append(f"{source} 登记失败: {exc}")

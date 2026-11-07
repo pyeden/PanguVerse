@@ -835,6 +835,11 @@ def _execute(
 
     run_id = uuid.uuid4().hex[:12]
     job.set_run_id(run_id)
+    # 每次运行都有持久工作目录：相对产物落在这里，收集后复制进 artifact store，
+    # 不写服务进程 cwd，也不会跑完即删。
+    run_out_dir = axe.workspace.run_dir(run_id)
+    run_workspace = run_out_dir / "workspace"
+    run_workspace.mkdir(parents=True, exist_ok=True)
     meta: dict[str, Any] = {
         "intent": plan.intent,
         "planner": plan.planner,
@@ -857,6 +862,7 @@ def _execute(
         env=effective_env,
         run_id=run_id,
         meta=meta,
+        output_dir=run_workspace,
     )
     summary = run.summary
     job.add_phase(
@@ -892,7 +898,10 @@ def _execute(
     if artifacts_mod is not None:
         try:
             collected = artifacts_mod.collect_run(
-                root, run, project_id=(attribution or {}).get("project_id")
+                root,
+                run,
+                project_id=(attribution or {}).get("project_id"),
+                workspace=run_workspace,
             )
         except Exception as exc:  # noqa: BLE001 - A7
             artifact_warnings.append(f"产出物收集失败: {sanitize_message(exc)}")
@@ -1185,7 +1194,45 @@ def get_run(root: Path, run_id: str) -> dict[str, Any]:
             plan = json.loads(plan_path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             plan = None
+    if isinstance(report, dict):
+        _attach_run_artifacts(root, run_id, report)
     return {"report": report, "plan": plan}
+
+
+def _attach_run_artifacts(root: Path, run_id: str, report: dict[str, Any]) -> None:
+    """把平台运行报告与任务交付物分开挂到 run 详情（只读，不改磁盘 report.json）。"""
+    try:
+        from . import artifacts as artifacts_mod
+
+        listing = artifacts_mod.list_artifacts(root, run=run_id, limit=200)
+        items = [dict(item) for item in listing.get("items") or []]
+    except Exception:  # noqa: BLE001 - 产出物旁路失败不影响 run 详情
+        report["artifacts"] = []
+        report["deliverables"] = []
+        return
+    deliverables = [
+        {
+            "name": item.get("name"),
+            "type": item.get("type"),
+            "node_id": item.get("node_id"),
+            "path": item.get("path") or item.get("file"),
+            "artifact_id": item.get("artifact_id"),
+            "bytes": item.get("bytes"),
+            "sha256": item.get("sha256"),
+        }
+        for item in items
+        if artifacts_mod.artifact_kind(item) == "deliverable"
+    ]
+    # 保持 report.artifacts 的既有契约（name → path 映射，报告渲染依赖它）：
+    # 平台运行报告与任务交付物都列在同一张表里，deliverables 再单独给出结构化清单。
+    artifacts_map = dict(report.get("artifacts") or {})
+    for item in items:
+        name = str(item.get("name") or "")
+        if not name:
+            continue
+        artifacts_map[name] = item.get("path") or item.get("file") or ""
+    report["artifacts"] = artifacts_map
+    report["deliverables"] = deliverables
 
 
 def run_artifact(root: Path, run_id: str, filename: str) -> Path:

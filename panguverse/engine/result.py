@@ -66,6 +66,9 @@ class StepResult:
     heal: list[HealEvent] = field(default_factory=list)
     skipped_reason: str = ""
     tags: list[str] = field(default_factory=list)
+    #: 节点固化的产出物映射（``{key: {"path": ..., "type": ...}}``）。
+    #: 只供运行后的收集器使用，不进入公开报告。
+    produces: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {

@@ -75,6 +75,7 @@ class CancellableExecutor(Executor):
         variables: dict[str, Any] | None = None,
         run_id: str | None = None,
         meta: dict[str, Any] | None = None,
+        output_dir: Any = None,
     ) -> RunResult:
         cases = list(getattr(plan, "cases", []) or [])
         if not cases:
@@ -100,6 +101,7 @@ class CancellableExecutor(Executor):
                 env=merged_env,
                 variables=variables,
                 run_id=run.run_id,
+                output_dir=output_dir,
             )
             run.cases.append(case_result)
             if self.settings.stop_on_first_failure and case_result.status in (FAILED, ERROR):

@@ -17,6 +17,7 @@ import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from ..core.atom import Atom
@@ -118,6 +119,7 @@ class Executor:
         variables: dict[str, Any] | None = None,
         run_id: str | None = None,
         meta: dict[str, Any] | None = None,
+        output_dir: Any = None,
     ) -> RunResult:
         """执行一个测试计划（``plan.cases``）。"""
         cases: list[Molecule] = list(getattr(plan, "cases", []) or [])
@@ -139,6 +141,7 @@ class Executor:
                 env=merged_env,
                 variables=variables,
                 run_id=run.run_id,
+                output_dir=output_dir,
             )
             run.cases.append(case_result)
             if self.settings.stop_on_first_failure and case_result.status in (FAILED, ERROR):
@@ -164,6 +167,7 @@ class Executor:
         run_id: str | None = None,
         parent: RunContext | None = None,
         out: dict[str, Any] | None = None,
+        output_dir: Any = None,
     ) -> CaseResult:
         """执行单个用例（分子）。
 
@@ -192,6 +196,7 @@ class Executor:
                 variables=variables or {},
                 run_id=run_id,
                 workspace=workspace,
+                output_dir=output_dir,
             )
             ctx.env = {**ctx.env, **(env or {})}
         ctx.vars["case_id"] = case.case_id
@@ -257,6 +262,7 @@ class Executor:
             atom=step.use,
             name=step.name or step.description,
             tags=list(step.tags),
+            produces=dict(step.extra.get("produces") or {}),
         )
         started = time.perf_counter()
         budget_used = 0
@@ -416,6 +422,7 @@ class Executor:
                 raise PlanError(
                     f"步骤 {step.id} 缺少必填输入: {', '.join(missing)}（原子 {target.name}）"
                 )
+            self._inject_output_dir(target, inputs, ctx)
             marker = len(ctx.http_log)
             step_result.inputs = _brief(inputs)
             step_result.target = semantics.target(target, inputs)
@@ -446,6 +453,27 @@ class Executor:
                 _sleep(policy.delay_for(attempt))
                 continue
             return outputs
+
+    @staticmethod
+    def _inject_output_dir(
+        target: Atom, inputs: dict[str, Any], ctx: RunContext
+    ) -> None:
+        """给声明了 ``output_dir`` 的原子注入本次运行的持久工作目录。
+
+        固化原子约定把相对产物写到 ``output_dir``；缺省 ``"."`` 会落到服务进程
+        cwd，多个 run 会互相覆盖。这里把相对值统一锚定到 run workspace。
+        """
+        root = getattr(ctx, "output_dir", None)
+        if not root:
+            return
+        accepted = {str(key).rstrip("?") for key in (target.inputs or {})}
+        if "output_dir" not in accepted:
+            return
+        raw = inputs.get("output_dir")
+        if raw in (None, "", ".", "./"):
+            inputs["output_dir"] = str(root)
+        elif not Path(str(raw)).is_absolute():
+            inputs["output_dir"] = str(Path(str(root)) / str(raw))
 
     def _check_capabilities(self, atom: Atom) -> None:
         """能力授权校验：显式授权列表存在时，原子声明的能力必须都在里面。"""

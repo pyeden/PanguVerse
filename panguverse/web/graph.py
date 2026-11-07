@@ -50,6 +50,7 @@ DIFF_NODE_KEYS = (
     "extra",
     "description",
     "case_id",
+    "produces",
 )
 
 
@@ -262,6 +263,9 @@ def _step_spec(node: Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(extra, Mapping):
         for key, value in extra.items():
             spec.setdefault(str(key), copy.deepcopy(value))
+    produces = node.get("produces")
+    if isinstance(produces, Mapping) and produces:
+        spec["produces"] = copy.deepcopy(dict(produces))
     return spec
 
 

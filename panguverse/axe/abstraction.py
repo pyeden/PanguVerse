@@ -122,6 +122,47 @@ def _safe_rel(raw: Any) -> str:
     return text
 
 
+_OUTPUT_TYPE_BY_EXT = {
+    ".md": "markdown",
+    ".markdown": "markdown",
+    ".json": "json",
+    ".html": "text",
+    ".htm": "text",
+    ".xml": "xml",
+    ".txt": "text",
+    ".csv": "text",
+    ".png": "image",
+    ".jpg": "image",
+    ".jpeg": "image",
+    ".gif": "image",
+    ".webp": "image",
+    ".svg": "image",
+}
+
+
+def output_type_for(path: str) -> str:
+    """产出物路径 → 平台类型（与 Web 层 ``KNOWN_TYPES`` 对齐）。"""
+    return _OUTPUT_TYPE_BY_EXT.get(Path(str(path or "")).suffix.lower(), "text")
+
+
+def produces_from_output_paths(output_paths: Mapping[str, Any]) -> dict[str, dict[str, str]]:
+    """把原子契约的 ``output_paths`` 固化成 ``produces`` 映射（键 → 路径/类型）。
+
+    ``output_paths`` 是「会写哪些文件」的执行契约，``produces`` 是「交付什么」的
+    产出物契约。固化时两者必须同时落地：收集链路不能只依赖全局原子库里的
+    ``Atom.produces``，否则新原子在工作区里根本不会被收集。
+    """
+    specs: dict[str, dict[str, str]] = {}
+    if not isinstance(output_paths, Mapping):
+        return specs
+    for key, value in output_paths.items():
+        rel = _safe_rel(value)
+        if not rel:
+            continue
+        specs[str(key)] = {"path": rel, "type": output_type_for(rel)}
+    return specs
+
+
 def build_digest(
     events: Iterable[Mapping[str, Any]],
     *,
@@ -1081,6 +1122,7 @@ def write_atom(
     atom_path = atoms_dir / f"{name}.py"
     atom_path.write_text(source, encoding="utf-8")
     sha = _hash_bytes(source.encode("utf-8"))
+    output_paths = dict(contract.get("output_paths") or {})
     return {
         "name": name,
         "pack": pack,
@@ -1089,7 +1131,8 @@ def write_atom(
         "description": description,
         "inputs": dict(contract.get("inputs") or {}),
         "outputs": dict(contract.get("outputs") or {}),
-        "output_paths": dict(contract.get("output_paths") or {}),
+        "output_paths": output_paths,
+        "produces": produces_from_output_paths(output_paths),
         "effects": list(contract.get("effects") or ["write"]),
         "idempotent": bool(contract.get("idempotent", True)),
         "failure_class": str(contract.get("failure_class") or "internal"),
@@ -1119,6 +1162,7 @@ def write_pack_manifest(workspace: Path, eid: str, atoms: list[dict[str, Any]]) 
                 "inputs",
                 "outputs",
                 "output_paths",
+                "produces",
                 "effects",
                 "idempotent",
                 "failure_class",
@@ -1214,6 +1258,7 @@ def _node(
     tags: list[str],
     case_name: str,
     new_atom: bool = False,
+    produces: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": node_id,
@@ -1235,6 +1280,7 @@ def _node(
         "origin": "explore",
         "new_atom": bool(new_atom),
         "locked": False,
+        "produces": dict(produces or {}),
     }
 
 
@@ -1745,6 +1791,8 @@ def build_graph_from_plan(
                     tags=["explore", "new_atom", "script"],
                     case_name=name or intent,
                     new_atom=True,
+                    produces=info.get("produces")
+                    or produces_from_output_paths(info.get("output_paths") or {}),
                 )
             )
         else:
@@ -2001,9 +2049,18 @@ def build_graph_from_plan(
                 node["capture"] = dict(captures.get(index) or {})
                 break
 
+    graph_produces: list[dict[str, Any]] = []
+    for node in nodes:
+        for key, spec in (node.get("produces") or {}).items():
+            entry: dict[str, Any] = {"node_id": str(node.get("id")), "name": str(key)}
+            if isinstance(spec, Mapping):
+                entry.update({"path": spec.get("path"), "type": spec.get("type")})
+            graph_produces.append(entry)
+
     return {
         "nodes": nodes,
         "edges": edges,
+        "produces": graph_produces,
         "checks": final_checks,
         "dropped_checks": dropped_checks,
         "pending_atoms": list(pending),

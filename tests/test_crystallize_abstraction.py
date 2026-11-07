@@ -269,6 +269,18 @@ def test_graph_has_data_edges_and_semantic_asserts() -> None:
     assert atoms == ["http_request", "build_report", "assert_file_min_items"]
     assert any(edge["kind"] == "data" and edge["from"] == "s1_http_request" for edge in graph["edges"])
     assert graph["checks"] and graph["checks"][0]["type"] == "min_items"
+    render = next(node for node in graph["nodes"] if node["atom"] == "build_report")
+    assert render["produces"] == {
+        "report_json": {"path": "report.json", "type": "json"}
+    }
+    assert graph["produces"] == [
+        {
+            "node_id": render["id"],
+            "name": "report_json",
+            "path": "report.json",
+            "type": "json",
+        }
+    ]
 
 
 def test_crystallize_rejects_hardcoded_recording_as_not_general(tmp_path: Path) -> None:
@@ -565,3 +577,43 @@ def test_percent_css_template_atom_is_rejected(tmp_path: Path) -> None:
     assert any(
         "runtime_error" in item for item in generality["violations"]
     )
+
+
+def test_write_atom_derives_produces_from_output_paths(tmp_path: Path) -> None:
+    from panguverse.core.workspace_packs import workspace_registry
+
+    contract = {
+        "inputs": {"output_dir?": "string?"},
+        "outputs": {"news_data": "string", "report_md": "string"},
+        "output_paths": {"news_data": "news_data.json", "report_md": "report.md"},
+        "effects": ["write"],
+        "idempotent": True,
+    }
+    source = (
+        "def run(ctx=None, output_dir='.'):\n"
+        "    return {'news_data': 'news_data.json', 'report_md': 'report.md'}\n"
+    )
+    info = abstraction.write_atom(
+        workspace=tmp_path,
+        eid="e-produces",
+        name="hot_report",
+        source=source,
+        contract=contract,
+        script={},
+        description="生成报告",
+        generality=abstraction.GeneralityReport(ok=True),
+    )
+    assert info["produces"] == {
+        "news_data": {"path": "news_data.json", "type": "json"},
+        "report_md": {"path": "report.md", "type": "markdown"},
+    }
+    abstraction.write_pack_manifest(tmp_path, "e-produces", [info])
+    manifest = json.loads(
+        (tmp_path / ".panguverse" / "packs" / "explore_e_produces" / "pack.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    entry = next(item for item in manifest["atoms"] if item["name"] == "hot_report")
+    assert entry["produces"] == info["produces"]
+    atom = workspace_registry(tmp_path).get("hot_report")
+    assert atom.produces == ("news_data", "report_md")

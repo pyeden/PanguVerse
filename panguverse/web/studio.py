@@ -1107,6 +1107,7 @@ def create_draft_from_graph(
         "abstraction_plan": copy.deepcopy((abstraction or {}).get("plan") or {}),
         "atoms_created": copy.deepcopy((abstraction or {}).get("atoms_created") or []),
         "dropped_steps": copy.deepcopy((abstraction or {}).get("dropped_steps") or []),
+        "produces": _node_produces(nodes),
         "llm_calls_replay": (abstraction or {}).get("replay_llm_calls"),
     }
     revision = {
@@ -1132,6 +1133,7 @@ def create_draft_from_graph(
         "abstraction_plan": copy.deepcopy((abstraction or {}).get("plan") or {}),
         "atoms_created": copy.deepcopy((abstraction or {}).get("atoms_created") or []),
         "dropped_steps": copy.deepcopy((abstraction or {}).get("dropped_steps") or []),
+        "produces": _node_produces(nodes),
         "llm_calls_replay": (abstraction or {}).get("replay_llm_calls"),
         "nodes": copy.deepcopy(nodes),
         "edges": copy.deepcopy(edges),
@@ -1178,6 +1180,19 @@ def create_draft_from_graph(
         "validation": validation,
         "replay_status": "pending",
     }
+
+
+def _node_produces(nodes: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """工作流级产出物清单（聚合展示；收集仍以节点 produces 为准）。"""
+    out: list[dict[str, Any]] = []
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        for name, spec in (node.get("produces") or {}).items():
+            entry: dict[str, Any] = {"node_id": node_id, "name": str(name)}
+            if isinstance(spec, Mapping):
+                entry.update({"path": spec.get("path"), "type": spec.get("type")})
+            out.append(entry)
+    return out
 
 
 def record_replay(

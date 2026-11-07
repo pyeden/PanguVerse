@@ -78,6 +78,15 @@ def _atom_from_manifest(raw: Mapping[str, Any], *, base: Path, pack: str, domain
         raise ValueError(f"原子模块缺少 run(): {target}")
     inputs = raw.get("inputs")
     outputs = raw.get("outputs")
+    declared = raw.get("produces")
+    if isinstance(declared, Mapping):
+        produces = tuple(str(key) for key in declared)
+    elif isinstance(declared, (list, tuple)):
+        produces = tuple(str(item) for item in declared)
+    else:
+        # 旧包没有 produces：output_paths 的键就是任务产出物（向后兼容）。
+        paths = raw.get("output_paths")
+        produces = tuple(str(key) for key in paths) if isinstance(paths, Mapping) else ()
     return Atom(
         name=name,
         fn=fn,
@@ -94,6 +103,7 @@ def _atom_from_manifest(raw: Mapping[str, Any], *, base: Path, pack: str, domain
         failure_class=str(raw.get("failure_class") or ""),
         source="explore",
         version=str(raw.get("version") or "0.1.0"),
+        produces=produces,
     )
 
 

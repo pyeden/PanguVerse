@@ -45,6 +45,7 @@ class RunContext:
         secrets: dict[str, Any] | None = None,
         run_id: str | None = None,
         workspace: Any = None,
+        output_dir: Any = None,
         parent: RunContext | None = None,
         share: bool = False,
     ) -> None:
@@ -60,6 +61,9 @@ class RunContext:
             self.vars = dict(variables or {})
             self.secrets = dict(secrets or {})
         self.workspace = workspace if workspace is not None else (parent.workspace if parent else None)
+        # 本次运行的持久工作目录：原子声明了 ``output_dir`` 时默认落到这里，
+        # 避免相对产物写进服务进程 cwd（多 run 互相覆盖）。
+        self.output_dir = output_dir if output_dir is not None else (parent.output_dir if parent else None)
         self.trace: list[dict[str, Any]] = parent.trace if parent else []
         self.http_log: list[dict[str, Any]] = parent.http_log if parent else []
         self.meta: dict[str, Any] = {
@@ -214,6 +218,7 @@ class RunContext:
             secrets=dict(self.secrets),
             run_id=self.run_id,
             workspace=self.workspace,
+            output_dir=self.output_dir,
         )
 
     def emit(self, event: str, **data: Any) -> None:
