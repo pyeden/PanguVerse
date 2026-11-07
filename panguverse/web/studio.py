@@ -63,6 +63,12 @@ _URL_KEY_RE = re.compile(
 STATES = ("draft", "review", "approved", "rejected")
 TRANSITIONS = ("review", "approved", "rejected")
 DEBUG_MODES = ("only", "from_start", "downstream")
+#: 探索固化流程：覆盖率 / 意图匹配 / 能力缺口仅 advisory，不阻断发布。
+_ADVISORY_CODES = frozenset(
+    {"intent_mismatch", "capability_gap", "intent_coverage_advisory"}
+)
+#: 普通草稿：覆盖率仍是 blocking 门禁；仅纯提示码可被忽略。
+_NON_EXPLORE_ADVISORY_CODES = frozenset({"intent_coverage_advisory"})
 #: 站点别名只服务网页域；非网页域不暴露 url，也不改写接口/设备节点参数。
 _WEB_DOMAINS = frozenset({"web_research", "web_browser"})
 MAX_TEXT = 2000
@@ -2136,21 +2142,17 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
         origin=origin,
         explore_id=str(workflow.get("explore_id") or ""),
     )
-    # 探索固化的覆盖率 / 意图匹配 / 能力缺口仅作 advisory，避免误伤真实跑通的
-    # 轨迹；但原子、参数、引用、缺失变量等结构性错误仍是发布硬门禁。
-    if explore:
-        blocking: list[dict[str, Any]] = [
-            item
-            for item in validation.get("errors") or []
-            if item.get("code")
-            not in {"intent_mismatch", "capability_gap", "intent_coverage_advisory"}
-        ]
-    else:
-        blocking = [
-            item
-            for item in validation.get("errors") or []
-            if item.get("code") in {"intent_mismatch", "capability_gap"}
-        ]
+    # 发布门禁只豁免 advisory 码，其余 validation error 一律阻断：
+    # - 探索固化流程的覆盖率 / 意图匹配 / 能力缺口来自真实轨迹，仅作提示；
+    # - 普通草稿覆盖率仍是 blocking，因此只有 intent_coverage_advisory 这种
+    #   纯提示码可被过滤，intent_mismatch / capability_gap 与 P001/P002/P101
+    #   等结构性错误全部是硬门禁（与前端 blockingValidationErrors 保持一致）。
+    advisory_codes = _ADVISORY_CODES if explore else _NON_EXPLORE_ADVISORY_CODES
+    blocking: list[dict[str, Any]] = [
+        item
+        for item in validation.get("errors") or []
+        if item.get("code") not in advisory_codes
+    ]
     if blocking:
         first = blocking[0]
         raise StudioError(
