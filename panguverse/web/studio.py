@@ -33,7 +33,7 @@ from ..axe.plan import PlanRequest
 from ..axe.planner import RuleBasedPlanner
 from ..core.context import MISSING, RunContext, split_path, walk_path
 from ..core.contract import failure_is_retryable
-from ..core.errors import AtomFailure, PanguError, StepFailure
+from ..core.errors import AtomFailure, AtomNotFoundError, PanguError, StepFailure
 from ..core.molecule import Step
 from ..core.redact import mask_obj
 from . import param_fill, planner_gate, projects
@@ -75,6 +75,7 @@ _STATUS_BY_CODE = {
     "risk_unconfirmed": 409,
     "intent_mismatch": 409,
     "capability_gap": 409,
+    "atom_missing": 409,
     "not_general": 422,
     "replay_failed": 422,
     "internal_error": 500,
@@ -755,6 +756,27 @@ def validate_nodes(
         "affected_nodes": affected,
         **detail,
     }
+
+
+def _unresolved_atoms(
+    root: Path, nodes: Iterable[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """发布硬门禁：节点引用的原子必须能在当前工作区 registry 中解析。
+
+    覆盖探索固化产生的工作区新原子（``.panguverse/packs``）；工作区包缺失
+    或原子拼写错误时返回未解析清单，由调用方转成 ``atom_missing`` 409。
+    """
+    from ..core.workspace_packs import workspace_registry
+
+    registry = workspace_registry(root, _registry())
+    missing: list[dict[str, Any]] = []
+    for node in nodes:
+        atom = str(node.get("atom") or "").strip()
+        try:
+            registry.get(atom)
+        except AtomNotFoundError:
+            missing.append({"atom": atom, "node_id": str(node.get("id") or "")})
+    return missing
 
 
 # --------------------------------------------------------------------------- #
@@ -2087,6 +2109,19 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
     if rev != int(workflow.get("current_rev") or 0):
         raise StudioError("conflict", "只能发布当前版本（请先重新批准最新 rev）")
     revision = read_revision(root, wid, rev)
+    missing_atoms = _unresolved_atoms(root, revision.get("nodes") or [])
+    if missing_atoms:
+        first = missing_atoms[0]
+        raise StudioError(
+            "atom_missing",
+            f"发布校验失败：原子不存在 {first['atom']}",
+            status=409,
+            details={
+                "atom": first["atom"],
+                "node_id": first["node_id"],
+                "missing_atoms": missing_atoms,
+            },
+        )
     validation = validate_nodes(
         root,
         wid=wid,
@@ -2101,10 +2136,15 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
         origin=origin,
         explore_id=str(workflow.get("explore_id") or ""),
     )
-    # 探索固化的发布门禁只看无 LLM 重放（已在上方校验），
-    # 覆盖率与能力缺口仅作 advisory，避免误伤真实跑通的轨迹。
+    # 探索固化的覆盖率 / 意图匹配 / 能力缺口仅作 advisory，避免误伤真实跑通的
+    # 轨迹；但原子、参数、引用、缺失变量等结构性错误仍是发布硬门禁。
     if explore:
-        blocking: list[dict[str, Any]] = []
+        blocking: list[dict[str, Any]] = [
+            item
+            for item in validation.get("errors") or []
+            if item.get("code")
+            not in {"intent_mismatch", "capability_gap", "intent_coverage_advisory"}
+        ]
     else:
         blocking = [
             item

@@ -58,12 +58,14 @@ EDGES = [
 ]
 
 
-def create_explore_draft(api: WebAPI) -> dict[str, Any]:
+def create_explore_draft(
+    api: WebAPI, *, nodes: list[dict[str, Any]] | None = None
+) -> dict[str, Any]:
     return studio.create_draft_from_graph(
         api.root,
         intent=INTENT,
         name=INTENT,
-        nodes=explore_nodes(),
+        nodes=nodes if nodes is not None else explore_nodes(),
         edges=EDGES,
         explore_id="e-test",
         registry=service.registry(),
@@ -133,6 +135,75 @@ def test_explore_replay_failed_still_blocks_publish(api: WebAPI) -> None:
     )
     assert status == 409, body
     assert body["error"]["code"] == "replay_failed"
+
+
+def test_explore_replay_pending_blocks_publish(api: WebAPI) -> None:
+    draft = create_explore_draft(api)
+    wid = draft["wid"]
+    approve(api, wid)
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "x"}
+    )
+    assert status == 409, body
+    assert body["error"]["code"] == "replay_pending"
+
+
+def test_explore_replay_passed_with_failed_check_blocks_publish(api: WebAPI) -> None:
+    draft = create_explore_draft(api)
+    wid = draft["wid"]
+    studio.record_replay(
+        api.root,
+        wid,
+        {"status": "passed", "checks": [{"id": "items>=1", "ok": False}]},
+    )
+    approve(api, wid)
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "x"}
+    )
+    assert status == 409, body
+    assert body["error"]["code"] == "replay_failed"
+    assert body["error"]["failed_checks"][0]["id"] == "items>=1"
+
+
+def test_explore_missing_atom_blocks_publish(api: WebAPI) -> None:
+    nodes = explore_nodes()
+    nodes[1]["atom"] = "explore_atom_not_in_registry"
+    draft = create_explore_draft(api, nodes=nodes)
+    wid = draft["wid"]
+    studio.record_replay(
+        api.root,
+        wid,
+        {"status": "passed", "checks": [{"id": "items>=1", "ok": True}]},
+    )
+    approve(api, wid)
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "x"}
+    )
+    assert status == 409, body
+    assert body["error"]["code"] == "atom_missing"
+    assert body["error"]["atom"] == "explore_atom_not_in_registry"
+
+
+def test_explore_structural_error_still_blocks_publish(api: WebAPI) -> None:
+    nodes = explore_nodes()
+    nodes[0]["params"]["url"] = "https://example.com/${undefined_node_var}"
+    draft = create_explore_draft(api, nodes=nodes)
+    wid = draft["wid"]
+    studio.record_replay(
+        api.root,
+        wid,
+        {"status": "passed", "checks": [{"id": "items>=1", "ok": True}]},
+    )
+    approve(api, wid)
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "x"}
+    )
+    assert status == 409, body
+    assert body["error"]["code"] == "P101"
+    assert any(
+        item["code"] == "P101"
+        for item in body["error"]["blocking"]
+    )
 
 
 def test_non_explore_low_coverage_still_blocked(api: WebAPI) -> None:
