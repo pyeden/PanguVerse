@@ -200,3 +200,29 @@ def test_http_error_request_id_is_preserved(monkeypatch) -> None:
         assert exc.request_id == "rid-123"
     else:  # pragma: no cover - 必须抛错
         raise AssertionError("连续 500 应当抛 LLMError")
+
+
+def test_complete_json_uses_low_reasoning_and_generous_tokens(monkeypatch) -> None:
+    body = json.dumps(
+        {"choices": [{"message": {"content": json.dumps({"ok": True})}, "finish_reason": "stop"}]}
+    ).encode()
+    capture = _CaptureOpener(body)
+    monkeypatch.setattr(llm_mod, "_DIRECT_OPENER", capture)
+    client = LLMClient(api_key="***", backend="openai", base_url="http://127.0.0.1:1", retry_backoff=0)
+    assert client.complete_json("system", "user") == {"ok": True}
+    payload, _timeout = capture.requests[0]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload["max_tokens"] == 4096
+    assert payload["reasoning_effort"] == "none"
+
+
+def test_complete_json_truncated_by_length_is_clear(monkeypatch) -> None:
+    capture = _CaptureOpener(b'{"choices":[{"message":{"content":""},"finish_reason":"length"}]}')
+    monkeypatch.setattr(llm_mod, "_DIRECT_OPENER", capture)
+    client = LLMClient(api_key="***", backend="openai", base_url="http://127.0.0.1:1", retry_backoff=0)
+    try:
+        client.complete_json("system", "user")
+    except LLMError as exc:
+        assert "finish_reason=length" in str(exc)
+    else:  # pragma: no cover - 必须抛错
+        raise AssertionError("截断的 JSON 必须抛 LLMError")

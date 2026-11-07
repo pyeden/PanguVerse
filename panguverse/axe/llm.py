@@ -264,9 +264,30 @@ class LLMClient:
                 raise LLMError(f"{type(exc).__name__}: {exc}") from exc
         raise last_error or LLMError("未知错误")
 
-    def complete_json(self, system: str, user: str) -> dict[str, Any]:
-        """要求返回 JSON 对象；解析失败会抛出 LLMError。"""
-        text = self.complete(system, user, json_mode=True)
+    def complete_json(
+        self,
+        system: str,
+        user: str,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """要求返回 JSON 对象；解析失败会抛出 LLMError。
+
+        结构化 JSON 不需要思维链：默认 ``reasoning_effort=none``，否则推理 token
+        会吃掉 max_tokens，导致 content 为空（finish_reason=length）。
+        """
+        json_max_tokens = _env_int("PANGUVERSE_LLM_JSON_MAX_TOKENS", 4096)
+        json_effort = (os.getenv("PANGUVERSE_LLM_JSON_REASONING_EFFORT") or "none").strip() or None
+        text = self.complete(
+            system,
+            user,
+            json_mode=True,
+            max_tokens=json_max_tokens,
+            timeout=timeout,
+            reasoning_effort=json_effort,
+        )
+        if not text.strip():
+            raise LLMError("LLM 返回空内容（可能被 max_tokens 截断）")
         data = _extract_json(text)
         if not isinstance(data, dict):
             raise LLMError(f"LLM 未返回 JSON 对象: {text[:200]}")
@@ -312,7 +333,23 @@ class LLMClient:
             choices = data["choices"]
             if not isinstance(choices, list) or not choices:
                 raise KeyError("choices")
-            return choices[0]["message"]["content"] or ""
+            choice = choices[0]
+            message = choice.get("message") or {}
+            content = message.get("content") or ""
+            finish = choice.get("finish_reason")
+            if json_mode and finish == "length":
+                raise LLMError(
+                    "LLM JSON 输出被截断（finish_reason=length）：请提高 max_tokens 或关闭 reasoning",
+                    retryable=False,
+                )
+            if not str(content).strip() and finish == "length":
+                raise LLMError(
+                    "LLM 输出被截断（finish_reason=length）：max_tokens 或 reasoning effort 限制过紧",
+                    retryable=False,
+                )
+            return content
+        except LLMError:
+            raise
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(
                 f"LLM 响应无 choices: {str(data)[:200]}",
