@@ -37,9 +37,25 @@ DIR_MODE = 0o700
 FILE_MODE = 0o600
 MAX_EVENT_TEXT = 4_000
 TERMINAL_STATUSES = ("succeeded", "failed", "budget_exceeded", "error")
+DEFAULT_TOTAL_TIMEOUT = 300.0
+MIN_TOTAL_TIMEOUT = 60.0
+MAX_TOTAL_TIMEOUT = 3600.0
+#: 每步预算估计；max_steps 会按 total_timeout / 该值封顶，避免 50 步撞 300s。
+DEFAULT_STEP_SECONDS = 25.0
 
 _LOCKS: dict[str, threading.Lock] = {}
 _LOCKS_GUARD = threading.Lock()
+
+
+def _step_seconds_env() -> float:
+    raw = os.getenv("PANGUVERSE_EXPLORE_STEP_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_STEP_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DEFAULT_STEP_SECONDS
+    return value if value >= 1.0 else DEFAULT_STEP_SECONDS
 
 
 # --------------------------------------------------------------------------- #
@@ -255,7 +271,14 @@ def start_explore(
         max_steps = int(data.get("max_steps") or 12)
     except (TypeError, ValueError) as exc:
         raise StudioError("bad_request", "max_steps 必须是整数") from exc
+    try:
+        total_timeout = float(data.get("total_timeout") or DEFAULT_TOTAL_TIMEOUT)
+    except (TypeError, ValueError) as exc:
+        raise StudioError("bad_request", "total_timeout 必须是数字") from exc
+    total_timeout = max(MIN_TOTAL_TIMEOUT, min(MAX_TOTAL_TIMEOUT, total_timeout))
     max_steps = max(1, min(50, max_steps))
+    # 步数不能超过时间预算能容纳的决策次数：慢模型下 50 步/300s 必然超时。
+    max_steps = min(max_steps, max(1, int(total_timeout // _step_seconds_env())))
     allow_scripts = data.get("allow_scripts") is not False
     domain_pack = str(data.get("domain_pack") or "").strip()[:80]
     eid = "e-" + uuid.uuid4().hex[:12]
@@ -270,6 +293,7 @@ def start_explore(
         "domain_pack": domain_pack,
         "allow_scripts": allow_scripts,
         "max_steps": max_steps,
+        "total_timeout": total_timeout,
         "model": _llm_status(llm).get("model") or data.get("model") or "",
         "status": "running",
         "created_at": now,
@@ -331,6 +355,7 @@ def _run_session(
             emit=writer.append,
             allow_scripts=bool(meta.get("allow_scripts")),
             max_steps=int(meta.get("max_steps") or 12),
+            total_timeout=float(meta.get("total_timeout") or DEFAULT_TOTAL_TIMEOUT),
             intent=str(meta.get("intent") or ""),
             domain_pack=str(meta.get("domain_pack") or ""),
         )

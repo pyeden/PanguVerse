@@ -14,6 +14,7 @@ the sandbox executable in isolation and easy to unit test.
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -40,6 +41,8 @@ MAX_PROMPT_OBSERVATIONS = 6
 MAX_PROMPT_SLIM_OBSERVATIONS = 3
 MAX_PROMPT_SLIM_OBSERVATION = 800
 MAX_PROMPT_BYTES = 8 * 1024
+#: 一次 LLM 决策至少需要这么多剩余预算；不足就直接按已有产物收尾。
+MIN_STEP_BUDGET_SECONDS = 15.0
 
 _FULL_STEP_REF_RE = re.compile(r"^\$\{step(\d+)\.([^}]+)\}$")
 _FULL_LAST_REF_RE = re.compile(r"^\$\{last\.([^}]+)\}$")
@@ -838,13 +841,19 @@ class ExploreAgent:
                     last_checks=last_checks,
                     reason=f"LLM 回合超限（>{self.max_steps + 6}）",
                 )
-            if self.clock() - self.started >= self.total_timeout:
+            remaining_budget = self.total_timeout - (self.clock() - self.started)
+            if remaining_budget <= MIN_STEP_BUDGET_SECONDS:
+                reason = (
+                    f"总时长超过 {self.total_timeout:.0f}s"
+                    if remaining_budget <= 0
+                    else f"剩余预算不足 {remaining_budget:.0f}s"
+                )
                 return self._auto_finalize(
                     actions_used=actions_used,
                     checks_spec=checks_spec,
                     given_criteria=has_user_criteria,
                     last_checks=last_checks,
-                    reason=f"总时长超过 {self.total_timeout:.0f}s",
+                    reason=reason,
                 )
             try:
                 decision = self._decide(intent, checks_spec, actions_used + 1, feedback)
@@ -1198,11 +1207,26 @@ class ExploreAgent:
     ) -> dict[str, Any]:
         payload = self._decision_payload(intent, criteria, step_no, feedback, slim=slim)
         user = self._serialize_prompt(payload, prompt_budget)
+        # 单次调用不能超过本次探索剩余预算：否则重试会直接把会话拖到硬超时。
+        remaining = max(0.0, self.total_timeout - (self.clock() - self.started))
+        client_timeout = float(getattr(self.llm, "timeout", 120.0) or 120.0)
+        call_timeout = max(2.0, min(client_timeout, remaining - 1.0))
+        observer = self._llm_observer(step_no)
         try:
             # 真实模型有时会在 JSON 前后夹带解释或多个对象；complete_json 会整段
             # 解析失败。这里取原始文本并抽取真正的 action 对象。
             if hasattr(self.llm, "complete"):
-                decision = _extract_decision(self.llm.complete(system, user))
+                decision = _extract_decision(
+                    _call_complete(
+                        self.llm,
+                        system,
+                        user,
+                        json_mode=True,
+                        timeout=call_timeout,
+                        reasoning_effort=_explore_reasoning_effort(),
+                        observer=observer,
+                    )
+                )
             else:
                 decision = self.llm.complete_json(system, user)
         except Exception as exc:
@@ -1211,6 +1235,14 @@ class ExploreAgent:
         if not isinstance(decision, dict):
             raise AgentExecError("llm_invalid", "LLM 未返回 JSON 对象", status=502)
         return decision
+
+    def _llm_observer(self, step_no: int) -> Callable[[dict[str, Any]], None]:
+        """Trace every LLM attempt so failures are diagnosable from the session."""
+
+        def observe(event: dict[str, Any]) -> None:
+            self.emit("llm_call", {"step": step_no, **event})
+
+        return observe
 
     def _decision_payload(
         self,
@@ -2294,3 +2326,28 @@ def replay_graph(
     if cleanup:
         shutil.rmtree(sandbox, ignore_errors=True)
     return payload
+
+
+def _explore_reasoning_effort() -> str | None:
+    """探索决策默认关闭思维链：结构化 JSON 决策不需要长 reasoning。"""
+    raw = os.getenv("PANGUVERSE_EXPLORE_REASONING_EFFORT", "none").strip()
+    return raw or None
+
+
+def _call_complete(
+    llm: Any,
+    system: str,
+    user: str,
+    **options: Any,
+) -> str:
+    """Call ``complete`` with only the keyword options the LLM object supports.
+
+    Test doubles and third-party clients only implement ``complete(system, user)``;
+    passing new keywords blindly would break them.
+    """
+    try:
+        params = inspect.signature(llm.complete).parameters
+    except (TypeError, ValueError):
+        params = {}
+    kwargs = {key: value for key, value in options.items() if key in params}
+    return llm.complete(system, user, **kwargs)

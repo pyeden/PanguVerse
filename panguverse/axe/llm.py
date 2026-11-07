@@ -9,7 +9,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import random
 import time
 import urllib.error
 import urllib.request
@@ -23,6 +25,12 @@ _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 #: 真实模型偶尔在 60s 附近抖动；默认放宽到 120s，并允许环境变量覆盖。
 DEFAULT_TIMEOUT = 120.0
 DEFAULT_RETRIES = 2
+#: 决策类调用必须显式限输出；不传 max_tokens 时推理模型会按默认高 effort 长跑。
+DEFAULT_MAX_TOKENS = 2048
+#: 5xx/空响应重试退避基数（秒）；实际间隔按 2^n 递增并加抖动。
+DEFAULT_RETRY_BACKOFF = 2.0
+
+logger = logging.getLogger(__name__)
 
 
 def _env_float(name: str, default: float) -> float:
@@ -60,10 +68,12 @@ class LLMError(RuntimeError):
         *,
         retryable: bool = False,
         status: int | None = None,
+        request_id: str | None = None,
     ) -> None:
         super().__init__(message)
         self.retryable = retryable
         self.status = status
+        self.request_id = request_id
 
 
 class LLMClient:
@@ -78,8 +88,9 @@ class LLMClient:
         base_url: str | None = None,
         timeout: float | None = None,
         retries: int | None = None,
-        retry_backoff: float = 1.0,
-        max_tokens: int = 4096,
+        retry_backoff: float = DEFAULT_RETRY_BACKOFF,
+        max_tokens: int | None = None,
+        reasoning_effort: str | None = None,
     ) -> None:
         self.backend = (backend or os.getenv("PANGUVERSE_AI_BACKEND") or "").strip().lower()
         self.api_key = api_key or os.getenv("PANGUVERSE_API_KEY") or os.getenv("OPENAI_API_KEY") or ""
@@ -106,7 +117,16 @@ class LLMClient:
             else _env_int("PANGUVERSE_LLM_RETRIES", DEFAULT_RETRIES),
         )
         self.retry_backoff = max(0.0, float(retry_backoff))
-        self.max_tokens = max_tokens
+        resolved_max_tokens = (
+            max_tokens
+            if max_tokens is not None
+            else _env_int("PANGUVERSE_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)
+        )
+        self.max_tokens = max(1, int(resolved_max_tokens))
+        self.reasoning_effort = (
+            (reasoning_effort or os.getenv("PANGUVERSE_LLM_REASONING_EFFORT") or "").strip()
+            or None
+        )
         self.calls = 0
         self.last_error = ""
 
@@ -124,49 +144,147 @@ class LLMClient:
             "reason": "" if self.available else "未配置 PANGUVERSE_API_KEY / OPENAI_API_KEY",
             "timeout": self.timeout,
             "retries": self.retries,
+            "max_tokens": self.max_tokens,
+            "reasoning_effort": self.reasoning_effort,
             "last_error": self.last_error,
         }
 
     # ------------------------------------------------------------------ #
-    def complete(self, system: str, user: str, *, temperature: float = 0.0) -> str:
+    def complete(
+        self,
+        system: str,
+        user: str,
+        *,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        reasoning_effort: str | None = None,
+        observer: Any = None,
+    ) -> str:
         if not self.available:
             raise LLMError("未配置 LLM 密钥（PANGUVERSE_API_KEY / OPENAI_API_KEY）")
         self.calls += 1
         attempts = self.retries + 1
         last_error: LLMError | None = None
+        attempt_timeout = self.timeout if timeout is None else max(0.1, float(timeout))
+        attempt_max_tokens = self.max_tokens if max_tokens is None else max(1, int(max_tokens))
+        attempt_effort = reasoning_effort if reasoning_effort is not None else self.reasoning_effort
+        prompt_bytes = len(system.encode("utf-8")) + len(user.encode("utf-8"))
         for attempt in range(attempts):
+            started = time.monotonic()
             try:
                 if self.backend == "anthropic":
-                    result = self._call_anthropic(system, user, temperature)
+                    result = self._call_anthropic(
+                        system,
+                        user,
+                        temperature,
+                        json_mode=json_mode,
+                        max_tokens=attempt_max_tokens,
+                        timeout=attempt_timeout,
+                    )
                 else:
-                    result = self._call_openai(system, user, temperature)
+                    result = self._call_openai(
+                        system,
+                        user,
+                        temperature,
+                        json_mode=json_mode,
+                        max_tokens=attempt_max_tokens,
+                        timeout=attempt_timeout,
+                        reasoning_effort=attempt_effort,
+                    )
                 self.last_error = ""
+                _notify(
+                    observer,
+                    {
+                        "attempt": attempt + 1,
+                        "attempts": attempts,
+                        "ok": True,
+                        "status": None,
+                        "elapsed_ms": int((time.monotonic() - started) * 1000),
+                        "prompt_bytes": prompt_bytes,
+                        "model": self.model,
+                        "max_tokens": attempt_max_tokens,
+                        "reasoning_effort": attempt_effort,
+                        "request_id": None,
+                    },
+                )
                 return result
             except LLMError as exc:
                 last_error = exc
                 self.last_error = str(exc)
+                elapsed_ms = int((time.monotonic() - started) * 1000)
+                logger.warning(
+                    "LLM attempt %d/%d failed in %dms: %s",
+                    attempt + 1,
+                    attempts,
+                    elapsed_ms,
+                    str(exc)[:300],
+                )
+                _notify(
+                    observer,
+                    {
+                        "attempt": attempt + 1,
+                        "attempts": attempts,
+                        "ok": False,
+                        "status": exc.status,
+                        "elapsed_ms": elapsed_ms,
+                        "prompt_bytes": prompt_bytes,
+                        "model": self.model,
+                        "max_tokens": attempt_max_tokens,
+                        "reasoning_effort": attempt_effort,
+                        "request_id": exc.request_id,
+                        "error": str(exc)[:600],
+                    },
+                )
                 if not exc.retryable or attempt + 1 >= attempts:
                     # 错误只在传输层包装一次；这里不再加 "LLM 调用失败" 前缀。
                     raise
                 delay = self.retry_backoff * (2**attempt)
                 if delay > 0:
-                    time.sleep(delay)
+                    time.sleep(delay + random.uniform(0, 0.25))
             except Exception as exc:
                 self.last_error = f"{type(exc).__name__}: {exc}"
+                _notify(
+                    observer,
+                    {
+                        "attempt": attempt + 1,
+                        "attempts": attempts,
+                        "ok": False,
+                        "status": None,
+                        "elapsed_ms": int((time.monotonic() - started) * 1000),
+                        "prompt_bytes": prompt_bytes,
+                        "model": self.model,
+                        "max_tokens": attempt_max_tokens,
+                        "reasoning_effort": attempt_effort,
+                        "request_id": None,
+                        "error": self.last_error[:600],
+                    },
+                )
                 raise LLMError(f"{type(exc).__name__}: {exc}") from exc
         raise last_error or LLMError("未知错误")
 
     def complete_json(self, system: str, user: str) -> dict[str, Any]:
         """要求返回 JSON 对象；解析失败会抛出 LLMError。"""
-        text = self.complete(system, user)
+        text = self.complete(system, user, json_mode=True)
         data = _extract_json(text)
         if not isinstance(data, dict):
             raise LLMError(f"LLM 未返回 JSON 对象: {text[:200]}")
         return data
 
     # ------------------------------------------------------------------ #
-    def _call_openai(self, system: str, user: str, temperature: float) -> str:
-        payload = {
+    def _call_openai(
+        self,
+        system: str,
+        user: str,
+        temperature: float,
+        *,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+        reasoning_effort: str | None = None,
+    ) -> str:
+        payload: dict[str, Any] = {
             "model": self.model,
             "temperature": temperature,
             "messages": [
@@ -174,6 +292,12 @@ class LLMClient:
                 {"role": "user", "content": user},
             ],
         }
+        if max_tokens:
+            payload["max_tokens"] = int(max_tokens)
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+        if reasoning_effort:
+            payload["reasoning_effort"] = reasoning_effort
         request = urllib.request.Request(
             f"{self.base_url}/v1/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
@@ -183,16 +307,32 @@ class LLMClient:
             },
             method="POST",
         )
-        data = self._send(request)
+        data = self._send(request, timeout=timeout)
         try:
-            return data["choices"][0]["message"]["content"] or ""
+            choices = data["choices"]
+            if not isinstance(choices, list) or not choices:
+                raise KeyError("choices")
+            return choices[0]["message"]["content"] or ""
         except (KeyError, IndexError, TypeError) as exc:
-            raise LLMError(f"无法解析 OpenAI 响应: {str(data)[:200]}") from exc
+            raise LLMError(
+                f"LLM 响应无 choices: {str(data)[:200]}",
+                retryable=True,
+                request_id=_request_id(data),
+            ) from exc
 
-    def _call_anthropic(self, system: str, user: str, temperature: float) -> str:
+    def _call_anthropic(
+        self,
+        system: str,
+        user: str,
+        temperature: float,
+        *,
+        json_mode: bool = False,
+        max_tokens: int | None = None,
+        timeout: float | None = None,
+    ) -> str:
         payload = {
             "model": self.model,
-            "max_tokens": self.max_tokens,
+            "max_tokens": int(max_tokens or self.max_tokens),
             "temperature": temperature,
             "system": system,
             "messages": [{"role": "user", "content": user}],
@@ -207,21 +347,27 @@ class LLMClient:
             },
             method="POST",
         )
-        data = self._send(request)
+        data = self._send(request, timeout=timeout)
         try:
             blocks = data.get("content") or []
             return "".join(block.get("text", "") for block in blocks if isinstance(block, dict))
         except (AttributeError, TypeError) as exc:
             raise LLMError(f"无法解析 Anthropic 响应: {str(data)[:200]}") from exc
 
-    def _send(self, request: urllib.request.Request) -> dict[str, Any]:
+    def _send(
+        self,
+        request: urllib.request.Request,
+        *,
+        timeout: float | None = None,
+    ) -> dict[str, Any]:
         # 与 panguverse/http/client.py 同一套规则：回环直连，其余仍尊重系统/环境代理
         opener = _DIRECT_OPENER if is_loopback_url(request.full_url) else None
+        request_timeout = self.timeout if timeout is None else max(0.1, float(timeout))
         try:
             with (
-                opener.open(request, timeout=self.timeout)
+                opener.open(request, timeout=request_timeout)
                 if opener
-                else urllib.request.urlopen(request, timeout=self.timeout)
+                else urllib.request.urlopen(request, timeout=request_timeout)
             ) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
         except urllib.error.HTTPError as exc:
@@ -232,19 +378,25 @@ class LLMClient:
                 f"LLM 接口返回 HTTP {exc.code}: {detail[:300]}",
                 retryable=retryable,
                 status=exc.code,
+                request_id=_request_id_from_text(detail),
             ) from exc
         except (TimeoutError, urllib.error.URLError) as exc:
             reason = getattr(exc, "reason", exc)
             self.last_error = f"timeout/url error: {reason}"
             if isinstance(exc, TimeoutError) or isinstance(reason, TimeoutError):
-                message = f"LLM 接口超时（{self.timeout:.0f}s）"
+                message = f"LLM 接口超时（{request_timeout:.0f}s）"
             else:
                 message = f"LLM 接口不可达: {reason}"
             raise LLMError(message, retryable=True) from exc
         try:
-            return json.loads(body)
+            data = json.loads(body)
         except ValueError as exc:
-            raise LLMError(f"LLM 返回非 JSON: {body[:200]}") from exc
+            self.last_error = f"non-json: {body[:200]}"
+            raise LLMError(f"LLM 返回非 JSON: {body[:200]}", retryable=True) from exc
+        if not isinstance(data, dict):
+            self.last_error = f"non-object: {body[:200]}"
+            raise LLMError(f"LLM 返回非对象响应: {body[:200]}", retryable=True)
+        return data
 
 
 def _extract_json(text: str) -> Any:
@@ -272,3 +424,30 @@ def _extract_json(text: str) -> Any:
         return json.loads(text[start : end + 1])
     except ValueError as exc:
         raise LLMError(f"JSON 解析失败: {exc}") from exc
+
+
+
+def _notify(observer: Any, event: dict[str, Any]) -> None:
+    """Best-effort observer; trace/log failures must never break the LLM call."""
+    if observer is None:
+        return
+    try:
+        observer(event)
+    except Exception:  # pragma: no cover - 观测失败不影响主流程
+        logger.debug("LLM observer failed", exc_info=True)
+
+
+def _request_id(data: Any) -> str | None:
+    if isinstance(data, dict):
+        rid = data.get("request_id")
+        if not rid and isinstance(data.get("error"), dict):
+            rid = data["error"].get("request_id")
+        return str(rid) if rid else None
+    return None
+
+
+def _request_id_from_text(text: str) -> str | None:
+    try:
+        return _request_id(json.loads(text))
+    except (TypeError, ValueError):
+        return None
