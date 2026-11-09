@@ -463,3 +463,16 @@
   .nx-flow-strip { grid-template-columns: 1fr; }
   .nx-intent-input { font-size: 12.5px; }
 }
+
+.nx-real-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 14px;
+  border-color: rgba(94, 234, 212, .28);
+  background: linear-gradient(90deg, rgba(94, 234, 212, .07), rgba(146, 133, 255, .04));
+}
+.nx-real-banner > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.nx-real-banner strong { font-size: 11.5px; color: var(--cyan); }
+.nx-real-banner span { font-size: 9.5px; color: var(--dim); word-break: break-all; }

@@ -22,6 +22,7 @@ import {
   type NxSuggestion,
   type NxTimelineEvent,
 } from '../../shared/nextMock'
+import { planIntent } from '../../shared/nextApi'
 import { Icon } from '../../components/Icon'
 import { Badge, Button, PageHeader, Progress, SectionHeader, useToast } from '../../components/ui'
 import './next.css'
@@ -54,6 +55,8 @@ export function NextConsolePage() {
   const [intent, setIntent] = useState(NX_INITIAL_INTENT)
   const [showTemplates, setShowTemplates] = useState(false)
   const [runState, setRunState] = useState<RunState>('paused')
+  const [realWid, setRealWid] = useState('')
+  const [planning, setPlanning] = useState(false)
   const [phase, setPhase] = useState(3)
   const [plan, setPlan] = useState<NxPlanStep[]>(NX_INITIAL_PLAN)
   const [timeline, setTimeline] = useState<NxTimelineEvent[]>(NX_INITIAL_TIMELINE)
@@ -73,7 +76,7 @@ export function NextConsolePage() {
   }, [plan])
 
   useEffect(() => {
-    if (runState !== 'running') return
+    if (runState !== 'running' || realWid) return
     if (phase >= 5) {
       setRunState('complete')
       setResult({
@@ -86,7 +89,7 @@ export function NextConsolePage() {
     }
     const timer = window.setTimeout(() => setPhase((value) => value + 1), 950)
     return () => window.clearTimeout(timer)
-  }, [runState, phase])
+  }, [runState, phase, realWid])
 
   useEffect(() => {
     if (runState === 'paused') return
@@ -105,12 +108,10 @@ export function NextConsolePage() {
         evidence: ['3 张页面截图', '12 条价格原始值', '2 次 AI 自修记录', 'run-9f2c14 · rev 4'],
       }))
     }
-  }, [phase, runState, intent])
+  }, [phase, runState, intent, realWid])
 
-  const start = () => {
-    if (runState === 'running') return
-    const text = intent.trim() || NX_TEMPLATES[0].intent
-    if (!intent.trim()) setIntent(text)
+  const startMock = (text: string) => {
+    setRealWid('')
     setRunState('running')
     setPhase(0)
     setPlan(planForPhase(text, 0))
@@ -127,8 +128,70 @@ export function NextConsolePage() {
       evidence: ['正在生成证据…'],
       artifacts: [],
     })
+  }
+
+  const start = async () => {
+    if (runState === 'running' || planning) return
+    const text = intent.trim() || NX_TEMPLATES[0].intent
+    if (!intent.trim()) setIntent(text)
     setShowTemplates(false)
-    push('AI 开始执行：先拆解，再逐步落到原子或自定义实现', 'ok')
+    setPlanning(true)
+    try {
+      const result = await planIntent(text)
+      if (result.gaps.length) {
+        setRealWid('')
+        setRunState('paused')
+        setPlan([])
+        setNeeds(result.gaps.map((gap, index) => ({
+          id: `gap-${index}`,
+          kind: gap.kind === 'capability' ? 'risk' : 'secret',
+          title: gap.title,
+          detail: gap.detail,
+          suggestion: gap.suggestion,
+          resolved: false,
+        })))
+        setFeed([{
+          id: 'real-gap',
+          at: '刚刚',
+          kind: 'decision',
+          text: 'AI 已完成第一次拆解，但发现缺口；补齐输入或插入自定义节点后继续。',
+        }])
+        setResult({
+          ...NX_INITIAL_RESULT,
+          title: 'AI 需要补充输入',
+          summary: '真实规划已经运行，当前卡在缺口上；右侧「需要你」列出了 AI 建议。',
+          evidence: ['真实规划响应', `${result.gaps.length} 个缺口`],
+          artifacts: [],
+        })
+        push('AI 需要补充输入后才能继续', 'warn')
+        return
+      }
+      setRealWid(result.wid)
+      setPlan(result.steps)
+      setRunState('paused')
+      setPhase(Math.min(3, result.steps.length))
+      setTimeline(timelineForPhase(0))
+      setFeed([{
+        id: 'real-plan',
+        at: '刚刚',
+        kind: 'success',
+        text: `AI 已生成真实流程 ${result.wid} · ${result.steps.length} 步；下一步在工作台调试或上线。`,
+      }])
+      setNeeds(NX_INITIAL_NEEDS)
+      setResult({
+        ...NX_INITIAL_RESULT,
+        title: '真实流程已生成',
+        summary: `AI 已拆解为 ${result.steps.length} 步，等待在工作台调试或上线。`,
+        evidence: [`workflow ${result.wid}`, `${result.steps.length} 个节点`, '真实规划'],
+        artifacts: [],
+      })
+      push('AI 已生成真实流程草稿', 'ok')
+    } catch (error) {
+      startMock(text)
+      push(`真实规划失败，已切回演示数据：${(error as Error).message}`, 'warn')
+    } finally {
+      setPlanning(false)
+    }
   }
 
   const applyTemplate = (template: (typeof NX_TEMPLATES)[number]) => {
@@ -221,7 +284,7 @@ export function NextConsolePage() {
         description="不用配置项目、套件或模式。AI 负责拆解、执行、观察与自修；你只在缺密钥、权限和风险点出现。"
         actions={
           <>
-            <Badge tone="warn">演示数据 · 不连后端</Badge>
+            {realWid ? <Badge tone="ok">真实草稿 · {realWid}</Badge> : <Badge tone="warn">演示数据 · 不连后端</Badge>}
             <Button variant="ghost" size="sm" icon="flow" onClick={() => navigate('/next/workbench/wf-console/node-extract-prices')}>节点工作台</Button>
           </>
         }
@@ -250,8 +313,8 @@ export function NextConsolePage() {
             <span className="nx-intent-hint">⌘ / Ctrl + ↵ 直接开始 · 空着也行，AI 会用示例意图</span>
           </label>
           <div className="nx-intent-actions">
-            <Button variant="primary" size="lg" icon={runState === 'running' ? 'refresh' : 'spark'} disabled={runState === 'running'} onClick={start}>
-              {runState === 'running' ? 'AI 正在执行…' : runState === 'complete' ? '让 AI 再跑一次' : '让 AI 开始'}
+            <Button variant="primary" size="lg" icon={planning || runState === 'running' ? 'refresh' : 'spark'} disabled={runState === 'running' || planning} onClick={start}>
+              {planning ? 'AI 正在规划…' : runState === 'running' ? 'AI 正在执行…' : runState === 'complete' ? '让 AI 再跑一次' : '让 AI 开始'}
             </Button>
             <Button variant="ghost" size="lg" icon="layers" onClick={() => setShowTemplates((value) => !value)} aria-expanded={showTemplates}>
               用模板
@@ -278,6 +341,23 @@ export function NextConsolePage() {
           </div>
         )}
       </section>
+
+      {realWid ? (
+        <section className="panel nx-real-banner" aria-label="真实流程草稿">
+          <div>
+            <strong>AI 已生成真实流程</strong>
+            <span>{realWid} · {plan.length} 个节点 · 真实规划</span>
+          </div>
+          <Button
+            size="sm"
+            variant="primary"
+            icon="flow"
+            onClick={() => navigate(`/next/workbench/${realWid}/${plan[0]?.id || ''}`)}
+          >
+            打开节点工作台
+          </Button>
+        </section>
+      ) : null}
 
       <div className="nx-layout">
         <div className="nx-main">
