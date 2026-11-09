@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
@@ -53,6 +53,25 @@ export function RunDetailPage() {
   const [saveOpen, setSaveOpen] = useState(false)
   const [taskName, setTaskName] = useState('')
   const [rerunOpen, setRerunOpen] = useState(false)
+  const RUN_TABS = [
+    ['overview', '概览'],
+    ['steps', '步骤'],
+    ['evidence', '证据'],
+    ['report', '报告'],
+    ['artifacts', '产出物'],
+  ] as const
+  type RunTab = (typeof RUN_TABS)[number][0]
+  const tabParam = route.query.get('tab')
+  const initialTab: RunTab = RUN_TABS.some(([id]) => id === tabParam) ? (tabParam as RunTab) : 'overview'
+  const [tab, setTab] = useState<RunTab>(initialTab)
+  useEffect(() => {
+    const raw = route.query.get('tab')
+    if (RUN_TABS.some(([id]) => id === raw)) setTab(raw as RunTab)
+  }, [route.query])
+  const selectTab = (next: RunTab) => {
+    setTab(next)
+    navigate(withQuery(route.path, { tab: next }), { replace: true })
+  }
   const [previewArtifactId, setPreviewArtifactId] = useState('')
 
   const runQuery = useQuery({ queryKey: ['run', rid], queryFn: () => api.run(rid), enabled: !!rid })
@@ -178,7 +197,7 @@ export function RunDetailPage() {
   })
 
   return (
-    <div className="page run-detail-page">
+    <div className="page run-detail-page" data-tab={tab}>
       <div className="report-hero">
         <div className="report-hero-main">
           <div className="report-back">
@@ -208,7 +227,15 @@ export function RunDetailPage() {
         </div>
       </div>
 
-      <div className="kpi-grid report-kpis">
+      <nav className="segmented run-tabs" role="tablist" aria-label="运行详情视图">
+        {RUN_TABS.map(([id, label]) => (
+          <button key={id} type="button" role="tab" aria-selected={tab === id} className={tab === id ? 'is-active' : ''} onClick={() => selectTab(id)}>
+            {label}
+          </button>
+        ))}
+      </nav>
+
+      <div className="kpi-grid report-kpis run-only-overview">
         <Kpi label="通过率" value={rate === null ? '—' : `${rate}%`} tone={rate !== null && rate < 80 ? 'bad' : 'ok'} sub={`${summary.passed || 0}/${summary.total || 0} 用例`} icon="check" />
         <Kpi label="失败 / 异常" value={`${summary.failed || 0} / ${summary.errored || 0}`} tone={summary.failed || summary.errored ? 'bad' : 'ok'} sub={`${summary.skipped || 0} 跳过 · ${summary.healed_cases || 0} 自愈`} icon="warning" />
         <Kpi label="HTTP 请求" value={summary.http_requests ?? '—'} sub={`${summary.steps ?? 0} 个步骤`} icon="server" />
@@ -216,7 +243,7 @@ export function RunDetailPage() {
       </div>
 
       {warningPhases.length ? (
-        <div className="notice-inline warn-note run-warning-phases" data-testid="run-warning-phases">
+        <div className="notice-inline warn-note run-warning-phases run-only-steps" data-testid="run-warning-phases">
           <Icon name="warning" size={15} />
           <div>
             <strong>执行阶段有 {warningPhases.length} 项警告</strong>
@@ -229,7 +256,7 @@ export function RunDetailPage() {
 
       <div className="report-grid">
         <div className="report-main">
-          <section className="panel insight-panel">
+          <section className="panel insight-panel run-only-overview">
             <SectionHeader
               title="AI 总结"
               description="数字来自报告本体；模型只负责措辞。"
@@ -259,7 +286,7 @@ export function RunDetailPage() {
             ) : null}
           </section>
 
-          <section className="panel run-artifacts-panel" data-testid="run-artifacts-panel">
+          <section className="panel run-artifacts-panel run-only-artifacts" data-testid="run-artifacts-panel">
             <SectionHeader
               title="产出物"
               description="执行报告回答「怎么跑的」，任务产出回答「跑出了什么」；均可就地预览或下载。"
@@ -336,7 +363,7 @@ export function RunDetailPage() {
             </div>
           </section>
 
-          <section className="panel cases-panel" id="run-cases">
+          <section className="panel cases-panel run-only-steps" id="run-cases">
             <SectionHeader
               title={`用例明细`}
               description={`${cases.length} 个用例 · ${summary.steps || 0} 个步骤`}
@@ -395,9 +422,57 @@ export function RunDetailPage() {
               </div>
             )}
           </section>
+          <section className="panel run-only-evidence">
+            <SectionHeader
+              title="执行证据"
+              description="阶段状态、计划来源与审计入口；原始报告可展开查看。"
+              icon="shield"
+              actions={<Button size="sm" variant="ghost" icon="code" onClick={() => setRawOpen(true)}>原始报告</Button>}
+            />
+            <div className="fact-list" style={{ marginTop: 10 }}>
+              <div><dt>运行状态</dt><dd>{statusLabel(status)}</dd></div>
+              <div><dt>计划来源</dt><dd>{plan.source || report.meta?.plan_source || '—'}</dd></div>
+              <div><dt>执行阶段</dt><dd>{executionPhases.length} 个</dd></div>
+              <div><dt>审计记录</dt><dd>{audit.length} 条</dd></div>
+            </div>
+            {executionPhases.length ? (
+              <div className="run-artifact-list" style={{ marginTop: 10 }}>
+                {executionPhases.map((phase, index) => (
+                  <div className="run-artifact-row" key={`${phase.name}-${index}`}>
+                    <span className="run-artifact-type"><Icon name="clock" size={14} /></span>
+                    <span className="run-artifact-copy">
+                      <strong>{phase.name}</strong>
+                      <small><StatusBadge status={phase.status} /> {cleanPhaseDetail(phase.detail) || '—'}</small>
+                    </span>
+                  </div>
+                ))}
+              </div>
+            ) : <EmptyState icon="shield" title="报告没有阶段明细">旧报告可能没有 phases；可查看原始报告。</EmptyState>}
+          </section>
+
+          <section className="panel run-only-report">
+            <SectionHeader
+              title="执行报告"
+              description="HTML / JUnit / report.json；可下载或就地预览。"
+              icon="report"
+              actions={<>
+                <a className="btn btn-ghost btn-sm" href={`api/runs/${encodeURIComponent(rid)}/report.html`} target="_blank" rel="noopener noreferrer"><Icon name="external" size={14} />HTML</a>
+                <a className="btn btn-ghost btn-sm" href={`api/runs/${encodeURIComponent(rid)}/junit.xml`}><Icon name="download" size={14} />JUnit</a>
+              </>}
+            />
+            {reportArtifacts.length ? (
+              <div className="run-artifact-list" style={{ marginTop: 10 }}>
+                {reportArtifacts.map((artifact) => renderArtifactRow(artifact, 'report'))}
+              </div>
+            ) : (
+              <EmptyState icon="report" title="没有执行报告产出物" actions={<Button size="sm" variant="ghost" icon="code" onClick={() => setRawOpen(true)}>查看原始报告</Button>}>
+                旧运行可能只保留 report.json。
+              </EmptyState>
+            )}
+          </section>
         </div>
 
-        <aside className="report-side">
+        <aside className="report-side run-only-overview">
           <section className="panel">
             <SectionHeader title="运行信息" description="来自报告与 plan.json" icon="database" />
             <dl className="fact-list">

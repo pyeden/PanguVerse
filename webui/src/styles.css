@@ -2506,3 +2506,28 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
   .run-artifact-group-head, .report-artifact-group-head { flex-direction: column; align-items: flex-start; }
   .run-artifact-group-actions { flex-wrap: wrap; }
 }
+
+
+/* Run detail tabs */
+.run-tabs { margin: 2px 0 4px; }
+.run-detail-page [data-tab] { }
+.run-detail-page[data-tab="overview"] .run-only-steps,
+.run-detail-page[data-tab="overview"] .run-only-evidence,
+.run-detail-page[data-tab="overview"] .run-only-report,
+.run-detail-page[data-tab="overview"] .run-only-artifacts { display: none !important; }
+.run-detail-page[data-tab="steps"] .run-only-overview,
+.run-detail-page[data-tab="steps"] .run-only-evidence,
+.run-detail-page[data-tab="steps"] .run-only-report,
+.run-detail-page[data-tab="steps"] .run-only-artifacts { display: none !important; }
+.run-detail-page[data-tab="evidence"] .run-only-overview,
+.run-detail-page[data-tab="evidence"] .run-only-steps,
+.run-detail-page[data-tab="evidence"] .run-only-report,
+.run-detail-page[data-tab="evidence"] .run-only-artifacts { display: none !important; }
+.run-detail-page[data-tab="report"] .run-only-overview,
+.run-detail-page[data-tab="report"] .run-only-steps,
+.run-detail-page[data-tab="report"] .run-only-evidence,
+.run-detail-page[data-tab="report"] .run-only-artifacts { display: none !important; }
+.run-detail-page[data-tab="artifacts"] .run-only-overview,
+.run-detail-page[data-tab="artifacts"] .run-only-steps,
+.run-detail-page[data-tab="artifacts"] .run-only-evidence,
+.run-detail-page[data-tab="artifacts"] .run-only-report { display: none !important; }
