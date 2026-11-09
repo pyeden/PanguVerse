@@ -34,9 +34,12 @@ DEFAULT_ROOT_ENV = ("FS_ROOT", "PANGUVERSE_FS_ROOT")
 # 沙箱：能力授权的最小落地
 # --------------------------------------------------------------------------- #
 def sandbox_root(ctx: RunContext) -> Path:
-    # The execution context's workspace is the hard boundary (explore sandbox,
-    # debug session, workflow run).  FS_ROOT is a fallback for callers that
-    # only pass env, then cwd as the last resort.
+    # Run/debug artifacts live in the per-run output directory.  Prefer it so
+    # files written by one step (e.g. report.html/news_data.json) are visible to
+    # later assertions; fall back to the broader workspace for read-only jobs.
+    output_dir = getattr(ctx, "output_dir", None)
+    if output_dir:
+        return Path(str(output_dir)).expanduser().resolve()
     workspace = getattr(ctx, "workspace", None)
     if workspace:
         # ``Path`` 自带 ``.root``（文件系统根 "/"），不能当成自定义

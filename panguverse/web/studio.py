@@ -799,8 +799,9 @@ def _build_plan(
     exclude_atoms: Iterable[str] = (),
 ) -> Any:
     from . import service
+    from ..core.workspace_packs import workspace_registry
 
-    registry = service.registry()
+    registry = workspace_registry(root, service.registry())
     templates: list[Any] = []
     for pack in registry.packs():
         for template in getattr(pack, "intent_templates", []) or []:
@@ -878,9 +879,12 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     domain_pack = _clean_domain_pack(data.get("domain_pack"))
     exclude = _clean_exclude(data.get("exclude_atoms"))
     allow_llm = data.get("allow_llm") is True
+    from ..core.workspace_packs import workspace_registry
+
+    registry = workspace_registry(root, _registry())
     try:
         bundle = planner_gate.plan_draft(
-            _registry(),
+            registry,
             intent=intent,
             domain_pack=domain_pack,
             exclude_atoms=exclude,
@@ -914,15 +918,15 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     autofilled = (
         param_fill.fill_url_params(
             graph["nodes"],
-            _registry(),
+            registry,
             resolved_url,
             source=url_source or "explicit",
         )
         if resolved_url
         else []
     )
-    param_gaps = param_fill.audit_param_gaps(graph["nodes"], _registry())
-    env_inputs = param_fill.audit_env_inputs(graph["nodes"], _registry())
+    param_gaps = param_fill.audit_param_gaps(graph["nodes"], registry)
+    env_inputs = param_fill.audit_env_inputs(graph["nodes"], registry)
     # 已被站点别名/显式 URL 填掉的环境占位符不再重复声明「需要 XXX」，
     # 只保留图中仍然真实存在的 env 依赖。
     remaining_env: set[str] = set()

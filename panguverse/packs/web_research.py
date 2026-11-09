@@ -716,6 +716,42 @@ def build_web_page_report() -> dict[str, Any]:
     }
 
 
+def build_baidu_hot_report() -> dict[str, Any]:
+    """「百度热搜 → 结构化数据 → 好看报告 → 新鲜度/条目/标题断言」。"""
+    return {
+        "id": "baidu_hot_report",
+        "name": "百度热点新闻报告",
+        "tags": ["web", "research", "report", "baidu"],
+        "description": "抓取百度热搜榜，生成带时间戳的 JSON 与 HTML 报告，并校验条目数量、数据新鲜度和报告标题",
+        "steps": [
+            {
+                "id": "baidu_hot",
+                "use": "baidu_hot_report",
+                "name": "抓取并生成热点新闻报告",
+                "with": {"url": "https://top.baidu.com/board?tab=realtime", "max_items": 10},
+            },
+            {
+                "id": "check_items",
+                "use": "assert_file_min_items",
+                "name": "断言热点条目数",
+                "with": {"path": "news_data.json", "min_items": 5},
+            },
+            {
+                "id": "check_fresh",
+                "use": "assert_file_freshness",
+                "name": "断言数据新鲜",
+                "with": {"path": "news_data.json", "max_age_seconds": 86400},
+            },
+            {
+                "id": "check_report",
+                "use": "assert_file_matches",
+                "name": "断言报告标题",
+                "with": {"path": "report.html", "pattern": "热点新闻报告"},
+            },
+        ],
+    }
+
+
 def web_research_intent_templates() -> list[Any]:
     """``web_research`` 包声明的意图模板。"""
     from ..core.contract import RuleTemplate
@@ -774,6 +810,7 @@ def build_pack() -> Any:
 __all__ = [
     "WebResearchSemantics",
     "build_pack",
+    "build_baidu_hot_report",
     "build_web_page_report",
     "decode_html",
     "extract_structure",

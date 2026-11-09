@@ -1056,6 +1056,23 @@ def _build_rule_plan(
         )
 
     if domain == "web_research":
+        baidu_hot = any(
+            keyword in intent for keyword in ("百度", "热搜", "热榜", "热点新闻", "热点报告")
+        )
+        if baidu_hot and registry.has("baidu_hot_report"):
+            from ..core.molecule import Molecule
+            from ..packs.web_research import build_baidu_hot_report
+
+            spec = expand_case_spec(build_baidu_hot_report(), registry=registry)
+            return TestPlan(
+                cases=[Molecule.from_spec(spec, source="template")],
+                source="template",
+                planner="template",
+                intent=intent,
+                env={},
+                notes=["百度热搜模板：抓取 → 数据/HTML 报告 → 条目/新鲜度/标题断言"],
+                meta={"template": "baidu_hot_report", "llm_used": False},
+            )
         specs = [
             expand_case_spec(
                 _build_web_spec(intent, analysis, llm_ready=llm_ready), registry=registry
