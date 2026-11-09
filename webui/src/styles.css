@@ -1409,8 +1409,8 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 }
 
 @media (max-width: 900px) {
-  .sidebar { position: fixed; left: -268px; transition: left .2s ease; height: 100vh; width: 252px; }
-  .sidebar.is-open { left: 0; box-shadow: 30px 0 80px rgba(0,0,0,.5); }
+  .sidebar { position: fixed; left: -268px; transition: left .2s ease; height: 100vh; width: 252px; visibility: hidden; }
+  .sidebar.is-open { left: 0; visibility: visible; box-shadow: 30px 0 80px rgba(0,0,0,.5); }
   .sidebar-scrim { display: block; position: fixed; inset: 0; z-index: 35; border: 0; background: rgba(3,6,11,.62); backdrop-filter: blur(4px); }
   .app-main { width: 100%; }
   .topbar { padding: 0 16px; height: 56px; flex-basis: 56px; }
