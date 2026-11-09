@@ -369,7 +369,7 @@ export function NextConsolePage() {
         description="不用配置项目、套件或模式。AI 负责拆解、执行、观察与自修；你只在缺密钥、权限和风险点出现。"
         actions={
           <>
-            {realWid ? <Badge tone="ok">真实草稿 · {realWid}</Badge> : <Badge tone="warn">演示数据 · 不连后端</Badge>}
+            {demoRunId ? <Badge tone="ok">真实运行 · {demoRunId}</Badge> : realWid ? <Badge tone="ok">真实草稿 · {realWid}</Badge> : <Badge tone="warn">尚未运行 · 可先跑内置演示</Badge>}
             <Button variant="ghost" size="sm" icon="flow" onClick={() => navigate('/next/workbench/wf-console/node-extract-prices')}>节点工作台</Button>
           </>
         }
@@ -399,7 +399,7 @@ export function NextConsolePage() {
           </label>
           <div className="nx-intent-actions">
             <Button variant="primary" size="lg" icon={planning || runState === 'running' ? 'refresh' : 'spark'} disabled={runState === 'running' || planning || demoRunning} onClick={start}>
-              {planning ? 'AI 正在规划…' : runState === 'running' ? 'AI 正在执行…' : runState === 'complete' ? '让 AI 再跑一次' : '让 AI 开始'}
+              {planning ? 'AI 正在规划…' : runState === 'running' ? 'AI 正在执行…' : runState === 'complete' ? '再拆解一次' : '让 AI 拆解'}
             </Button>
             <Button variant="soft" size="lg" icon="play" loading={demoRunning} disabled={runState === 'running' || planning || demoRunning} onClick={runDemo}>跑内置演示</Button>
             <Button variant="ghost" size="lg" icon="layers" onClick={() => setShowTemplates((value) => !value)} aria-expanded={showTemplates}>
