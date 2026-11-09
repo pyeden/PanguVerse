@@ -9,7 +9,7 @@ import { Badge, IconButton, StatusBadge } from './ui'
 
 const navItems: { id: string; label: string; href: string; icon: IconName; hint?: string }[] = [
   { id: 'home', label: '首页', href: '/next/console', icon: 'spark', hint: 'AI' },
-  { id: 'flows', label: '流程', href: '/studio/new', icon: 'flow', hint: '造' },
+  { id: 'flows', label: '流程', href: '/flows', icon: 'flow', hint: '管' },
   { id: 'runs', label: '运行', href: '/runs', icon: 'play', hint: '跑' },
   { id: 'assets', label: '资产', href: '/atoms', icon: 'atoms', hint: '料' },
   { id: 'settings', label: '设置', href: '/settings', icon: 'settings', hint: '配' },
@@ -22,7 +22,7 @@ function isCanvasRoute(route: Route): boolean {
 function navActive(route: Route): string {
   const first = route.parts[0] || 'next'
   if (first === 'next' || first === 'projects') return 'home'
-  if (first === 'studio' || first === 'tasks' || first === 'schedules' || first === 'explore') return 'flows'
+  if (first === 'flows' || first === 'studio' || first === 'tasks' || first === 'schedules' || first === 'explore') return 'flows'
   if (first === 'runs' || first === 'executions' || first === 'history' || first === 'reports' || first === 'artifacts' || first === 'p') return 'runs'
   if (first === 'atoms' || first === 'packs' || first === 'platform') return 'assets'
   if (first === 'settings') return 'settings'
@@ -35,6 +35,7 @@ function crumbs(route: Route, projects: Project[]): { label: string; href?: stri
     return [{ label: '首页' }, ...(route.parts[1] === 'workbench' ? [{ label: '节点工作台' }] : [])]
   }
   if (first === 'runs') return [{ label: '运行' }, ...(route.parts[1] ? [{ label: '运行详情' }] : [])]
+  if (first === 'flows') return [{ label: '流程' }]
   if (first === 'settings') return [{ label: '设置' }]
   if (first === 'atoms') return [{ label: '资产' }, { label: '原子库' }]
   if (first === 'packs') return [{ label: '资产' }, { label: '领域包' }]
@@ -120,7 +121,7 @@ export function Shell({
           <IconButton label="关闭导航" icon="close" className="mobile-only" onClick={() => setMobileOpen(false)} />
         </div>
 
-        <button className="create-flow" type="button" onClick={() => navigate('/studio/new')}>
+        <button className="create-flow" type="button" onClick={() => navigate('/next/console')}>
           <span className="create-flow-icon"><Icon name="plus" size={17} /></span>
           <span>
             <strong>新建流程</strong>
@@ -209,7 +210,7 @@ export function Shell({
               <span className={`model-dot ${status?.llm_enabled ? 'on' : ''}`} />
               {status?.llm_enabled ? 'AI 在线' : '规则模式'}
             </span>
-            <a href={href('/studio/new')} className="topbar-create"><Icon name="spark" size={15} />新建流程</a>
+            <a href={href('/next/console')} className="topbar-create"><Icon name="spark" size={15} />新建流程</a>
           </div>
         </header>
         <main id="main-content" className={`content ${isCanvasRoute(route) ? 'content-canvas' : ''}`} tabIndex={-1}>

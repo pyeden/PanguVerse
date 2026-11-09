@@ -15,6 +15,7 @@ import { ExecutionsPage } from './pages/ExecutionsPage'
 import { HistoryPage } from './pages/HistoryPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { RunsPage } from './pages/RunsPage'
+import { FlowsPage } from './pages/FlowsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/SchedulesPage'
 import { ArtifactsPage } from './pages/ArtifactsPage'
@@ -135,6 +136,7 @@ function RoutedPage({ route }: { route: Route }) {
   if (first === 'packs') return <Redirect to="/atoms" />
   if (first === 'runs' && parts[1]) return <RunDetailPage key={parts[1]} />
   if (first === 'runs') return <RunsPage />
+  if (first === 'flows') return <FlowsPage />
   if (first === 'settings') return <SettingsPage />
   if (first === 'executions' || first === 'history') return <Redirect to="/runs" />
   if (first === 'reports') return <Redirect to={withQuery('/runs', { view: 'reports' })} />
@@ -155,6 +157,7 @@ function RoutedPage({ route }: { route: Route }) {
     if (parts[1] === 'workbench') return <NextWorkbenchPage wid={parts[2]} nodeId={parts[3]} key={`${parts[2] || ''}-${parts[3] || ''}`} />
     return <Redirect to="/next/console" />
   }
+  if (first === 'studio' && (!parts[1] || parts[1] === 'new')) return <Redirect to="/next/console" />
   if (first === 'studio') {
     if (!parts[1] || parts[1] === 'new') return <StudioNewPage />
     if (parts[1] === 'explore') return <StudioExplorePage eid={parts[2]} key={parts[2] || 'explore-new'} />
@@ -196,6 +199,7 @@ function NotFound({ route }: { route: Route }) {
 function pageTitle(route: Route): string {
   const first = route.parts[0] || 'projects'
   if (first === 'next') return route.parts[1] === 'workbench' ? '节点工作台' : 'AI 控制台'
+  if (first === 'flows') return '流程'
   if (first === 'runs') return route.parts[1] ? '运行详情' : '运行'
   if (first === 'settings') return '设置'
   if (first === 'studio') return route.parts[1] === 'explore' ? (route.parts[2] ? '探索回看' : '探索') : route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '流程画布' : '新建流程'

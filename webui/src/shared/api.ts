@@ -187,6 +187,8 @@ export const api = {
   runConfig: (rid: string) => request<AnyRecord>(`api/runs/${encodeURIComponent(rid)}/config`),
 
   jobs: () => request<Job[]>('api/jobs'),
+  startDemoRun: () => request<{ job_id: string; status: string }>('api/runs', { method: 'POST', body: { mode: 'demo' } }),
+
   job: (jobId: string) => request<Job>(`api/jobs/${encodeURIComponent(jobId)}`),
 
   executions: (params: URLSearchParams) =>

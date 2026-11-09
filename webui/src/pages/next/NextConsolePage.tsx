@@ -23,6 +23,7 @@ import {
   type NxTimelineEvent,
 } from '../../shared/nextMock'
 import { planIntent } from '../../shared/nextApi'
+import { api } from '../../shared/api'
 import { Icon } from '../../components/Icon'
 import { Badge, Button, PageHeader, Progress, SectionHeader, useToast } from '../../components/ui'
 import './next.css'
@@ -49,6 +50,19 @@ const STATUS_TONE = {
 } as const
 
 type RunState = 'paused' | 'running' | 'complete'
+type DemoJob = {
+  status: string
+  run_id?: string
+  error?: string | null
+  phases?: { name: string; status: string; detail?: string }[]
+}
+
+function phaseStatus(status: string): NxStatus {
+  if (status === 'done') return 'done'
+  if (status === 'running') return 'running'
+  if (status === 'warning') return 'fixing'
+  return 'queued'
+}
 
 export function NextConsolePage() {
   const { push } = useToast()
@@ -57,6 +71,8 @@ export function NextConsolePage() {
   const [runState, setRunState] = useState<RunState>('paused')
   const [realWid, setRealWid] = useState('')
   const [planning, setPlanning] = useState(false)
+  const [demoRunning, setDemoRunning] = useState(false)
+  const [demoRunId, setDemoRunId] = useState('')
   const [phase, setPhase] = useState(3)
   const [plan, setPlan] = useState<NxPlanStep[]>(NX_INITIAL_PLAN)
   const [timeline, setTimeline] = useState<NxTimelineEvent[]>(NX_INITIAL_TIMELINE)
@@ -76,7 +92,7 @@ export function NextConsolePage() {
   }, [plan])
 
   useEffect(() => {
-    if (runState !== 'running' || realWid) return
+    if (runState !== 'running' || realWid || demoRunning) return
     if (phase >= 5) {
       setRunState('complete')
       setResult({
@@ -89,10 +105,10 @@ export function NextConsolePage() {
     }
     const timer = window.setTimeout(() => setPhase((value) => value + 1), 950)
     return () => window.clearTimeout(timer)
-  }, [runState, phase, realWid])
+  }, [runState, phase, realWid, demoRunning])
 
   useEffect(() => {
-    if (runState === 'paused') return
+    if (runState === 'paused' || demoRunning || (runState === 'complete' && demoRunId)) return
     setPlan(planForPhase(intent, phase))
     setTimeline(timelineForPhase(phase))
     const additions = feedForPhase(phase)
@@ -108,10 +124,11 @@ export function NextConsolePage() {
         evidence: ['3 张页面截图', '12 条价格原始值', '2 次 AI 自修记录', 'run-9f2c14 · rev 4'],
       }))
     }
-  }, [phase, runState, intent, realWid])
+  }, [phase, runState, intent, realWid, demoRunning, demoRunId])
 
   const startMock = (text: string) => {
     setRealWid('')
+    setDemoRunId('')
     setRunState('running')
     setPhase(0)
     setPlan(planForPhase(text, 0))
@@ -131,10 +148,11 @@ export function NextConsolePage() {
   }
 
   const start = async () => {
-    if (runState === 'running' || planning) return
+    if (runState === 'running' || planning || demoRunning) return
     const text = intent.trim() || NX_TEMPLATES[0].intent
     if (!intent.trim()) setIntent(text)
     setShowTemplates(false)
+    setDemoRunId('')
     setPlanning(true)
     try {
       const result = await planIntent(text)
@@ -191,6 +209,73 @@ export function NextConsolePage() {
       push(`真实规划失败，已切回演示数据：${(error as Error).message}`, 'warn')
     } finally {
       setPlanning(false)
+    }
+  }
+
+  const runDemo = async () => {
+    if (demoRunning || planning || runState === 'running') return
+    setDemoRunning(true)
+    setDemoRunId('')
+    setRealWid('')
+    setRunState('running')
+    setPhase(0)
+    setPlan([])
+    setTimeline([])
+    setNeeds([])
+    setSuggestion(NX_INITIAL_SUGGESTION)
+    setFeed([{ id: 'demo-start', at: '刚刚', kind: 'observe', text: '启动内置演示：本地 mock API，不需要外部站点或密钥。' }])
+    setResult({
+      ...NX_INITIAL_RESULT,
+      title: '内置演示运行中…',
+      summary: '正在跑本地 mock API，不需要填 URL 或密钥。',
+      evidence: ['等待运行完成'],
+      artifacts: [],
+    })
+    try {
+      const started = await api.startDemoRun()
+      let job: DemoJob | undefined
+      for (let index = 0; index < 150; index += 1) {
+        job = await api.job(started.job_id)
+        const phases = Array.isArray(job.phases) ? job.phases : []
+        if (phases.length) {
+          setPlan(phases.map((phaseItem, phaseIndex) => ({
+            id: `demo-step-${phaseIndex}`,
+            title: phaseItem.name,
+            atom: 'demo',
+            kind: 'atom',
+            risk: 'L0',
+            status: phaseStatus(phaseItem.status),
+            note: phaseItem.detail || '',
+          })))
+          setTimeline(phases.map((phaseItem, phaseIndex) => ({
+            id: `demo-tl-${phaseIndex}`,
+            label: phaseItem.name,
+            detail: phaseItem.detail || '',
+            status: phaseStatus(phaseItem.status),
+            time: '—',
+          })))
+        }
+        if (['done', 'failed', 'cancelled'].includes(job.status)) break
+        await new Promise((resolve) => window.setTimeout(resolve, 800))
+      }
+      if (!job) throw new Error('没有拿到任务状态')
+      if (job.status !== 'done') throw new Error(job.error || `任务状态 ${job.status}`)
+      setDemoRunId(job.run_id || '')
+      setRunState('complete')
+      setResult({
+        ...NX_INITIAL_RESULT,
+        title: '内置演示完成',
+        summary: '本地 mock API 全流程通过；可以打开真实运行详情查看报告与证据。',
+        evidence: [`run ${job.run_id || '—'}`, `${job.phases?.length || 0} 个阶段`, '真实执行'],
+        artifacts: [],
+      })
+      setFeed((current) => [...current, { id: `demo-done-${Date.now()}`, at: '刚刚', kind: 'success', text: '内置演示完成，已生成真实运行记录。' }])
+      push('内置演示运行完成', 'ok')
+    } catch (error) {
+      setRunState('paused')
+      push(`演示运行失败：${(error as Error).message}`, 'error')
+    } finally {
+      setDemoRunning(false)
     }
   }
 
@@ -310,12 +395,13 @@ export function NextConsolePage() {
               placeholder="例如：每天 9 点抓取竞品价格，异常时发飞书提醒，并生成对比报告"
               aria-label="一句话说明目标"
             />
-            <span className="nx-intent-hint">⌘ / Ctrl + ↵ 直接开始 · 空着也行，AI 会用示例意图</span>
+            <span className="nx-intent-hint">⌘ / Ctrl + ↵ 拆解 · 示例需要可访问 URL；想先看效果点「跑内置演示」</span>
           </label>
           <div className="nx-intent-actions">
-            <Button variant="primary" size="lg" icon={planning || runState === 'running' ? 'refresh' : 'spark'} disabled={runState === 'running' || planning} onClick={start}>
+            <Button variant="primary" size="lg" icon={planning || runState === 'running' ? 'refresh' : 'spark'} disabled={runState === 'running' || planning || demoRunning} onClick={start}>
               {planning ? 'AI 正在规划…' : runState === 'running' ? 'AI 正在执行…' : runState === 'complete' ? '让 AI 再跑一次' : '让 AI 开始'}
             </Button>
+            <Button variant="soft" size="lg" icon="play" loading={demoRunning} disabled={runState === 'running' || planning || demoRunning} onClick={runDemo}>跑内置演示</Button>
             <Button variant="ghost" size="lg" icon="layers" onClick={() => setShowTemplates((value) => !value)} aria-expanded={showTemplates}>
               用模板
             </Button>
@@ -441,7 +527,7 @@ export function NextConsolePage() {
               actions={
                 <>
                   <Button size="sm" variant="ghost" icon="download" onClick={() => push('演示模式：产出物已准备好（mock）', 'info')}>下载产出物</Button>
-                  <Button size="sm" variant="ghost" icon="external" onClick={() => push('演示模式：运行详情将在批次 2 接入真实 API', 'info')}>查看运行</Button>
+                  {demoRunId ? <Button size="sm" variant="primary" icon="external" onClick={() => navigate(`/runs/${demoRunId}`)}>查看运行详情</Button> : <Button size="sm" variant="ghost" icon="external" onClick={() => push('先跑一次内置演示，或打开节点工作台', 'info')}>查看运行</Button>}
                 </>
               }
             />
