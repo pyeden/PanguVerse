@@ -1,5 +1,8 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 import { navigate, useRoute } from '../../shared/router'
+import { studioApi } from '../../shared/api'
+import type { StudioNode, Workflow } from '../../shared/types'
 import {
   EVIDENCE_BY_NODE,
   EXTRACT_DIFFS,
@@ -7,6 +10,7 @@ import {
   WORKBENCH_TESTS,
   codeWithHeader,
   type NxNodeMeta,
+  type NxPort,
 } from '../../shared/nextMock'
 import { Icon } from '../../components/Icon'
 import { Badge, Button, PageHeader, SectionHeader, useToast } from '../../components/ui'
@@ -27,12 +31,71 @@ function lockRange(node: NxNodeMeta): [number, number] {
   return match ? [Number(match[1]), Number(match[2])] : [0, 0]
 }
 
+
+function realNodeMeta(node: StudioNode, workflow?: Workflow): NxNodeMeta {
+  const atom = String(node.atom || '')
+  const effects = Array.isArray(node.effects) ? node.effects.map(String) : []
+  const risk: NxNodeMeta['contract']['risk'] = effects.includes('destructive')
+    ? 'L2'
+    : effects.some((effect) => ['write', 'mutate', 'external'].includes(effect))
+      ? 'L1'
+      : 'L0'
+  const inputs: NxPort[] = (node.input_ports || []).map((port) => ({
+    name: String(port.name || ''),
+    type: String(port.type || 'any'),
+    required: !!port.required,
+    source: '',
+  }))
+  const outputs: NxPort[] = (node.output_ports || []).map((port) => ({
+    name: String(port.name || ''),
+    type: String(port.type || 'any'),
+  }))
+  const custom = !atom || atom.includes('custom')
+  return {
+    id: node.node_id,
+    name: node.name || atom || node.node_id,
+    atom: atom || 'custom',
+    custom,
+    locked: !!node.locked,
+    rev: Number(workflow?.current_rev || workflow?.rev || 1),
+    autoFixes: 0,
+    tests: { passed: 0, total: 0 },
+    contract: {
+      inputs,
+      outputs,
+      capabilities: [],
+      sideEffect: effects[0] || 'none',
+      idempotency: 'unknown',
+      risk,
+      timeout: '—',
+    },
+    code: custom
+      ? `# 自定义节点 ${node.node_id}\n# 真实 workflow 暂未返回代码实现；可在此调试并注册原子\n`
+      : `# atom: ${atom}\n# 已注册实现；运行时由 registry 按 pinned ref 解析\n`,
+    logs: [{ id: `${node.node_id}-loaded`, at: '刚刚', level: 'info', line: 1, message: '真实 workflow 节点已加载；运行调试接入下一批' }],
+    note: custom ? '真实草稿实现 · 尚未注册' : `真实原子 · ${atom}`,
+  }
+}
+
 export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-prices' }: { wid?: string; nodeId?: string }) {
   const route = useRoute()
   const { push } = useToast()
-  const initialNode = WORKBENCH_NODES.find((item) => item.id === nodeId) || WORKBENCH_NODES[1]
-  const [selectedId, setSelectedId] = useState(initialNode.id)
-  const node = WORKBENCH_NODES.find((item) => item.id === selectedId) || initialNode
+  const isRealWid = !!wid && wid !== 'wf-console'
+  const workflowQuery = useQuery({
+    queryKey: ['next-workbench', wid],
+    queryFn: () => studioApi.getWorkflow(wid),
+    enabled: isRealWid,
+    staleTime: 30_000,
+  })
+  const realNodes = useMemo(() => {
+    const workflow = workflowQuery.data
+    const graph = workflow?.graph?.nodes || workflow?.nodes || []
+    return graph.map((item) => realNodeMeta(item, workflow))
+  }, [workflowQuery.data])
+  const nodes = isRealWid && realNodes.length ? realNodes : WORKBENCH_NODES
+  const fallbackNode = nodes.find((item) => item.id === nodeId) || nodes[1] || nodes[0]
+  const [selectedId, setSelectedId] = useState(nodeId || fallbackNode.id)
+  const node = nodes.find((item) => item.id === selectedId) || fallbackNode
   const [tab, setTab] = useState<Tab>('impl')
   const [rev, setRev] = useState(node.rev)
   const [autoFixes, setAutoFixes] = useState(node.autoFixes)
@@ -41,6 +104,15 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
   const [editing, setEditing] = useState(false)
   const [editedCode, setEditedCode] = useState('')
   const [logs, setLogs] = useState(node.logs)
+  useEffect(() => {
+    setRev(node.rev)
+    setAutoFixes(node.autoFixes)
+    setLogs(node.logs)
+    setAccepted(!node.custom)
+    setRegistered(!node.custom)
+    setEditing(false)
+  }, [node.id, node.rev])
+
   const [activeLine, setActiveLine] = useState<number>(() => {
     const value = Number(route.query.get('line') || '')
     return Number.isFinite(value) && value > 0 ? value : 0
@@ -136,9 +208,10 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
       <PageHeader
         eyebrow={<><span className="live-dot" /> 节点工作台 · AI 先做一遍</>}
         title={node.name}
-        description={`${node.custom ? '草稿实现 · 可编辑 · 尚需注册' : '已注册原子 · 实现只读'}；节点身份不变，只替换 implementation。`}
+        description={`${isRealWid ? `真实 workflow ${wid}` : '原型演示数据'} · ${node.custom ? '草稿实现 · 可编辑 · 尚需注册' : '已注册原子 · 实现只读'}；节点身份不变，只替换 implementation。`}
         actions={
           <>
+            <Badge tone={isRealWid ? 'cyan' : 'neutral'}>{isRealWid ? '真实 workflow' : '演示数据'}</Badge>
             <Badge tone={node.custom ? 'warn' : 'ok'} dot>{node.custom ? 'custom · 低复用' : 'atom · 高复用'}</Badge>
             <Badge tone="cyan">rev {rev}</Badge>
             <Button size="sm" variant="ghost" icon="flow" onClick={() => navigate('/next/console')}>返回控制台</Button>
@@ -153,9 +226,9 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
 
       <div className="nx-wb-grid">
         <aside className="panel nx-wb-steps" aria-label="任务步骤">
-          <SectionHeader icon="flow" title="任务步骤" description={`${WORKBENCH_NODES.length} 个节点`} />
+          <SectionHeader icon="flow" title="任务步骤" description={`${nodes.length} 个节点`} />
           <div style={{ marginTop: 8 }}>
-            {WORKBENCH_NODES.map((item, index) => (
+            {nodes.map((item, index) => (
               <button
                 key={item.id}
                 type="button"
