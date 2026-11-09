@@ -2,13 +2,14 @@ import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { navigate, useRoute } from '../../shared/router'
 import { studioApi } from '../../shared/api'
-import type { StudioNode, Workflow } from '../../shared/types'
+import type { DebugSession, StudioNode, Workflow } from '../../shared/types'
 import {
   EVIDENCE_BY_NODE,
   EXTRACT_DIFFS,
   WORKBENCH_NODES,
   WORKBENCH_TESTS,
   codeWithHeader,
+  type NxLogEvent,
   type NxNodeMeta,
   type NxPort,
 } from '../../shared/nextMock'
@@ -77,6 +78,13 @@ function realNodeMeta(node: StudioNode, workflow?: Workflow): NxNodeMeta {
   }
 }
 
+
+function debugErrorText(value: unknown): string {
+  if (!value) return ''
+  if (typeof value === 'string') return value
+  try { return JSON.stringify(value) } catch { return String(value) }
+}
+
 export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-prices' }: { wid?: string; nodeId?: string }) {
   const route = useRoute()
   const { push } = useToast()
@@ -111,8 +119,12 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     setAccepted(!node.custom)
     setRegistered(!node.custom)
     setEditing(false)
+    setDebugState('idle')
+    setDebugSummary(null)
   }, [node.id, node.rev])
 
+  const [debugState, setDebugState] = useState<'idle' | 'running' | 'done' | 'failed'>('idle')
+  const [debugSummary, setDebugSummary] = useState<{ passed: number; failed: number; total: number } | null>(null)
   const [activeLine, setActiveLine] = useState<number>(() => {
     const value = Number(route.query.get('line') || '')
     return Number.isFinite(value) && value > 0 ? value : 0
@@ -143,6 +155,80 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     setTab('impl')
     setActiveLine(0)
     navigate(`/next/workbench/${wid}/${id}`, { replace: true })
+  }
+
+  const applyDebugSession = (session: DebugSession) => {
+    const states = Array.isArray(session.nodes) ? session.nodes : []
+    const rows: NxLogEvent[] = states.map((state, index) => {
+      const status = String(state.status || 'info')
+      const level: NxLogEvent['level'] = status === 'passed' ? 'pass' : status === 'failed' ? 'error' : 'info'
+      const duration = state.duration_ms ? ` · ${Math.round(state.duration_ms)}ms` : ''
+      const reason = state.reason ? ` · ${state.reason}` : ''
+      const error = state.error ? ` · ${debugErrorText(state.error)}` : ''
+      return {
+        id: `debug-${index}-${state.node_id}`,
+        at: '刚刚',
+        level,
+        line: 1,
+        message: `${state.node_id} · ${status}${duration}${reason}${error}`,
+      }
+    })
+    if (rows.length) setLogs(rows)
+    const summary = session.summary || { passed: 0, failed: 0, skipped: 0 }
+    const passed = Number(summary.passed || 0)
+    const failed = Number(summary.failed || 0)
+    setDebugSummary({ passed, failed, total: Number(summary.total || passed + failed) })
+    setDebugState(failed ? 'failed' : 'done')
+  }
+
+  const runDebug = async () => {
+    if (debugState === 'running') return
+    setDebugState('running')
+    if (!isRealWid) {
+      window.setTimeout(() => {
+        setLogs((current) => [...current, {
+          id: `debug-mock-${Date.now()}`,
+          at: '刚刚',
+          level: 'pass',
+          line: 25,
+          message: '演示调试通过 · 输出契约验证 rows=12 / count=12',
+        }])
+        setDebugSummary({ passed: 1, failed: 0, total: 1 })
+        setDebugState('done')
+        push('演示调试通过', 'ok')
+      }, 600)
+      return
+    }
+    try {
+      const started = await studioApi.startDebug(wid, { rev, node_id: node.id, mode: 'only' })
+      if (started.legacy) {
+        applyDebugSession(started.legacy)
+        push(started.legacy.summary?.failed ? '调试完成，有失败节点' : '调试完成', started.legacy.summary?.failed ? 'warn' : 'ok')
+        return
+      }
+      if (!started.session_id) throw new Error('调试接口没有返回 session_id')
+      let cursor: number | string = 0
+      let session: DebugSession | null = null
+      for (let index = 0; index < 30; index += 1) {
+        session = await studioApi.debugSession(started.session_id, cursor)
+        cursor = session.cursor ?? cursor
+        if (session.done) break
+        await new Promise((resolve) => window.setTimeout(resolve, 700))
+      }
+      if (!session) throw new Error('没有拿到调试结果')
+      applyDebugSession(session)
+      push(session.summary?.failed ? '调试完成，有失败节点' : '调试完成', session.summary?.failed ? 'warn' : 'ok')
+    } catch (error) {
+      setDebugState('failed')
+      setLogs((current) => [...current, {
+        id: `debug-error-${Date.now()}`,
+        at: '刚刚',
+        level: 'error',
+        line: 1,
+        message: `调试失败：${(error as Error).message}`,
+      }])
+      push(`调试失败：${(error as Error).message}`, 'error')
+    }
   }
 
   const accept = () => {
@@ -268,6 +354,8 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
                 <span>{node.id}.py</span>
                 <Badge tone={editing ? 'warn' : 'cyan'}>{editing ? '人工编辑' : `rev ${rev}`}</Badge>
                 <span>{node.custom ? '草稿实现' : '已注册原子'}</span>
+                {debugState === 'running' ? <Badge tone="run" dot>调试中</Badge> : null}
+                {debugSummary ? <Badge tone={debugSummary.failed ? 'bad' : 'ok'} dot>调试图 {debugSummary.passed}/{debugSummary.total}</Badge> : null}
                 <span style={{ marginLeft: 'auto' }}>{editing ? '保存后生成新 revision' : '点击日志行号可定位'}</span>
               </div>
               {editing ? (
@@ -409,6 +497,7 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
             <strong>{node.custom ? `AI 建议：接受 rev ${rev}` : '已注册原子 · 实现只读'}</strong>
             <p>{node.custom ? '契约完整、测试通过、整任务跑通；确认后仅替换 implementation，不改变节点身份。' : '该节点已绑定注册原子；如需修改实现，请去资产库创建新版本。'}</p>
             <div className="nx-ai-actions">
+              <Button size="sm" variant="soft" icon="play" loading={debugState === 'running'} onClick={runDebug}>{debugState === 'running' ? '调试中…' : '运行调试'}</Button>
               <Button size="sm" variant="primary" icon="check" disabled={!node.custom || accepted || registered} onClick={accept}>接受 AI 建议</Button>
               <Button size="sm" variant="soft" icon="refresh" disabled={!node.custom || registered} onClick={aiFix}>让 AI 再改</Button>
               <Button size="sm" variant="ghost" icon="edit" disabled={!node.custom || registered} onClick={startManual}>手动修改</Button>
