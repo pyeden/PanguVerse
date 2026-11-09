@@ -140,7 +140,8 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     { key: 'task', label: '整任务跑通', ok: true },
     { key: 'human', label: '人工确认风险', ok: accepted },
   ]
-  const canRegister = node.custom && !registered && checks.every((item) => item.ok)
+  const hasRunnableCode = /def\s+run\s*\(/.test(node.code)
+  const canRegister = node.custom && !registered && hasRunnableCode && checks.every((item) => item.ok)
 
   const selectNode = (id: string) => {
     const next = WORKBENCH_NODES.find((item) => item.id === id)
@@ -278,10 +279,39 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     push(`人工修改已保存为 rev ${nextRev}`, 'ok')
   }
 
-  const register = () => {
+  const register = async () => {
     if (!canRegister) return
-    setRegistered(true)
-    push('已注册原子：implementation 替换为 atom 引用，节点身份不变', 'ok')
+    if (!isRealWid) {
+      setRegistered(true)
+      push('已注册原子：implementation 替换为 atom 引用，节点身份不变', 'ok')
+      return
+    }
+    try {
+      const inputs = Object.fromEntries(node.contract.inputs.map((port) => [port.name, port.type]))
+      const outputs = Object.fromEntries(node.contract.outputs.map((port) => [port.name, port.type]))
+      const result = await studioApi.registerAtom(wid, node.id, {
+        name: node.atom && node.atom !== 'custom' ? node.atom : node.name,
+        description: `工作台注册：${wid}/${node.id}`,
+        code: node.code,
+        inputs,
+        outputs,
+        effects: node.contract.sideEffect === 'none' ? [] : [node.contract.sideEffect],
+        capabilities: node.contract.capabilities,
+        idempotent: node.contract.idempotency === 'yes',
+        pack: 'custom',
+      })
+      setRegistered(true)
+      setLogs((current) => [...current, {
+        id: `register-${Date.now()}`,
+        at: '刚刚',
+        level: 'pass',
+        line: 1,
+        message: `已注册原子 ${String(result.ref || result.atom?.name || '')} → ${String(result.pack_path || '')}`,
+      }])
+      push(`已注册原子 ${String(result.ref || '')}`, 'ok')
+    } catch (error) {
+      push(`注册失败：${(error as Error).message}`, 'error')
+    }
   }
 
   const jumpToLine = (line: number) => {
@@ -516,7 +546,7 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
             <Button size="sm" variant="primary" icon="atoms" className="full-width" style={{ width: '100%', marginTop: 8 }} disabled={!canRegister} onClick={register}>
               {registered ? '已注册原子' : '注册原子'}
             </Button>
-            <p className="nx-register-note">注册只替换 implementation 与 registration；节点 id、契约、端口、图位置不变。</p>
+            <p className="nx-register-note">{hasRunnableCode ? '注册只替换 implementation 与 registration；节点 id、契约、端口、图位置不变。' : '真实 workflow 未返回可执行代码，暂不能注册；先在工作台补全实现。'}</p>
           </section>
 
           <section className="panel">

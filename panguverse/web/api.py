@@ -232,6 +232,12 @@ class WebAPI:
                 # 调度线程自检：last_tick_at / last_tick_error 由 Scheduler 维护
                 payload.update(self.scheduler.status_snapshot())
                 return json_response(payload)
+            if head == "atoms" and len(rest) == 1 and rest[0] == "register" and method == "POST":
+                from .custom_atoms import register_custom_atom
+                return json_response(
+                    register_custom_atom(self.root, body, actor=self._actor(request_headers)),
+                    status=201,
+                )
             if head == "atoms" and not rest:
                 return json_response(
                     service.list_atoms(

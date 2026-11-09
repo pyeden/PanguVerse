@@ -470,6 +470,13 @@ export const studioApi = {
     )
   },
 
+  async registerAtom(wid: string, nodeId: string, body: AnyRecord): Promise<AnyRecord> {
+    return request<AnyRecord>('api/atoms/register', {
+      method: 'POST',
+      body: { ...body, wid, node_id: nodeId },
+    })
+  },
+
   async getWorkflow(wid: string, rev?: number): Promise<Workflow> {
     return realOrMock(
       async () => {
