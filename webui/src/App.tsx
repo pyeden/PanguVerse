@@ -1,7 +1,7 @@
 import { Component, useEffect, useMemo, useState, type ErrorInfo, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, UNAUTHORIZED_EVENT } from './shared/api'
-import { navigate, useRoute, type Route } from './shared/router'
+import { navigate, useRoute, withQuery, type Route } from './shared/router'
 import { Shell } from './components/Shell'
 import { ToastProvider, Button, Loading } from './components/ui'
 import { Icon } from './components/Icon'
@@ -14,6 +14,8 @@ import { TasksPage } from './pages/TasksPage'
 import { ExecutionsPage } from './pages/ExecutionsPage'
 import { HistoryPage } from './pages/HistoryPage'
 import { ReportsPage } from './pages/ReportsPage'
+import { RunsPage } from './pages/RunsPage'
+import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/SchedulesPage'
 import { ArtifactsPage } from './pages/ArtifactsPage'
 import { StudioNewPage } from './pages/StudioNewPage'
@@ -132,6 +134,14 @@ function RoutedPage({ route }: { route: Route }) {
   if (['overview', 'run'].includes(first) && parts.length === 1) return <Redirect to="/projects" />
   if (first === 'packs') return <Redirect to="/atoms" />
   if (first === 'runs' && parts[1]) return <RunDetailPage key={parts[1]} />
+  if (first === 'runs') return <RunsPage />
+  if (first === 'settings') return <SettingsPage />
+  if (first === 'executions' || first === 'history') return <Redirect to="/runs" />
+  if (first === 'reports') return <Redirect to={withQuery('/runs', { view: 'reports' })} />
+  if (first === 'artifacts') {
+    const run = route.query.get('run')
+    return <Redirect to={withQuery('/runs', { view: 'artifacts', ...(run ? { run } : {}) })} />
+  }
   if (first === 'projects') return <ProjectsPage />
   if (first === 'atoms') return <AtomsPage />
   if (first === 'tasks') return <TasksPage />
@@ -186,6 +196,8 @@ function NotFound({ route }: { route: Route }) {
 function pageTitle(route: Route): string {
   const first = route.parts[0] || 'projects'
   if (first === 'next') return route.parts[1] === 'workbench' ? '节点工作台' : 'AI 控制台'
+  if (first === 'runs') return route.parts[1] ? '运行详情' : '运行'
+  if (first === 'settings') return '设置'
   if (first === 'studio') return route.parts[1] === 'explore' ? (route.parts[2] ? '探索回看' : '探索') : route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '流程画布' : '新建流程'
   if (first === 'p') {
     const page = route.parts[2]

@@ -8,16 +8,11 @@ import { Icon, type IconName } from './Icon'
 import { Badge, IconButton, StatusBadge } from './ui'
 
 const navItems: { id: string; label: string; href: string; icon: IconName; hint?: string }[] = [
-  { id: 'studio', label: '工作台', href: '/studio/new', icon: 'spark', hint: '造流程' },
-  { id: 'explore', label: '探索', href: '/studio/explore', icon: 'bolt', hint: '先跑' },
-  { id: 'projects', label: '项目', href: '/projects', icon: 'projects', hint: '域' },
-  { id: 'atoms', label: '原子', href: '/atoms', icon: 'atoms', hint: '料' },
-  { id: 'tasks', label: '任务', href: '/tasks', icon: 'tasks', hint: '活' },
-  { id: 'executions', label: '执行', href: '/executions', icon: 'play', hint: '活' },
-  { id: 'schedules', label: '调度', href: '/schedules', icon: 'clock', hint: '自动' },
-  { id: 'artifacts', label: '产出物', href: '/artifacts', icon: 'archive', hint: '成果' },
-  { id: 'history', label: '历史', href: '/history', icon: 'history', hint: '账' },
-  { id: 'reports', label: '报告', href: '/reports', icon: 'report', hint: '账' },
+  { id: 'home', label: '首页', href: '/next/console', icon: 'spark', hint: 'AI' },
+  { id: 'flows', label: '流程', href: '/studio/new', icon: 'flow', hint: '造' },
+  { id: 'runs', label: '运行', href: '/runs', icon: 'play', hint: '跑' },
+  { id: 'assets', label: '资产', href: '/atoms', icon: 'atoms', hint: '料' },
+  { id: 'settings', label: '设置', href: '/settings', icon: 'settings', hint: '配' },
 ]
 
 function isCanvasRoute(route: Route): boolean {
@@ -25,34 +20,41 @@ function isCanvasRoute(route: Route): boolean {
 }
 
 function navActive(route: Route): string {
-  const first = route.parts[0] || 'projects'
-  if (first === 'p') return 'projects'
-  if (first === 'studio') return route.parts[1] === 'explore' ? 'explore' : 'studio'
-  if (first === 'platform') return 'studio'
+  const first = route.parts[0] || 'next'
+  if (first === 'next' || first === 'projects') return 'home'
+  if (first === 'studio' || first === 'tasks' || first === 'schedules' || first === 'explore') return 'flows'
+  if (first === 'runs' || first === 'executions' || first === 'history' || first === 'reports' || first === 'artifacts' || first === 'p') return 'runs'
+  if (first === 'atoms' || first === 'packs' || first === 'platform') return 'assets'
+  if (first === 'settings') return 'settings'
   return first
 }
 
 function crumbs(route: Route, projects: Project[]): { label: string; href?: string }[] {
-  const first = route.parts[0] || 'projects'
-  if (first === 'projects') return [{ label: '项目' }]
-  if (first === 'atoms') return [{ label: '原子库' }]
-  if (first === 'tasks') return [{ label: '任务' }]
-  if (first === 'executions') return [{ label: '执行' }]
-  if (first === 'history') return [{ label: '历史' }]
-  if (first === 'reports') return [{ label: '报告' }]
-  if (first === 'schedules') return [{ label: '调度' }]
-  if (first === 'artifacts') return [{ label: '产出物' }]
+  const first = route.parts[0] || 'next'
+  if (first === 'next') {
+    return [{ label: '首页' }, ...(route.parts[1] === 'workbench' ? [{ label: '节点工作台' }] : [])]
+  }
+  if (first === 'runs') return [{ label: '运行' }, ...(route.parts[1] ? [{ label: '运行详情' }] : [])]
+  if (first === 'settings') return [{ label: '设置' }]
+  if (first === 'atoms') return [{ label: '资产' }, { label: '原子库' }]
+  if (first === 'packs') return [{ label: '资产' }, { label: '领域包' }]
+  if (first === 'executions' || first === 'history') return [{ label: '运行' }]
+  if (first === 'reports') return [{ label: '运行' }, { label: '报告' }]
+  if (first === 'artifacts') return [{ label: '运行' }, { label: '产出物' }]
+  if (first === 'tasks') return [{ label: '流程' }, { label: '任务' }]
+  if (first === 'schedules') return [{ label: '流程' }, { label: '调度' }]
+  if (first === 'projects') return [{ label: '首页' }, { label: '项目' }]
   if (first === 'studio') {
-    if (route.parts[1] === 'new') return [{ label: '工作台' }, { label: '新建流程' }]
-    if (route.parts[1] === 'explore') return [{ label: '工作台', href: '/studio/new' }, { label: '探索' }, ...(route.parts[2] ? [{ label: '回看' }] : [])]
-    if (route.parts[2] === 'review') return [{ label: '工作台', href: '/studio/new' }, { label: '流程', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
-    return [{ label: '工作台', href: '/studio/new' }, { label: '画布' }]
+    if (route.parts[1] === 'new') return [{ label: '流程' }, { label: '新建流程' }]
+    if (route.parts[1] === 'explore') return [{ label: '流程', href: '/studio/new' }, { label: '探索' }, ...(route.parts[2] ? [{ label: '回看' }] : [])]
+    if (route.parts[2] === 'review') return [{ label: '流程', href: '/studio/new' }, { label: '画布', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
+    return [{ label: '流程', href: '/studio/new' }, { label: '画布' }]
   }
   if (first === 'p') {
     const pid = route.parts[1]
     const project = projects.find((item) => item.project_id === pid)
     return [
-      { label: '项目', href: '/projects' },
+      { label: '运行', href: '/runs' },
       { label: project?.name || pid },
       ...(route.parts[2] === 'runs' ? [{ label: '运行详情' }] : []),
     ]
