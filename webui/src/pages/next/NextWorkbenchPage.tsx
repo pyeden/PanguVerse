@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { navigate, useRoute } from '../../shared/router'
 import { studioApi } from '../../shared/api'
 import type { DebugSession, StudioNode, Workflow } from '../../shared/types'
@@ -34,27 +34,38 @@ function lockRange(node: NxNodeMeta): [number, number] {
 
 
 function realNodeMeta(node: StudioNode, workflow?: Workflow): NxNodeMeta {
-  const atom = String(node.atom || '')
-  const effects = Array.isArray(node.effects) ? node.effects.map(String) : []
-  const risk: NxNodeMeta['contract']['risk'] = effects.includes('destructive')
-    ? 'L2'
-    : effects.some((effect) => ['write', 'mutate', 'external'].includes(effect))
-      ? 'L1'
-      : 'L0'
-  const inputs: NxPort[] = (node.input_ports || []).map((port) => ({
-    name: String(port.name || ''),
-    type: String(port.type || 'any'),
-    required: !!port.required,
-    source: '',
-  }))
-  const outputs: NxPort[] = (node.output_ports || []).map((port) => ({
-    name: String(port.name || ''),
-    type: String(port.type || 'any'),
-  }))
-  const custom = !atom || atom.includes('custom')
+  const draft = node.draft && typeof node.draft === 'object' ? (node.draft as Record<string, any>) : null
+  const atom = String(draft?.name || node.atom || '')
+  const effects = Array.isArray(draft?.effects)
+    ? (draft.effects as unknown[]).map(String)
+    : Array.isArray(node.effects) ? node.effects.map(String) : []
+  const risk: NxNodeMeta['contract']['risk'] = draft?.risk === 'L1' || draft?.risk === 'L2'
+    ? draft.risk
+    : effects.includes('destructive')
+      ? 'L2'
+      : effects.some((effect) => ['write', 'mutate', 'external'].includes(effect))
+        ? 'L1'
+        : 'L0'
+  const draftInputs = draft?.inputs && typeof draft.inputs === 'object' ? draft.inputs : null
+  const draftOutputs = draft?.outputs && typeof draft.outputs === 'object' ? draft.outputs : null
+  const inputs: NxPort[] = draftInputs
+    ? Object.entries(draftInputs).map(([name, type]) => ({ name, type: String(type || 'any'), required: true, source: '' }))
+    : (node.input_ports || []).map((port) => ({
+        name: String(port.name || ''),
+        type: String(port.type || 'any'),
+        required: !!port.required,
+        source: '',
+      }))
+  const outputs: NxPort[] = draftOutputs
+    ? Object.entries(draftOutputs).map(([name, type]) => ({ name, type: String(type || 'any') }))
+    : (node.output_ports || []).map((port) => ({
+        name: String(port.name || ''),
+        type: String(port.type || 'any'),
+      }))
+  const custom = !!draft || !atom || atom.includes('custom') || atom.startsWith('draft:')
   return {
     id: node.node_id,
-    name: node.name || atom || node.node_id,
+    name: String(draft?.name || node.name || atom || node.node_id),
     atom: atom || 'custom',
     custom,
     locked: !!node.locked,
@@ -64,17 +75,19 @@ function realNodeMeta(node: StudioNode, workflow?: Workflow): NxNodeMeta {
     contract: {
       inputs,
       outputs,
-      capabilities: [],
+      capabilities: Array.isArray(draft?.capabilities) ? (draft.capabilities as unknown[]).map(String) : [],
       sideEffect: effects[0] || 'none',
-      idempotency: 'unknown',
+      idempotency: draft?.idempotent ? 'yes' : 'unknown',
       risk,
       timeout: '—',
     },
-    code: custom
-      ? `# 自定义节点 ${node.node_id}\n# 真实 workflow 暂未返回代码实现；可在此调试并注册原子\n`
-      : `# atom: ${atom}\n# 已注册实现；运行时由 registry 按 pinned ref 解析\n`,
-    logs: [{ id: `${node.node_id}-loaded`, at: '刚刚', level: 'info', line: 1, message: '真实 workflow 节点已加载；运行调试接入下一批' }],
-    note: custom ? '真实草稿实现 · 尚未注册' : `真实原子 · ${atom}`,
+    code: draft?.code
+      ? String(draft.code)
+      : custom
+        ? `# 草稿自定义节点 ${node.node_id}\n# 等待工作台读取真实代码\n`
+        : `# atom: ${atom}\n# 已注册实现；运行时由 registry 按 pinned ref 解析\n`,
+    logs: [{ id: `${node.node_id}-loaded`, at: '刚刚', level: 'info', line: 1, message: '真实 workflow 节点已加载' }],
+    note: custom ? '草稿自定义节点 · 尚未注册' : `真实原子 · ${atom}`,
   }
 }
 
@@ -88,12 +101,14 @@ function debugErrorText(value: unknown): string {
 export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-prices' }: { wid?: string; nodeId?: string }) {
   const route = useRoute()
   const { push } = useToast()
+  const queryClient = useQueryClient()
   const isRealWid = !!wid && wid !== 'wf-console'
   const workflowQuery = useQuery({
     queryKey: ['next-workbench', wid],
     queryFn: () => studioApi.getWorkflow(wid),
     enabled: isRealWid,
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: 'always',
   })
   const realNodes = useMemo(() => {
     const workflow = workflowQuery.data
@@ -123,15 +138,36 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     setDebugSummary(null)
   }, [node.id, node.rev])
 
+  const [creatingDraft, setCreatingDraft] = useState(false)
   const [debugState, setDebugState] = useState<'idle' | 'running' | 'done' | 'failed'>('idle')
   const [debugSummary, setDebugSummary] = useState<{ passed: number; failed: number; total: number } | null>(null)
   const implementationQuery = useQuery({
     queryKey: ['node-implementation', wid, node.id, rev],
     queryFn: () => studioApi.nodeImplementation(wid, node.id, rev),
-    enabled: isRealWid && !!node.id && !editing,
+    enabled: isRealWid && workflowQuery.isSuccess && realNodes.some((item) => item.id === node.id) && !editing,
     staleTime: 15_000,
   })
   const implementation = implementationQuery.data
+  const rawNodes = workflowQuery.data?.graph?.nodes || workflowQuery.data?.nodes || []
+  const rawNode = rawNodes.find((item) => item.id === node.id)
+  const rawDraft = rawNode?.draft && typeof rawNode.draft === 'object' ? (rawNode.draft as Record<string, any>) : null
+  const isDraft = node.custom || !!rawDraft || implementation?.kind === 'draft'
+  const rawDraftContract = rawDraft
+    ? {
+        inputs: Object.entries(rawDraft.inputs || {}).map(([name, type]) => ({ name, type: String(type || 'any'), required: true })),
+        outputs: Object.entries(rawDraft.outputs || {}).map(([name, type]) => ({ name, type: String(type || 'any'), required: true })),
+        capabilities: Array.isArray(rawDraft.capabilities) ? rawDraft.capabilities.map(String) : [],
+        sideEffect: Array.isArray(rawDraft.effects) && rawDraft.effects.length ? String(rawDraft.effects[0]) : 'none',
+        idempotency: rawDraft.idempotent ? 'yes' : 'unknown',
+        risk: rawDraft.risk === 'L1' || rawDraft.risk === 'L2' ? rawDraft.risk : 'L0',
+        timeout: '—',
+      }
+    : null
+  const effectiveContract = rawDraftContract || (implementation?.kind === 'draft' && implementation.contract ? implementation.contract as typeof node.contract : node.contract)
+  useEffect(() => {
+    setAccepted(!isDraft)
+    setRegistered(!isDraft)
+  }, [node.id, isDraft])
   const [activeLine, setActiveLine] = useState<number>(() => {
     const value = Number(route.query.get('line') || '')
     return Number.isFinite(value) && value > 0 ? value : 0
@@ -143,16 +179,16 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
   const [lockStart, lockEnd] = useMemo(() => lockRange({ ...node, code: baseCode }), [node, baseCode])
   const evidence = EVIDENCE_BY_NODE[node.id]
   const checks = [
-    { key: 'contract', label: '契约完整', ok: node.contract.inputs.length > 0 && node.contract.outputs.length > 0 },
+    { key: 'contract', label: '契约完整', ok: effectiveContract.inputs.length > 0 && effectiveContract.outputs.length > 0 },
     { key: 'tests', label: `契约测试 ${node.tests.passed}/${node.tests.total}`, ok: node.tests.passed === node.tests.total },
     { key: 'task', label: '整任务跑通', ok: true },
     { key: 'human', label: '人工确认风险', ok: accepted },
   ]
   const hasRunnableCode = /def\s+run\s*\(/.test(code)
-  const canRegister = node.custom && !registered && hasRunnableCode && checks.every((item) => item.ok)
+  const canRegister = isDraft && !registered && hasRunnableCode && checks.every((item) => item.ok)
 
   const selectNode = (id: string) => {
-    const next = WORKBENCH_NODES.find((item) => item.id === id)
+    const next = nodes.find((item) => item.id === id) || WORKBENCH_NODES.find((item) => item.id === id)
     if (!next) return
     setSelectedId(id)
     setRev(next.rev)
@@ -287,6 +323,36 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     push(`人工修改已保存为 rev ${nextRev}`, 'ok')
   }
 
+  const insertDraftNode = async () => {
+    if (!isRealWid || creatingDraft) return
+    setCreatingDraft(true)
+    try {
+      const result = await studioApi.createDraftNode(wid, {
+        name: `draft_${Date.now().toString(36).slice(-4)}`,
+        description: '工作台插入的草稿自定义节点',
+        code: 'def run(ctx=None, **inputs):\n    text = inputs.get("text", "")\n    return {"out": text}\n',
+        inputs: { text: 'string' },
+        outputs: { out: 'string' },
+        effects: [],
+        capabilities: [],
+        risk: 'L0',
+        idempotent: true,
+      })
+      const created = result.node as { id?: string } | undefined
+      const graphNodes = (result.graph as { nodes?: Array<{ id?: string }> } | undefined)?.nodes
+      const newId = created?.id || graphNodes?.[graphNodes.length - 1]?.id
+      if (newId) {
+        await queryClient.invalidateQueries({ queryKey: ['next-workbench', wid] })
+        navigate(`/next/workbench/${wid}/${newId}`)
+      }
+      push('已插入草稿自定义节点', 'ok')
+    } catch (error) {
+      push(`插入草稿节点失败：${(error as Error).message}`, 'error')
+    } finally {
+      setCreatingDraft(false)
+    }
+  }
+
   const register = async () => {
     if (!canRegister) return
     if (!isRealWid) {
@@ -295,23 +361,24 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
       return
     }
     try {
-      const inputs = Object.fromEntries(node.contract.inputs.map((port) => [port.name, port.type]))
-      const outputs = Object.fromEntries(node.contract.outputs.map((port) => [port.name, port.type]))
+      const inputs = Object.fromEntries(effectiveContract.inputs.map((port) => [port.name, port.type]))
+      const outputs = Object.fromEntries(effectiveContract.outputs.map((port) => [port.name, port.type]))
       const result = await studioApi.registerAtom(wid, node.id, {
-        name: node.atom && node.atom !== 'custom' ? node.atom : node.name,
+        name: isDraft ? node.name : (node.atom && node.atom !== 'custom' ? node.atom : node.name),
         description: `工作台注册：${wid}/${node.id}`,
-        code: node.code,
+        code,
         rev,
         inputs,
         outputs,
-        effects: node.contract.sideEffect === 'none' ? [] : [node.contract.sideEffect],
-        capabilities: node.contract.capabilities,
-        idempotent: node.contract.idempotency === 'yes',
+        effects: effectiveContract.sideEffect === 'none' ? [] : [effectiveContract.sideEffect],
+        capabilities: effectiveContract.capabilities,
+        idempotent: effectiveContract.idempotency === 'yes',
         pack: 'custom',
       })
       const binding = result.binding as { rev?: number; atom?: string; node_id?: string } | undefined
       if (binding?.rev) setRev(Number(binding.rev))
       setRegistered(true)
+      await queryClient.invalidateQueries({ queryKey: ['next-workbench', wid] })
       setLogs((current) => [...current, {
         id: `register-${Date.now()}`,
         at: '刚刚',
@@ -335,12 +402,13 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
       <PageHeader
         eyebrow={<><span className="live-dot" /> 节点工作台 · AI 先做一遍</>}
         title={node.name}
-        description={`${isRealWid ? `真实 workflow ${wid}` : '原型演示数据'} · ${node.custom ? '草稿实现 · 可编辑 · 尚需注册' : '已注册原子 · 实现只读'}；节点身份不变，只替换 implementation。`}
+        description={`${isRealWid ? `真实 workflow ${wid}` : '原型演示数据'} · ${isDraft ? '草稿实现 · 可编辑 · 尚需注册' : '已注册原子 · 实现只读'}；节点身份不变，只替换 implementation。`}
         actions={
           <>
             <Badge tone={isRealWid ? 'cyan' : 'neutral'}>{isRealWid ? '真实 workflow' : '演示数据'}</Badge>
-            <Badge tone={node.custom ? 'warn' : 'ok'} dot>{node.custom ? 'custom · 低复用' : 'atom · 高复用'}</Badge>
+            <Badge tone={isDraft ? 'warn' : 'ok'} dot>{isDraft ? 'custom · 低复用' : 'atom · 高复用'}</Badge>
             <Badge tone="cyan">rev {rev}</Badge>
+            {isRealWid ? <Button size="sm" variant="soft" icon="plus" loading={creatingDraft} onClick={insertDraftNode}>插入草稿节点</Button> : null}
             <Button size="sm" variant="ghost" icon="flow" onClick={() => navigate('/next/console')}>返回控制台</Button>
           </>
         }
@@ -539,13 +607,13 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
 
         <aside className="nx-wb-side">
           <section className="panel nx-ai-card">
-            <strong>{node.custom ? `AI 建议：接受 rev ${rev}` : '已注册原子 · 实现只读'}</strong>
-            <p>{node.custom ? '契约完整、测试通过、整任务跑通；确认后仅替换 implementation，不改变节点身份。' : '该节点已绑定注册原子；如需修改实现，请去资产库创建新版本。'}</p>
+            <strong>{isDraft ? `AI 建议：接受 rev ${rev}` : '已注册原子 · 实现只读'}</strong>
+            <p>{isDraft ? '契约完整、测试通过、整任务跑通；确认后仅替换 implementation，不改变节点身份。' : '该节点已绑定注册原子；如需修改实现，请去资产库创建新版本。'}</p>
             <div className="nx-ai-actions">
               <Button size="sm" variant="soft" icon="play" loading={debugState === 'running'} onClick={runDebug}>{debugState === 'running' ? '调试中…' : '运行调试'}</Button>
-              <Button size="sm" variant="primary" icon="check" disabled={!node.custom || accepted || registered} onClick={accept}>接受 AI 建议</Button>
-              <Button size="sm" variant="soft" icon="refresh" disabled={!node.custom || registered} onClick={aiFix}>让 AI 再改</Button>
-              <Button size="sm" variant="ghost" icon="edit" disabled={!node.custom || registered} onClick={startManual}>手动修改</Button>
+              <Button size="sm" variant="primary" icon="check" disabled={!isDraft || accepted || registered} onClick={accept}>接受 AI 建议</Button>
+              <Button size="sm" variant="soft" icon="refresh" disabled={!isDraft || registered} onClick={aiFix}>让 AI 再改</Button>
+              <Button size="sm" variant="ghost" icon="edit" disabled={!isDraft || registered} onClick={startManual}>手动修改</Button>
             </div>
           </section>
 

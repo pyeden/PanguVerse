@@ -148,3 +148,59 @@ def test_node_implementation_builtin_is_readonly(tmp_path):
     assert payload["editable"] is False
     assert payload["atom"] == "http_get_page"
     assert "# atom: http_get_page@" in payload["code"]
+
+
+def test_draft_custom_node_is_real_backend_object(tmp_path):
+    from panguverse.web import studio
+
+    workflow = studio.create_draft_from_graph(
+        tmp_path,
+        intent="基础流程",
+        name="草稿节点测试",
+        nodes=[{
+            "id": "n1",
+            "atom": "http_get_page",
+            "name": "抓取",
+            "params": {"url": "https://example.com"},
+            "capture": {},
+        }],
+        edges=[],
+        actor="tester",
+    )
+    wid = workflow["wid"]
+    draft_payload = {
+        "name": "draft_echo",
+        "description": "工作台插入的草稿节点",
+        "code": "def run(ctx=None, **inputs):\n    return {'out': inputs.get('text', '')}\n",
+        "inputs": {"text": "string"},
+        "outputs": {"out": "string"},
+        "effects": [],
+        "capabilities": [],
+        "risk": "L0",
+        "idempotent": True,
+    }
+    added = studio.add_node(tmp_path, wid, {"draft": draft_payload}, actor="tester")
+    node = added["node"]
+    node_id = node["id"]
+    assert node["atom"].startswith("draft:")
+    assert node["draft"]["code"].startswith("def run")
+    impl = studio.node_implementation(tmp_path, wid, node_id, rev=added["rev"])
+    assert impl["kind"] == "draft"
+    assert impl["editable"] is True
+    assert "def run" in impl["code"]
+
+    registered = register_custom_atom(
+        tmp_path,
+        _payload(
+            name="draft_echo",
+            code=draft_payload["code"],
+            wid=wid,
+            node_id=node_id,
+        ),
+        actor="tester",
+    )
+    assert registered["binding"]["rev"] == added["rev"] + 1
+    revision = studio.read_revision(tmp_path, wid, registered["binding"]["rev"])
+    target = next(item for item in revision["nodes"] if item["id"] == node_id)
+    assert target["atom"] == "draft_echo"
+    assert "draft" not in target

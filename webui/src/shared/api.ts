@@ -491,6 +491,14 @@ export const studioApi = {
     )
   },
 
+  async createDraftNode(wid: string, body: AnyRecord): Promise<AnyRecord> {
+    return request<AnyRecord>(`api/studio/${encode(wid)}/nodes`, { method: 'POST', body: { draft: body } })
+  },
+
+  async updateDraftNode(wid: string, nid: string, body: AnyRecord): Promise<AnyRecord> {
+    return request<AnyRecord>(`api/studio/${encode(wid)}/nodes/${encode(nid)}`, { method: 'PATCH', body: { draft: body } })
+  },
+
   async nodeImplementation(wid: string, nid: string, rev?: number): Promise<AnyRecord> {
     const suffix = rev !== undefined ? `?rev=${encodeURIComponent(String(rev))}` : ''
     return request<AnyRecord>(`api/studio/${encode(wid)}/nodes/${encode(nid)}/implementation${suffix}`)

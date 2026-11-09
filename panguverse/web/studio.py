@@ -727,8 +727,9 @@ def validate_nodes(
     explore_id: str = "",
     registry: Any = None,
 ) -> dict[str, Any]:
-    nodes = list(nodes)
-    env_keys = list(env_schema) or _env_schema(nodes)
+    all_nodes = list(nodes)
+    nodes = [node for node in all_nodes if not isinstance(node.get("draft"), Mapping)]
+    env_keys = list(env_schema) or _env_schema(all_nodes)
     if registry is None:
         from ..core.workspace_packs import workspace_registry
 
@@ -777,6 +778,8 @@ def _unresolved_atoms(
     registry = workspace_registry(root, _registry())
     missing: list[dict[str, Any]] = []
     for node in nodes:
+        if isinstance(node.get("draft"), Mapping):
+            continue
         atom = str(node.get("atom") or "").strip()
         try:
             registry.get(atom)
@@ -1470,6 +1473,8 @@ def patch_node(
     root: Path, wid: str, node_id: str, payload: Any, *, actor: str = "local"
 ) -> dict[str, Any]:
     data = _as_dict(payload)
+    if "draft" in data:
+        return update_draft_node(root, wid, node_id, data, actor=actor)
     workflow = read_workflow(root, wid)
     revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
     nodes = [dict(node) for node in revision.get("nodes") or []]
@@ -1521,6 +1526,33 @@ def node_implementation(
     use_rev = int(workflow.get("current_rev") or 0) if rev is None else int(rev)
     revision = read_revision(root, wid, use_rev)
     node = _find_node(revision.get("nodes") or [], node_id)
+    draft = node.get("draft")
+    if isinstance(draft, Mapping):
+        code = str(draft.get("code") or "")
+        digest = hashlib.sha256(code.encode("utf-8")).hexdigest() if code else ""
+        return {
+            "wid": wid,
+            "rev": use_rev,
+            "node_id": node_id,
+            "atom": str(node.get("atom") or ""),
+            "ref": f"draft:{draft.get('artifact_id') or node_id}@{draft.get('revision') or 1}",
+            "kind": "draft",
+            "language": "python",
+            "code": code,
+            "entry": "",
+            "pack": "",
+            "hash": digest,
+            "editable": True,
+            "origin": "custom",
+            "contract": {
+                "inputs": [{"name": k, "type": v, "required": True} for k, v in (draft.get("inputs") or {}).items()],
+                "outputs": [{"name": k, "type": v, "required": True} for k, v in (draft.get("outputs") or {}).items()],
+                "capabilities": list(draft.get("capabilities") or []),
+                "effects": list(draft.get("effects") or []),
+                "idempotent": bool(draft.get("idempotent", True)),
+            },
+            "note": "草稿自定义节点；注册原子前只可在工作台查看/修改，不能调试或发布",
+        }
     atom_name = str(node.get("atom") or "").strip()
     if not atom_name:
         raise StudioError("bad_request", f"节点 {node_id} 没有 atom 绑定")
@@ -1649,6 +1681,7 @@ def rebind_node_to_atom(
             f"原子不存在: {name}",
             details={"atom": name},
         )
+    node.pop("draft", None)
     node["atom"] = name
     node["origin"] = "human"
     for index, item in enumerate(nodes):
@@ -1670,6 +1703,160 @@ def rebind_node_to_atom(
     payload = _node_payload(root, wid, new_rev, workflow)
     payload.update({"atom": name, "node_id": node_id, "binding_rev": new_rev.get("rev")})
     return payload
+
+
+def _clean_port_map(value: Any, *, field: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise StudioError("bad_request", f"{field} 必须是对象")
+    out: dict[str, str] = {}
+    for key, item in value.items():
+        name = _clean_text(key, field=f"{field} 的键", required=True, limit=80)
+        out[name] = _clean_text(item, field=f"{field}.{name}", limit=40) or "any"
+    return out
+
+
+def _clean_draft(value: Any, *, base: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """校验并规范化草稿自定义节点；代码保留原始缩进。"""
+    if not isinstance(value, Mapping):
+        raise StudioError("bad_request", "draft 必须是对象")
+    base = dict(base or {})
+    raw_code = value.get("code", base.get("code"))
+    if not isinstance(raw_code, str) or not raw_code.strip():
+        raise StudioError("bad_request", "草稿节点缺少代码")
+    code = raw_code if raw_code.endswith("\n") else raw_code + "\n"
+    if len(code) > 200_000:
+        raise StudioError("bad_request", "草稿代码不能超过 200000 个字符")
+    if not re.search(r"^\s*def\s+run\s*\(", code, re.M):
+        raise StudioError("bad_request", "草稿代码必须提供 def run(...) 入口")
+    try:
+        compile(code, "<draft-node>", "exec")
+    except SyntaxError as exc:
+        raise StudioError("bad_request", f"草稿代码语法错误：{exc.msg}（第 {exc.lineno} 行）", status=422) from exc
+
+    name_raw = value.get("name", base.get("name")) or "draft_node"
+    name = _clean_text(name_raw, field="name", required=True, limit=80)
+    name = re.sub(r"[^a-zA-Z0-9_]+", "_", name).strip("_")[:64] or "draft_node"
+    risk = str(value.get("risk", base.get("risk") or "L0")).upper()
+    if risk not in {"L0", "L1", "L2"}:
+        raise StudioError("bad_request", "risk 只能是 L0/L1/L2")
+    effects = value.get("effects", base.get("effects") or [])
+    capabilities = value.get("capabilities", base.get("capabilities") or [])
+    if not isinstance(effects, (list, tuple)) or not isinstance(capabilities, (list, tuple)):
+        raise StudioError("bad_request", "effects/capabilities 必须是字符串数组")
+    revision = int(base.get("revision") or 0) + 1
+    return {
+        "artifact_id": str(base.get("artifact_id") or value.get("artifact_id") or f"d-{uuid.uuid4().hex[:8]}"),
+        "name": name,
+        "description": _clean_text(value.get("description", base.get("description")) or f"草稿自定义节点 {name}", field="description", limit=500),
+        "code": code,
+        "language": "python",
+        "inputs": _clean_port_map(value.get("inputs", base.get("inputs")), field="inputs"),
+        "outputs": _clean_port_map(value.get("outputs", base.get("outputs")), field="outputs"),
+        "effects": [str(item) for item in effects if str(item).strip()],
+        "capabilities": [str(item) for item in capabilities if str(item).strip()],
+        "idempotent": bool(value.get("idempotent", base.get("idempotent", True))),
+        "risk": risk,
+        "revision": revision,
+        "created_at": base.get("created_at") or time.time(),
+        "updated_at": time.time(),
+    }
+
+
+def _draft_node(draft: Mapping[str, Any], *, node_id: str, case_id: str, case_name: str) -> dict[str, Any]:
+    artifact_id = str(draft.get("artifact_id") or "")
+    return {
+        "id": node_id,
+        "atom": f"draft:{artifact_id}",
+        "name": str(draft.get("name") or "draft_node"),
+        "description": str(draft.get("description") or ""),
+        "params": {},
+        "capture": {},
+        "when": None,
+        "foreach": None,
+        "as": "item",
+        "retry": None,
+        "continue_on_failure": False,
+        "tags": ["draft", "custom"],
+        "optional": False,
+        "extra": {"draft_artifact": artifact_id},
+        "case_id": case_id,
+        "case_name": case_name,
+        "origin": "human",
+        "locked": False,
+        "draft": dict(draft),
+    }
+
+
+def add_draft_node(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
+    data = _as_dict(payload)
+    draft = _clean_draft(data.get("draft") or data)
+    workflow = read_workflow(root, wid)
+    revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
+    nodes = [dict(node) for node in revision.get("nodes") or []]
+    edges = [dict(edge) for edge in revision.get("edges") or []]
+    last_case = nodes[-1].get("case_id") if nodes else "flow"
+    last_case_name = nodes[-1].get("case_name") if nodes else "流程"
+    case_id = str(data.get("case_id") or last_case or "flow")
+    case_name = str(data.get("case_name") or last_case_name or case_id)
+    node_id = str(data.get("id") or f"draft_{draft['name']}_{uuid.uuid4().hex[:6]}")
+    if any(str(item.get("id")) == node_id for item in nodes):
+        raise StudioError("conflict", f"节点 id 已存在: {node_id}")
+    node = _draft_node(draft, node_id=node_id, case_id=case_id, case_name=case_name)
+    nodes.append(node)
+    if len(nodes) > 1:
+        _ensure_order_edge(edges, str(nodes[-2]["id"]), node_id)
+    new_rev = _commit_revision(
+        root,
+        workflow,
+        wid=wid,
+        nodes=nodes,
+        edges=edges,
+        origin="human",
+        actor=actor,
+        message=f"插入草稿自定义节点 {node_id}",
+        base_rev=int(revision.get("rev") or 0),
+        audit_note=f"POST draft node {node_id}",
+    )
+    result = _node_payload(root, wid, new_rev, workflow)
+    result["node"] = node
+    return result
+
+
+def update_draft_node(root: Path, wid: str, node_id: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
+    data = _as_dict(payload)
+    incoming = data.get("draft") or data
+    workflow = read_workflow(root, wid)
+    revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
+    nodes = [dict(node) for node in revision.get("nodes") or []]
+    node = _find_node(nodes, node_id)
+    old = node.get("draft")
+    if not isinstance(old, Mapping):
+        raise StudioError("not_draft", f"节点 {node_id} 不是草稿自定义节点")
+    draft = _clean_draft(incoming, base=old)
+    node["draft"] = draft
+    node["name"] = str(draft.get("name") or node.get("name") or node_id)
+    node["origin"] = "human"
+    for index, item in enumerate(nodes):
+        if str(item.get("id")) == node_id:
+            nodes[index] = node
+            break
+    new_rev = _commit_revision(
+        root,
+        workflow,
+        wid=wid,
+        nodes=nodes,
+        edges=list(revision.get("edges") or []),
+        origin="human",
+        actor=actor,
+        message=f"更新草稿节点 {node_id}",
+        base_rev=int(revision.get("rev") or 0),
+        audit_note=f"PATCH draft node {node_id}",
+    )
+    result = _node_payload(root, wid, new_rev, workflow)
+    result["node"] = node
+    return result
 
 
 def _make_node(data: Mapping[str, Any], *, case_id: str, case_name: str) -> dict[str, Any]:
@@ -1708,6 +1895,8 @@ def _make_node(data: Mapping[str, Any], *, case_id: str, case_name: str) -> dict
 
 def add_node(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
     data = _as_dict(payload)
+    if "draft" in data or ("code" in data and "atom" not in data):
+        return add_draft_node(root, wid, data, actor=actor)
     workflow = read_workflow(root, wid)
     revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
     nodes = [dict(node) for node in revision.get("nodes") or []]
@@ -2295,6 +2484,14 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
     if rev != int(workflow.get("current_rev") or 0):
         raise StudioError("conflict", "只能发布当前版本（请先重新批准最新 rev）")
     revision = read_revision(root, wid, rev)
+    draft_nodes = [str(node.get("id")) for node in (revision.get("nodes") or []) if isinstance(node.get("draft"), Mapping)]
+    if draft_nodes:
+        raise StudioError(
+            "draft_not_registered",
+            "存在草稿自定义节点，先注册原子并重绑后才能发布",
+            status=409,
+            details={"node_ids": draft_nodes},
+        )
     missing_atoms = _unresolved_atoms(root, revision.get("nodes") or [])
     if missing_atoms:
         first = missing_atoms[0]
@@ -3131,6 +3328,18 @@ def debug_workflow(root: Path, wid: str, payload: Any, *, actor: str = "local") 
         raise StudioError("bad_request", "mode 只能是 only/from_start/downstream")
     node_id = _clean_text(data.get("node_id"), field="node_id", required=True, limit=200)
     workflow = read_workflow(root, wid)
+    draft_nodes = [
+        str(node.get("id"))
+        for node in (read_revision(root, wid, int(workflow.get("current_rev") or 0)).get("nodes") or [])
+        if isinstance(node.get("draft"), Mapping)
+    ]
+    if draft_nodes:
+        raise StudioError(
+            "draft_not_registered",
+            "存在草稿自定义节点，先注册原子并重绑后才能调试",
+            status=409,
+            details={"node_ids": draft_nodes},
+        )
     if (
         workflow.get("origin") == "explore"
         and workflow.get("replay_status") == "replay_failed"
