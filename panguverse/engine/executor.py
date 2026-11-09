@@ -37,6 +37,7 @@ from ..core.errors import (
     StepFailure,
 )
 from ..core.molecule import Molecule, RetryPolicy, Step
+from ..core.node import build_node_from_atom
 from ..core.registry import AtomRegistry, default_registry
 from .result import (
     ERROR,
@@ -426,8 +427,11 @@ class Executor:
             marker = len(ctx.http_log)
             step_result.inputs = _brief(inputs)
             step_result.target = semantics.target(target, inputs)
+            node = build_node_from_atom(target, node_id=step.id, origin="builtin")
+            step_result.node_id = node.id
+            step_result.node_ref = node.implementation.ref.to_str()
             try:
-                outputs = target.invoke(ctx, inputs)
+                outputs = node.invoke(ctx, inputs)
             except (StepFailure, StepError, PanguError, TypeError) as exc:
                 kind, failure_class = self.classify(target, None, exc)
                 if policy and policy.should_retry(kind, failure_class.value) and attempt < policy.attempts:

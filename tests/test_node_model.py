@@ -156,3 +156,27 @@ def test_run_snapshot_contains_refs_and_metrics() -> None:
     assert snapshot["metrics"]["reuse_score"] == 100
     assert snapshot["metrics"]["determinism_grade"] == "A"
     assert snapshot["nodes"][0]["lifecycle"] == Lifecycle.DRAFT.value
+
+
+def test_executor_step_records_node_ref(registry):
+    from panguverse.core.atom import Atom
+    from panguverse.core.molecule import Molecule
+    from panguverse.engine.executor import Executor
+    from panguverse.engine.result import PASSED
+
+    registry.register(Atom(
+        name="echo_node",
+        fn=lambda text: {"out": text},
+        inputs={"text": "string"},
+        outputs={"out": "string"},
+        effects=("read",),
+    ))
+    result = Executor(registry).run_case(
+        Molecule.from_spec({"id": "node-case", "steps": [{"id": "s1", "use": "echo_node", "with": {"text": "hi"}}]}),
+        env={},
+    )
+    assert result.status == PASSED
+    step = result.steps[0]
+    assert step.node_id == "s1"
+    assert step.node_ref.startswith("atom:echo_node@")
+    assert step.outputs["out"] == "hi"

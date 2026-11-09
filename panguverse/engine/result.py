@@ -69,6 +69,9 @@ class StepResult:
     #: 节点固化的产出物映射（``{key: {"path": ..., "type": ...}}``）。
     #: 只供运行后的收集器使用，不进入公开报告。
     produces: dict[str, Any] = field(default_factory=dict)
+    #: 统一 Node 执行封装留下的节点身份与实现引用（审计/回放用）
+    node_id: str = ""
+    node_ref: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -99,6 +102,10 @@ class StepResult:
             data["skipped_reason"] = self.skipped_reason
         if self.tags:
             data["tags"] = list(self.tags)
+        if self.node_id:
+            data["node_id"] = self.node_id
+        if self.node_ref:
+            data["node_ref"] = self.node_ref
         return data
 
 

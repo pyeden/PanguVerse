@@ -351,6 +351,11 @@ class Node:
     def validate(self, inputs: Mapping[str, Any]) -> list[str]:
         return list(self.contract.validate_inputs(inputs))
 
+    def invoke(self, ctx: Any, inputs: Mapping[str, Any]) -> dict[str, Any]:
+        """执行实现并返回原始输出；异常原样抛出，交给 executor 分类/重试。"""
+        outputs = self.implementation.execute(ctx, inputs)
+        return dict(outputs or {})
+
     def execute(
         self,
         ctx: Any,
