@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from ..core.workspace_packs import MANIFEST_NAME, PACKS_REL
-from .studio import StudioError
+from .studio import StudioError, rebind_node_to_atom
 
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 _RUN_RE = re.compile(r"^\s*def\s+run\s*\(", re.M)
@@ -175,12 +175,28 @@ def register_custom_atom(
 
     if not atom_path.is_file():
         raise StudioError("internal_error", f"原子代码写入失败：{atom_path}")
-    # 注册阶段只做静态校验，不导入/执行用户代码；运行时由 workspace_registry 解析。
+    # 注册阶段只做静态校验；绑定阶段由 workspace_registry 解析真实原子。
+    binding: dict[str, Any] | None = None
+    bind = bool(payload.get("bind", True))
+    wid = _text(payload.get("wid"), field="wid", limit=120)
+    node_id = _text(payload.get("node_id"), field="node_id", limit=200)
+    if bind and wid and node_id:
+        base_rev = payload.get("rev")
+        binding = rebind_node_to_atom(
+            root_path,
+            wid,
+            node_id,
+            name,
+            base_rev=int(base_rev) if base_rev is not None else None,
+            actor=actor,
+            message=f"注册原子 {name} 并绑定节点 {node_id}",
+        )
     return {
         "atom": atom_entry,
         "pack": pack,
         "pack_path": str(pack_dir),
         "ref": f"atom:{name}@{version}#{code_sha[:12]}",
+        "binding": binding,
         "contract": {
             "inputs": inputs,
             "outputs": outputs,

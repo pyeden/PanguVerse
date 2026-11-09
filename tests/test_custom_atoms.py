@@ -65,3 +65,33 @@ def test_rejects_missing_run(tmp_path):
 def test_rejects_empty_code(tmp_path):
     with pytest.raises(StudioError):
         register_custom_atom(tmp_path, _payload(code="   "))
+
+
+def test_register_and_bind_workflow_node(tmp_path):
+    from panguverse.web import studio
+
+    workflow = studio.create_draft_from_graph(
+        tmp_path,
+        intent="抓取页面并解析",
+        name="绑定测试",
+        nodes=[{
+            "id": "n1",
+            "atom": "http_get_page",
+            "name": "抓取",
+            "params": {"url": "https://example.com"},
+            "capture": {},
+        }],
+        edges=[],
+        actor="tester",
+    )
+    wid = workflow["wid"]
+    result = register_custom_atom(
+        tmp_path,
+        _payload(wid=wid, node_id="n1"),
+        actor="tester",
+    )
+    assert result["binding"] is not None
+    assert result["binding"]["rev"] == 1
+    revision = studio.read_revision(tmp_path, wid, 1)
+    assert revision["nodes"][0]["atom"] == "parse_price"
+    assert revision["base_rev"] == 0

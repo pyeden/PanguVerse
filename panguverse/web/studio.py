@@ -1507,6 +1507,57 @@ def patch_node(
     return _node_payload(root, wid, new_rev, workflow)
 
 
+def rebind_node_to_atom(
+    root: Path,
+    wid: str,
+    node_id: str,
+    atom_name: str,
+    *,
+    base_rev: int | None = None,
+    actor: str = "local",
+    message: str = "",
+) -> dict[str, Any]:
+    """把某个 revision 里的节点 atom 换成已注册工作区原子，并生成新 rev。"""
+    workflow = read_workflow(root, wid)
+    base = int(workflow.get("current_rev") or 0) if base_rev is None else int(base_rev)
+    revision = read_revision(root, wid, base)
+    nodes = [dict(node) for node in revision.get("nodes") or []]
+    node = _find_node(nodes, node_id)
+    from ..core.workspace_packs import workspace_registry
+
+    registry = workspace_registry(root, _registry())
+    name = str(atom_name or "").strip()
+    if not name:
+        raise StudioError("bad_request", "atom_name 不能为空")
+    if not registry.has(name):
+        raise StudioError(
+            "atom_missing",
+            f"原子不存在: {name}",
+            details={"atom": name},
+        )
+    node["atom"] = name
+    node["origin"] = "human"
+    for index, item in enumerate(nodes):
+        if str(item.get("id")) == node_id:
+            nodes[index] = node
+            break
+    new_rev = _commit_revision(
+        root,
+        workflow,
+        wid=wid,
+        nodes=nodes,
+        edges=list(revision.get("edges") or []),
+        origin="human",
+        actor=actor,
+        message=message or f"绑定注册原子 {name}",
+        base_rev=base,
+        audit_note=f"bind atom {name} to node {node_id}",
+    )
+    payload = _node_payload(root, wid, new_rev, workflow)
+    payload.update({"atom": name, "node_id": node_id, "binding_rev": new_rev.get("rev")})
+    return payload
+
+
 def _make_node(data: Mapping[str, Any], *, case_id: str, case_name: str) -> dict[str, Any]:
     atom = data.get("atom")
     if not isinstance(atom, str) or not atom.strip():

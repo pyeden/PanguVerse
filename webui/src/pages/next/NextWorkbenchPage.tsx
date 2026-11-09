@@ -293,6 +293,7 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
         name: node.atom && node.atom !== 'custom' ? node.atom : node.name,
         description: `工作台注册：${wid}/${node.id}`,
         code: node.code,
+        rev,
         inputs,
         outputs,
         effects: node.contract.sideEffect === 'none' ? [] : [node.contract.sideEffect],
@@ -300,15 +301,17 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
         idempotent: node.contract.idempotency === 'yes',
         pack: 'custom',
       })
+      const binding = result.binding as { rev?: number; atom?: string; node_id?: string } | undefined
+      if (binding?.rev) setRev(Number(binding.rev))
       setRegistered(true)
       setLogs((current) => [...current, {
         id: `register-${Date.now()}`,
         at: '刚刚',
         level: 'pass',
         line: 1,
-        message: `已注册原子 ${String(result.ref || result.atom?.name || '')} → ${String(result.pack_path || '')}`,
+        message: `已注册原子 ${String(result.ref || result.atom?.name || '')} → ${String(result.pack_path || '')}${binding?.rev ? ` · 绑定节点 ${binding.node_id || node.id} · rev ${binding.rev}` : ''}`,
       }])
-      push(`已注册原子 ${String(result.ref || '')}`, 'ok')
+      push(`已注册原子 ${String(result.ref || '')}${binding?.rev ? ` · 已绑定 rev ${binding.rev}` : ''}`, 'ok')
     } catch (error) {
       push(`注册失败：${(error as Error).message}`, 'error')
     }
