@@ -58,7 +58,7 @@ function realNodeMeta(node: StudioNode, workflow?: Workflow): NxNodeMeta {
     atom: atom || 'custom',
     custom,
     locked: !!node.locked,
-    rev: Number(workflow?.current_rev || workflow?.rev || 1),
+    rev: Number(workflow?.current_rev ?? workflow?.rev ?? 0),
     autoFixes: 0,
     tests: { passed: 0, total: 0 },
     contract: {
