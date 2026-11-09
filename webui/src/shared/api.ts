@@ -491,6 +491,11 @@ export const studioApi = {
     )
   },
 
+  async nodeImplementation(wid: string, nid: string, rev?: number): Promise<AnyRecord> {
+    const suffix = rev !== undefined ? `?rev=${encodeURIComponent(String(rev))}` : ''
+    return request<AnyRecord>(`api/studio/${encode(wid)}/nodes/${encode(nid)}/implementation${suffix}`)
+  },
+
   async updateNode(wid: string, nid: string, patch: AnyRecord): Promise<Workflow> {
     return realOrMock(
       async () => {

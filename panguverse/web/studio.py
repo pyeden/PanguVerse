@@ -1507,6 +1507,120 @@ def patch_node(
     return _node_payload(root, wid, new_rev, workflow)
 
 
+def node_implementation(
+    root: Path,
+    wid: str,
+    node_id: str,
+    *,
+    rev: int | None = None,
+) -> dict[str, Any]:
+    """返回节点当前绑定的真实实现：工作区原子代码，或内置原子引用。"""
+    import hashlib
+
+    workflow = read_workflow(root, wid)
+    use_rev = int(workflow.get("current_rev") or 0) if rev is None else int(rev)
+    revision = read_revision(root, wid, use_rev)
+    node = _find_node(revision.get("nodes") or [], node_id)
+    atom_name = str(node.get("atom") or "").strip()
+    if not atom_name:
+        raise StudioError("bad_request", f"节点 {node_id} 没有 atom 绑定")
+
+    from ..core.workspace_packs import load_workspace_packs, list_workspace_pack_manifests
+
+    target_atom = None
+    target_pack = None
+    for pack in load_workspace_packs(root):
+        for atom in pack.atoms:
+            if atom.name == atom_name:
+                target_atom = atom
+                target_pack = pack
+                break
+        if target_atom is not None:
+            break
+
+    code = ""
+    entry = ""
+    pack_name = ""
+    code_hash = ""
+    editable = False
+    origin = ""
+    atom_obj = None
+
+    if target_atom is not None and target_pack is not None:
+        manifests = list_workspace_pack_manifests(root)
+        manifest = next(
+            (item for item in manifests if str(item.get("name") or "") == target_pack.name),
+            {},
+        )
+        raw = next(
+            (
+                item
+                for item in (manifest.get("atoms") or [])
+                if isinstance(item, Mapping) and str(item.get("name") or "") == atom_name
+            ),
+            {},
+        )
+        entry = str(raw.get("entry") or f"atoms/{atom_name}.py")
+        base = Path(target_pack.path or "").resolve()
+        target = (base / entry).resolve()
+        try:
+            target.relative_to(base)
+        except ValueError as exc:
+            raise StudioError("internal_error", f"原子入口越出包目录: {entry}") from exc
+        if not target.is_file():
+            raise StudioError("internal_error", f"原子代码不存在: {target}")
+        code = target.read_text(encoding="utf-8")
+        code_hash = hashlib.sha256(code.encode("utf-8")).hexdigest()
+        pack_name = target_pack.name
+        editable = True
+        origin = str(getattr(target_atom, "source", "custom") or "custom")
+        atom_obj = target_atom
+    else:
+        registry = _registry()
+        if not registry.has(atom_name):
+            raise StudioError("atom_missing", f"原子不存在: {atom_name}")
+        atom_obj = registry.get(atom_name)
+        code = (
+            f"# atom: {atom_name}@{atom_obj.version}\n"
+            "# 内置/已注册原子；工作区没有源码，运行时由 registry 按 pinned ref 解析。\n"
+        )
+        origin = str(getattr(atom_obj, "source", "builtin") or "builtin")
+        editable = False
+
+    try:
+        effects = [str(item) for item in atom_obj.effects_for({})]
+    except Exception:
+        effects = [str(item) for item in getattr(atom_obj, "effects", ())]
+    contract = {
+        "inputs": [port.to_dict() for port in atom_obj.input_ports()],
+        "outputs": [port.to_dict() for port in atom_obj.output_ports()],
+        "capabilities": list(getattr(atom_obj, "capabilities", ()) or ()),
+        "effects": effects,
+        "idempotent": getattr(atom_obj, "idempotent", None),
+    }
+    return {
+        "wid": wid,
+        "rev": use_rev,
+        "node_id": node_id,
+        "atom": atom_name,
+        "ref": f"atom:{atom_name}@{atom_obj.version}",
+        "kind": "code" if editable else "atom",
+        "language": "python",
+        "code": code,
+        "entry": entry,
+        "pack": pack_name,
+        "hash": code_hash,
+        "editable": editable,
+        "origin": origin,
+        "contract": contract,
+        "note": (
+            "工作区原子实现，可在工作台调试/编辑后重新注册"
+            if editable
+            else "内置或全局原子；源码不在工作区，只读引用"
+        ),
+    }
+
+
 def rebind_node_to_atom(
     root: Path,
     wid: str,

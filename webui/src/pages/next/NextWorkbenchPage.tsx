@@ -125,14 +125,22 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
 
   const [debugState, setDebugState] = useState<'idle' | 'running' | 'done' | 'failed'>('idle')
   const [debugSummary, setDebugSummary] = useState<{ passed: number; failed: number; total: number } | null>(null)
+  const implementationQuery = useQuery({
+    queryKey: ['node-implementation', wid, node.id, rev],
+    queryFn: () => studioApi.nodeImplementation(wid, node.id, rev),
+    enabled: isRealWid && !!node.id && !editing,
+    staleTime: 15_000,
+  })
+  const implementation = implementationQuery.data
   const [activeLine, setActiveLine] = useState<number>(() => {
     const value = Number(route.query.get('line') || '')
     return Number.isFinite(value) && value > 0 ? value : 0
   })
 
-  const code = editing ? editedCode : codeWithHeader(node.code, node.name, rev, autoFixes)
+  const baseCode = isRealWid && implementation?.code ? String(implementation.code) : codeWithHeader(node.code, node.name, rev, autoFixes)
+  const code = editing ? editedCode : baseCode
   const lines = useMemo(() => code.split('\n'), [code])
-  const [lockStart, lockEnd] = useMemo(() => lockRange(node), [node])
+  const [lockStart, lockEnd] = useMemo(() => lockRange({ ...node, code: baseCode }), [node, baseCode])
   const evidence = EVIDENCE_BY_NODE[node.id]
   const checks = [
     { key: 'contract', label: '契约完整', ok: node.contract.inputs.length > 0 && node.contract.outputs.length > 0 },
@@ -140,7 +148,7 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
     { key: 'task', label: '整任务跑通', ok: true },
     { key: 'human', label: '人工确认风险', ok: accepted },
   ]
-  const hasRunnableCode = /def\s+run\s*\(/.test(node.code)
+  const hasRunnableCode = /def\s+run\s*\(/.test(code)
   const canRegister = node.custom && !registered && hasRunnableCode && checks.every((item) => item.ok)
 
   const selectNode = (id: string) => {
@@ -387,6 +395,10 @@ export function NextWorkbenchPage({ wid = 'wf-console', nodeId = 'node-extract-p
                 <span>{node.id}.py</span>
                 <Badge tone={editing ? 'warn' : 'cyan'}>{editing ? '人工编辑' : `rev ${rev}`}</Badge>
                 <span>{node.custom ? '草稿实现' : '已注册原子'}</span>
+                {implementation ? <Badge tone={implementation.kind === 'code' ? 'warn' : 'ok'}>{implementation.kind === 'code' ? '工作区实现' : '内置原子'}</Badge> : null}
+                {implementation?.ref ? <span title={`${implementation.ref}${implementation.pack ? ` · ${implementation.pack}` : ''}`}>{String(implementation.ref).slice(0, 42)}</span> : null}
+                {implementationQuery.isLoading ? <Badge tone="run">读取实现…</Badge> : null}
+                {implementationQuery.error ? <Badge tone="warn">实现读取失败</Badge> : null}
                 {debugState === 'running' ? <Badge tone="run" dot>调试中</Badge> : null}
                 {debugSummary ? <Badge tone={debugSummary.failed ? 'bad' : 'ok'} dot>调试图 {debugSummary.passed}/{debugSummary.total}</Badge> : null}
                 <span style={{ marginLeft: 'auto' }}>{editing ? '保存后生成新 revision' : '点击日志行号可定位'}</span>

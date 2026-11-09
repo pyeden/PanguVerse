@@ -795,6 +795,15 @@ class WebAPI:
                     studio.transition_state(self.root, wid, body, actor=actor)
                 )
 
+        if len(tail) == 3 and tail[0] == "nodes" and tail[2] == "implementation":
+            if method != "GET":
+                raise ApiError("not_found", "接口不存在")
+            default_rev = int(studio.read_workflow(self.root, wid).get("current_rev") or 0)
+            rev = _rev_query(_first(query, "rev"), default_rev)
+            return json_response(
+                studio.node_implementation(self.root, wid, tail[1], rev=rev)
+            )
+
         if len(tail) == 2 and tail[0] == "nodes":
             node_id = tail[1]
             if method == "PATCH":
