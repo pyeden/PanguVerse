@@ -18,8 +18,10 @@ import {
 } from '../shared/utils'
 import type { AnyRecord, Artifact } from '../shared/types'
 import { artifactHint, splitArtifacts } from '../shared/artifacts'
+import { executionModeOf, frozenRefOf } from '../shared/executionMode'
 import { ArtifactPreviewModal } from '../components/ArtifactPreview'
 import { Icon } from '../components/Icon'
+import { ExecutionModeBadge } from '../components/ExecutionModeBadge'
 import {
   Badge,
   Button,
@@ -132,6 +134,24 @@ export function RunDetailPage() {
   const project = projectQuery.data
   const suiteName = report.meta?.suite || plan.meta?.suite || report.meta?.suite_name || project?.suites?.find((suite) => suite.suite_id === report.meta?.suite_id)?.name || '未归类运行'
   const workflowRef = report.workflow_ref || report.meta?.workflow_ref || plan.workflow_ref || report.meta?.published_ref || ''
+  // 旧报告没有 execution_mode：按 debug 展示，不改变历史语义。
+  const executionMode = executionModeOf({
+    execution_mode: report.execution_mode
+      ?? report.meta?.execution_mode
+      ?? plan.execution_mode
+      ?? plan.meta?.execution_mode
+      ?? executionQuery.data?.execution_mode
+      ?? runQuery.data?.execution_mode,
+  })
+  const frozenRef = frozenRefOf({
+    execution_mode: executionMode,
+    frozen_ref: report.frozen_ref
+      ?? report.meta?.frozen_ref
+      ?? plan.frozen_ref
+      ?? plan.meta?.frozen_ref
+      ?? executionQuery.data?.frozen_ref
+      ?? (executionMode === 'frozen' ? workflowRef : ''),
+  })
   const audit: AnyRecord[] = Array.isArray(report.audit_tail) ? report.audit_tail : Array.isArray(plan.audit_tail) ? plan.audit_tail : []
   const executionPhases: { name: string; status: string; detail?: string }[] = executionQuery.data?.phases?.length
     ? executionQuery.data.phases
@@ -208,6 +228,7 @@ export function RunDetailPage() {
           <div className="report-title-row">
             <h1>{suiteName}</h1>
             <StatusBadge status={status} />
+            <ExecutionModeBadge mode={executionMode} refText={frozenRef} run={executionMode === 'frozen'} />
             {report.conclusion?.verdict ? <Badge tone={report.conclusion?.success ? 'ok' : 'bad'}>{report.conclusion.verdict}</Badge> : null}
           </div>
           <div className="report-meta-line">

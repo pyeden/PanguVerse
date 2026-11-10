@@ -5,6 +5,7 @@ import { href, navigate, useRoute, withQuery } from '../shared/router'
 import { relativeTime } from '../shared/utils'
 import type { Workflow } from '../shared/types'
 import { Icon } from '../components/Icon'
+import { ExecutionModeBadgeForWorkflow } from '../components/ExecutionModeBadge'
 import {
   Badge,
   Button,
@@ -229,6 +230,7 @@ export function FlowsPage() {
                 <div className="task-copy">
                   <div className="task-title-row">
                     <a className="task-name-link" href={href(`/studio/${workflow.wid}`)}>{workflow.name || workflow.wid}</a>
+                    <ExecutionModeBadgeForWorkflow workflow={workflow} />
                     <Badge tone={meta.tone}>{meta.label}</Badge>
                     {archived ? <Badge tone="warn">已归档</Badge> : null}
                   </div>

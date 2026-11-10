@@ -21,17 +21,19 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
-import { api, debugReasonDetail, debugReasonLabel, isStudioMock, onStudioMockChange, readStudioProvenance, studioApi } from '../shared/api'
+import { ApiError, api, debugReasonDetail, debugReasonLabel, isStudioMock, onStudioMockChange, readStudioProvenance, studioApi } from '../shared/api'
 import { navigate, href, useRoute } from '../shared/router'
 import { errorText, formatDuration, pretty, statusLabel } from '../shared/utils'
 import { contractText, effectsText, isNewAtomNode, readNewAtomCache } from '../shared/atomContracts'
 import { COVERAGE_ADVISORY_NOTE, blockingValidationErrors, coverageGate, coverageTone } from '../shared/coverage'
+import { EXECUTION_MODE_COPY, executionModeOf, frozenRefOf, runStatusLabel, runSucceeded } from '../shared/executionMode'
 import type {
   AnyRecord,
   Atom,
   DebugNodeState,
   DebugSession,
   DebugSummary,
+  Execution,
   ExploreAtomCreated,
   Risk,
   StudioEdge,
@@ -41,6 +43,7 @@ import type {
   Workflow,
 } from '../shared/types'
 import { Icon } from '../components/Icon'
+import { ExecutionModeBadge } from '../components/ExecutionModeBadge'
 import { CoverageLine } from '../components/CoverageLine'
 import { TriggerPanel, WorkflowRunsPanel } from '../components/TriggerPanel'
 import {
@@ -393,6 +396,10 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   debugWidthRef.current = debugWidth
   const storedProvenance = useMemo(() => readStudioProvenance(wid), [wid])
   const [panelOpen, setPanelOpen] = useState(false)
+  const [freezeOpen, setFreezeOpen] = useState(false)
+  const [freezeMessage, setFreezeMessage] = useState('')
+  const [unfreezeOpen, setUnfreezeOpen] = useState(false)
+  const [unfreezeMessage, setUnfreezeMessage] = useState('')
   const [paramName, setParamName] = useState('')
   const [paramWith, setParamWith] = useState<AnyRecord>({})
   const [paramAtom, setParamAtom] = useState('')
@@ -401,6 +408,27 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   const [newAtomCache, setNewAtomCache] = useState<Record<string, ExploreAtomCreated>>(() => readNewAtomCache(wid))
 
   const workflowQuery = useQuery({ queryKey: ['studio-workflow', wid], queryFn: () => studioApi.getWorkflow(wid), enabled: !!wid })
+  const executionMode = executionModeOf(workflowQuery.data)
+  const isFrozen = executionMode === 'frozen'
+  const frozenRef = frozenRefOf(workflowQuery.data)
+  const modeRev = Number(workflowQuery.data?.current_rev ?? workflowQuery.data?.rev ?? 0)
+  // 固化门禁：该 rev 最近一次运行必须成功（后端按 workflow_ref=wid@rev 校验）。
+  const latestRunQuery = useQuery<Execution | null>({
+    queryKey: ['workflow-latest-run', wid, modeRev],
+    queryFn: async () => {
+      const page = await api.executions(new URLSearchParams({ offset: '0', limit: '100' }))
+      const ref = `${wid}@${modeRev}`
+      const rows = (page.executions || []).filter((run) => run.workflow_ref === ref)
+      rows.sort((a, b) => Number(b.started_at ?? b.finished_at ?? b.created_at ?? 0) - Number(a.started_at ?? a.finished_at ?? a.created_at ?? 0))
+      return rows[0] || null
+    },
+    enabled: !!wid && !!workflowQuery.data && !isFrozen,
+    staleTime: 3_000,
+    retry: false,
+  })
+  const latestRun = latestRunQuery.data || null
+  const latestRunOk = runSucceeded(latestRun)
+  const canFreeze = !isFrozen && latestRunOk
   const atomsQuery = useQuery({ queryKey: ['atoms'], queryFn: api.atoms, staleTime: 60_000 })
   const workflow = workflowQuery.data
   const atoms = atomsQuery.data || EMPTY_ATOMS
@@ -565,6 +593,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
 
   const updateNode = useMutation({
     mutationFn: () => {
+      if (isFrozen) throw new Error('已固化：先回到调试再改图')
       if (!selectedNode) throw new Error('没有选中节点')
       let withValue = { ...paramWith }
       for (const [key, raw] of Object.entries(paramJson)) {
@@ -581,13 +610,16 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   })
 
   const toggleLock = useMutation({
-    mutationFn: () => selectedNode ? studioApi.updateNode(wid, selectedNode.node_id, { locked: !selectedNode.locked }) : Promise.reject(new Error('没有选中节点')),
+    mutationFn: () => isFrozen
+      ? Promise.reject(new Error('已固化：先回到调试再改图'))
+      : selectedNode ? studioApi.updateNode(wid, selectedNode.node_id, { locked: !selectedNode.locked }) : Promise.reject(new Error('没有选中节点')),
     onSuccess: (next) => { refresh(next); push(selectedNode?.locked ? '节点已解锁' : '节点已锁定，AI 不可改写', 'ok') },
     onError: (error: Error) => push(error.message, 'error'),
   })
 
   const addNode = useMutation({
     mutationFn: () => {
+      if (isFrozen) throw new Error('已固化：先回到调试再改图')
       if (!addAtom) throw new Error('请选择原子')
       return studioApi.addNode(wid, { atom: addAtom.name, name: addName.trim() || addAtom.name, with: {} })
     },
@@ -604,13 +636,16 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   })
 
   const removeNode = useMutation({
-    mutationFn: () => selectedNode ? studioApi.deleteNode(wid, selectedNode.node_id) : Promise.reject(new Error('没有选中节点')),
+    mutationFn: () => isFrozen
+      ? Promise.reject(new Error('已固化：先回到调试再改图'))
+      : selectedNode ? studioApi.deleteNode(wid, selectedNode.node_id) : Promise.reject(new Error('没有选中节点')),
     onSuccess: (next) => { refresh(next); setSelectedId(''); setDeleteOpen(false); push('节点与相关边已删除', 'ok') },
     onError: (error: Error) => push(error.message, 'error'),
   })
 
   const addEdgeMutation = useMutation({
     mutationFn: () => {
+      if (isFrozen) throw new Error('已固化：先回到调试再改图')
       if (!pendingConnection) throw new Error('连线信息缺失')
       return studioApi.addEdge(wid, { from: pendingConnection.source, to: pendingConnection.target, kind: edgeKind, via: edgeKind === 'data' ? edgeVia.trim() : 'order-only' })
     },
@@ -635,6 +670,68 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     onSuccess: (next) => { refresh(next); navigate(`/studio/${wid}/review?base=${Math.max(0, (next.current_rev || 0) - 1)}&rev=${next.current_rev || 0}`) },
     onError: (error: Error) => push(error.message, 'error'),
   })
+
+  const freeze = useMutation({
+    mutationFn: () => studioApi.freezeWorkflow(wid, {
+      rev: modeRev,
+      message: freezeMessage.trim() || `固化 ${wid}@${modeRev} 为生产任务`,
+    }),
+    onSuccess: (result) => {
+      const checks = Array.isArray(result.goal_checks) ? result.goal_checks.length : 0
+      queryClient.setQueryData<Workflow | undefined>(['studio-workflow', wid], (current) => current ? {
+        ...current,
+        execution_mode: result.execution_mode,
+        frozen_ref: result.frozen_ref || `${wid}@${modeRev}`,
+        goal_checks: (result.goal_checks as Workflow['goal_checks']) || current.goal_checks,
+      } : current)
+      void queryClient.invalidateQueries({ queryKey: ['studio-workflow', wid] })
+      void queryClient.invalidateQueries({ queryKey: ['workflow-latest-run', wid] })
+      void queryClient.invalidateQueries({ queryKey: ['studio-drafts-list'] })
+      void queryClient.invalidateQueries({ queryKey: ['studio-drafts'] })
+      void queryClient.invalidateQueries({ queryKey: ['overview-drafts'] })
+      setFreezeOpen(false)
+      push(`已固化为生产任务 ${result.frozen_ref || `${wid}@${modeRev}`}${checks ? ` · ${checks} 项验收` : ''}；后续运行确定性执行，不再调 LLM 改图`, 'ok')
+    },
+    onError: (error) => {
+      const info = modeActionError(error, '固化')
+      push(info.message, info.unavailable ? 'warn' : 'error')
+    },
+  })
+
+  const unfreeze = useMutation({
+    mutationFn: () => studioApi.unfreezeWorkflow(wid, {
+      message: unfreezeMessage.trim() || '回到调试：继续调整节点图',
+    }),
+    onSuccess: (result) => {
+      queryClient.setQueryData<Workflow | undefined>(['studio-workflow', wid], (current) => current ? {
+        ...current,
+        execution_mode: 'debug',
+      } : current)
+      void queryClient.invalidateQueries({ queryKey: ['studio-workflow', wid] })
+      void queryClient.invalidateQueries({ queryKey: ['workflow-latest-run', wid] })
+      void queryClient.invalidateQueries({ queryKey: ['studio-drafts-list'] })
+      void queryClient.invalidateQueries({ queryKey: ['studio-drafts'] })
+      void queryClient.invalidateQueries({ queryKey: ['overview-drafts'] })
+      setUnfreezeOpen(false)
+      const previous = result.previous_frozen_ref || frozenRef
+      push(`已回到调试模式${previous ? `；已固化版本 ${previous} 仍保留，可按 ref 运行` : '；已固化版本仍保留'}`, 'ok')
+    },
+    onError: (error) => {
+      const info = modeActionError(error, '回到调试')
+      push(info.message, info.unavailable ? 'warn' : 'error')
+    },
+  })
+
+  const openFreeze = () => {
+    if (!canFreeze) return
+    setFreezeMessage(`固化 ${wid}@${modeRev} 为生产任务`)
+    setFreezeOpen(true)
+  }
+
+  const openUnfreeze = () => {
+    setUnfreezeMessage(`回到调试：继续调整 ${wid}`)
+    setUnfreezeOpen(true)
+  }
 
   const startDebug = useMutation({
     mutationFn: () => {
@@ -707,13 +804,17 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   }, [])
 
   const onConnect = useCallback((connection: Connection) => {
+    if (isFrozen) {
+      push('已固化：先回到调试再改图', 'warn')
+      return
+    }
     if (!connection.source || !connection.target) return
     setPendingConnection({ source: connection.source, target: connection.target })
     const sourceNode = workflow?.graph?.nodes.find((node) => node.node_id === connection.source)
     const captureKey = Object.keys(sourceNode?.capture || {})[0] || connection.source
     setEdgeVia(captureKey)
     setEdgeKind('data')
-  }, [workflow])
+  }, [workflow, isFrozen, push])
 
   const centerNode = useCallback((nodeId: string) => {
     const instance = flowRef.current
@@ -1054,6 +1155,9 @@ function StudioCanvasInner({ wid }: { wid: string }) {
   if (workflowQuery.isLoading) return <div className="page"><Loading label="正在读取任务…" /></div>
   if (workflowQuery.error || !workflow) return <div className="page"><ErrorState error={workflowQuery.error} onRetry={() => workflowQuery.refetch()} title="任务读取失败" /></div>
   const currentRev = workflow.current_rev ?? 0
+  const recordedGoalChecks = Array.isArray(workflow.goal_checks) ? workflow.goal_checks.length : 0
+  // 后端会在未传 checks 时按最近成功运行的断言生成 goal_checks；数量未知时明确说明来源。
+  const estimatedGoalChecks = recordedGoalChecks || Number(latestRun?.summary?.total || 0)
   const debugSummary = debugSession?.summary || { passed: 0, failed: 0, skipped: 0, total: workflow.graph?.nodes?.length || 0 }
   const totalCount = debugTotal || Number(debugSummary.total ?? 0) || workflow.graph?.nodes?.length || 0
   const finishedCount = debugSummary.passed + debugSummary.failed + debugSummary.skipped
@@ -1140,7 +1244,14 @@ function StudioCanvasInner({ wid }: { wid: string }) {
             {errors.length} 错误 · {warnings.length} 警告
           </span>
           <Button size="sm" variant="ghost" icon="refresh" onClick={() => studioApi.validate(wid).then(setValidation).catch((error) => push(error.message, 'error'))}>校验</Button>
-          <Button size="sm" variant="ghost" icon="spark" onClick={() => setReplanOpen(true)}>AI 重规划</Button>
+          <Button
+            size="sm"
+            variant="ghost"
+            icon="spark"
+            disabled={isFrozen}
+            title={isFrozen ? '已固化：先回到调试再让 LLM 改图' : '让 LLM 生成图差异提案'}
+            onClick={() => setReplanOpen(true)}
+          >AI 重规划</Button>
           <Button size="sm" variant="ghost" icon="settings" className="mobile-only" onClick={() => { setNodeRailCollapsed(false); setPanelOpen(true) }}>节点设置</Button>
           <Button
             size="sm"
@@ -1155,6 +1266,64 @@ function StudioCanvasInner({ wid }: { wid: string }) {
           </Button>
         </div>
       </div>
+
+      <section
+        className={`execution-mode-bar is-${executionMode}`}
+        data-testid="execution-mode-bar"
+        data-mode={executionMode}
+        aria-label="任务执行模式"
+      >
+        <span className="execution-mode-icon"><Icon name={isFrozen ? 'lock' : 'bug'} size={16} /></span>
+        <div className="execution-mode-copy">
+          <div className="execution-mode-head">
+            <strong>{EXECUTION_MODE_COPY[executionMode].title}</strong>
+            <ExecutionModeBadge mode={executionMode} refText={frozenRef} />
+            {!isFrozen && workflow.frozen_ref ? (
+              <span className="execution-mode-history">历史固化 <code>{workflow.frozen_ref}</code></span>
+            ) : null}
+          </div>
+          <p>{EXECUTION_MODE_COPY[executionMode].hint}</p>
+        </div>
+        <div className="execution-mode-actions">
+          {isFrozen ? (
+            <Button size="sm" variant="soft" icon="unlock" onClick={openUnfreeze} data-testid="unfreeze-workflow">回到调试</Button>
+          ) : (
+            <>
+              <span
+                className={`execution-mode-run ${latestRunOk ? 'is-ok' : latestRunQuery.isLoading ? 'is-loading' : 'is-warn'}`}
+                data-testid="latest-run-state"
+              >
+                {latestRunQuery.isLoading ? (
+                  '正在检查最近一次运行…'
+                ) : latestRunQuery.error ? (
+                  '运行记录读取失败'
+                ) : latestRun ? (
+                  <>最近一次运行 <strong>{runStatusLabel(latestRun)}</strong>{latestRun.eid ? <code>{latestRun.eid}</code> : null}</>
+                ) : (
+                  <>尚无 <code>{`${wid}@${currentRev}`}</code> 的成功运行</>
+                )}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                icon="refresh"
+                loading={latestRunQuery.isFetching}
+                onClick={() => latestRunQuery.refetch()}
+                title="刷新最近一次运行状态"
+              >刷新</Button>
+              <Button
+                size="sm"
+                variant="primary"
+                icon="lock"
+                disabled={!canFreeze}
+                title={latestRunOk ? `固化为 ${wid}@${currentRev}` : '最近一次运行未成功，暂不能固化'}
+                onClick={openFreeze}
+                data-testid="freeze-workflow"
+              >固化为生产任务</Button>
+            </>
+          )}
+        </div>
+      </section>
 
       <nav className="studio-tabs" aria-label="任务视图" data-testid="studio-tabs">
         <button type="button" className={tab === 'canvas' ? 'is-active' : ''} aria-current={tab === 'canvas' ? 'page' : undefined} onClick={() => setTab('canvas')}>
@@ -1497,7 +1666,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
           ) : null}
           <div className="canvas-toolbar">
             <div className="canvas-toolbar-left">
-              <Button size="sm" variant="ghost" icon="plus" onClick={() => setAddOpen(true)}>添加节点</Button>
+              <Button size="sm" variant="ghost" icon="plus" disabled={isFrozen} title={isFrozen ? '已固化：先回到调试再改图' : '添加原子节点'} onClick={() => setAddOpen(true)}>添加节点</Button>
               <span className="legend"><span className="legend-line data" />数据边</span>
               <span className="legend"><span className="legend-line order" />顺序边 order-only</span>
             </div>
@@ -1575,7 +1744,15 @@ function StudioCanvasInner({ wid }: { wid: string }) {
             <div className="side-head-actions">
               <IconButton label="折叠属性面板" icon="chevron" className="node-panel-collapse" onClick={() => setNodeRailCollapsed(true)} />
               <IconButton label="关闭面板" icon="close" className="mobile-only" onClick={() => setPanelOpen(false)} />
-              {selectedNode ? <IconButton label={selectedNode.locked ? '解锁节点' : '锁定节点'} icon={selectedNode.locked ? 'lock' : 'unlock'} className={selectedNode.locked ? 'is-locked' : ''} onClick={() => toggleLock.mutate()} /> : null}
+              {selectedNode ? (
+                <IconButton
+                  label={isFrozen ? '已固化：先回到调试再改图' : selectedNode.locked ? '解锁节点' : '锁定节点'}
+                  icon={selectedNode.locked ? 'lock' : 'unlock'}
+                  className={selectedNode.locked ? 'is-locked' : ''}
+                  disabled={isFrozen}
+                  onClick={() => toggleLock.mutate()}
+                />
+              ) : null}
             </div>
           </div>
 
@@ -1665,7 +1842,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                   />
                 </details>
                 {paramError ? <div className="inline-error"><Icon name="warning" size={13} />{paramError}</div> : null}
-                <Button size="sm" variant="primary" icon="check" loading={updateNode.isPending} onClick={() => updateNode.mutate()}>保存参数 · 新 rev</Button>
+                <Button size="sm" variant="primary" icon="check" loading={updateNode.isPending} disabled={isFrozen} title={isFrozen ? '已固化：先回到调试再改图' : undefined} onClick={() => updateNode.mutate()}>保存参数 · 新 rev</Button>
               </div>
 
               <div className="port-binding-section">
@@ -1722,7 +1899,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
               ) : null}
 
               <div className="node-danger">
-                <Button size="sm" variant="ghost" icon="trash" onClick={() => selectedNode.locked ? push('锁定节点不能删除，先解锁', 'error') : setDeleteOpen(true)}>删除节点</Button>
+                <Button size="sm" variant="ghost" icon="trash" disabled={isFrozen} title={isFrozen ? '已固化：先回到调试再改图' : undefined} onClick={() => selectedNode.locked ? push('锁定节点不能删除，先解锁', 'error') : setDeleteOpen(true)}>删除节点</Button>
                 <span>删除会同时移除相关边并生成新 rev</span>
               </div>
             </div>
@@ -1792,6 +1969,111 @@ function StudioCanvasInner({ wid }: { wid: string }) {
       )}
 
       <Modal
+        open={freezeOpen}
+        onClose={() => setFreezeOpen(false)}
+        title="固化为生产任务"
+        subtitle="固化后只执行固定节点图，LLM 不再生成或修改节点。"
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setFreezeOpen(false)} disabled={freeze.isPending}>取消</Button>
+            <Button
+              variant="primary"
+              icon="lock"
+              loading={freeze.isPending}
+              disabled={!canFreeze || !freezeMessage.trim()}
+              onClick={() => freeze.mutate()}
+              data-testid="confirm-freeze"
+            >确认固化</Button>
+          </>
+        }
+      >
+        <div className="freeze-summary" data-testid="freeze-confirm-summary">
+          <div>
+            <span>固化版本</span>
+            <code className="execution-mode-ref">{`${wid}@${currentRev}`}</code>
+          </div>
+          <div>
+            <span>验收检查 goal_checks</span>
+            <strong>{estimatedGoalChecks ? `约 ${estimatedGoalChecks} 项` : '后端生成'}</strong>
+            <small>{recordedGoalChecks ? `历史固化记录 ${recordedGoalChecks} 项；本次按最近成功运行重新生成` : '按最近一次成功运行的断言结果估算'}</small>
+          </div>
+          <div>
+            <span>最近一次运行</span>
+            <strong className={latestRunOk ? 'tone-ok' : 'tone-warn'}>{runStatusLabel(latestRun)}</strong>
+            <small>{latestRun?.eid ? `run ${latestRun.eid}` : '尚无运行记录'}</small>
+          </div>
+        </div>
+        <div className="notice-inline warn-note">
+          <Icon name="shield" size={15} />
+          <div>
+            <strong>固化后不会自动改图</strong>
+            <p>LLM 不再规划、生成或注册节点；失败只做重试与重认证。需要继续改图时用「回到调试」，已固化版本仍保留。</p>
+          </div>
+        </div>
+        <Field label="固化说明" hint="写入 audit；说明为什么这个版本可以进入生产。">
+          <textarea
+            className="textarea"
+            rows={3}
+            value={freezeMessage}
+            onChange={(event) => setFreezeMessage(event.target.value)}
+            placeholder={`固化 ${wid}@${currentRev}：最近一次运行成功，验收通过`}
+            aria-label="固化说明"
+          />
+        </Field>
+      </Modal>
+
+      <Modal
+        open={unfreezeOpen}
+        onClose={() => setUnfreezeOpen(false)}
+        title="回到调试"
+        subtitle="切回调试期，允许 LLM 重新拆解和生成节点。"
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setUnfreezeOpen(false)} disabled={unfreeze.isPending}>取消</Button>
+            <Button
+              variant="primary"
+              icon="unlock"
+              loading={unfreeze.isPending}
+              disabled={!unfreezeMessage.trim()}
+              onClick={() => unfreeze.mutate()}
+              data-testid="confirm-unfreeze"
+            >确认回到调试</Button>
+          </>
+        }
+      >
+        <div className="freeze-summary" data-testid="unfreeze-confirm-summary">
+          <div>
+            <span>已固化版本</span>
+            <code className="execution-mode-ref">{frozenRef || `${wid}@${currentRev}`}</code>
+          </div>
+          <div>
+            <span>操作后模式</span>
+            <strong>调试</strong>
+            <small>允许 LLM 自定义节点</small>
+          </div>
+        </div>
+        <div className="notice-inline">
+          <Icon name="lock" size={15} />
+          <div>
+            <strong>已固化版本仍保留</strong>
+            <p>{frozenRef || `${wid}@${currentRev}`} 不会被删除或改写，仍可按 ref 运行；本次只切换 execution_mode。</p>
+          </div>
+        </div>
+        <Field label="回到调试说明" hint="必填；写入 audit，说明为什么需要继续改图。">
+          <textarea
+            className="textarea"
+            rows={3}
+            value={unfreezeMessage}
+            onChange={(event) => setUnfreezeMessage(event.target.value)}
+            placeholder="需要继续调整节点图，先回到调试"
+            aria-label="回到调试说明"
+          />
+        </Field>
+      </Modal>
+
+      <Modal
         open={addOpen}
         onClose={() => setAddOpen(false)}
         title="添加节点"
@@ -1854,4 +2136,21 @@ function StudioCanvasInner({ wid }: { wid: string }) {
 
 function normalizeLocal(validation: Validation): Validation {
   return { errors: validation.errors || [], warnings: validation.warnings || [], risks: validation.risks || [] }
+}
+
+function modeActionError(error: unknown, action: string): { message: string; unavailable: boolean } {
+  if (error instanceof ApiError) {
+    if (error.status === 404) {
+      return { message: `${action}接口尚未就绪（404）；后端升级后即可使用`, unavailable: true }
+    }
+    if (error.status === 409) {
+      const reason = error.code === 'no_successful_run'
+        ? '该版本最近一次运行没有成功'
+        : error.code === 'capability_gap'
+          ? '图中仍有未注册原子'
+          : ''
+      return { message: `${action}未执行：${reason || error.message || '存在冲突'}`, unavailable: false }
+    }
+  }
+  return { message: error instanceof Error ? error.message : `${action}失败`, unavailable: false }
 }

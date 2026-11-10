@@ -478,6 +478,43 @@ export const studioApi = {
     )
   },
 
+  /**
+   * POST api/studio/{wid}/freeze —— 把当前 rev 固化为生产任务。
+   * 后端要求该 rev 最近一次运行成功；未就绪时由调用方按 404 给友好提示。
+   */
+  async freezeWorkflow(
+    wid: string,
+    body: { rev?: number; message: string; checks?: AnyRecord[] },
+  ): Promise<{ wid: string; execution_mode: 'frozen'; frozen_ref: string; goal_checks?: AnyRecord[] }> {
+    return realOrMock(
+      () => request<{ wid: string; execution_mode: 'frozen'; frozen_ref: string; goal_checks?: AnyRecord[] }>(
+        `api/studio/${encode(wid)}/freeze`,
+        { method: 'POST', body },
+      ),
+      async () => {
+        const { mockFreezeWorkflow } = await import('./studioMock')
+        return mockFreezeWorkflow(wid, body)
+      },
+    )
+  },
+
+  /** POST api/studio/{wid}/unfreeze —— 回到调试；已固化 ref 作为历史保留。 */
+  async unfreezeWorkflow(
+    wid: string,
+    body: { message: string },
+  ): Promise<{ wid: string; execution_mode: 'debug'; previous_frozen_ref?: string }> {
+    return realOrMock(
+      () => request<{ wid: string; execution_mode: 'debug'; previous_frozen_ref?: string }>(
+        `api/studio/${encode(wid)}/unfreeze`,
+        { method: 'POST', body },
+      ),
+      async () => {
+        const { mockUnfreezeWorkflow } = await import('./studioMock')
+        return mockUnfreezeWorkflow(wid, body)
+      },
+    )
+  },
+
   async createDraft(body: { intent: string; domain_pack?: string; exclude_atoms?: string[]; allow_llm?: boolean }): Promise<Workflow> {
     return realOrMock(
       async () => {

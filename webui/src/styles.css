@@ -2574,3 +2574,156 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
   .nx-real-actions { width: 100%; }
   .nx-real-actions .btn { flex: 1; }
 }
+
+/* ── 任务执行态：调试 / 已固化 ─────────────────────────────────────── */
+.execution-mode-badge { max-width: 100%; min-width: 0; }
+.task-title-row .execution-mode-badge { flex: 0 1 auto; }
+.execution-mode-ref {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  min-width: 0;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+.execution-mode-run-note {
+  font-style: normal;
+  font-weight: 500;
+  opacity: 0.78;
+  padding-left: 5px;
+  border-left: 1px solid currentColor;
+}
+
+.execution-mode-bar {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  min-width: 0;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: linear-gradient(150deg, rgba(17, 26, 43, 0.55), rgba(10, 16, 27, 0.62));
+}
+.execution-mode-bar.is-debug {
+  border-color: rgba(247, 187, 99, 0.18);
+  background: linear-gradient(150deg, rgba(247, 187, 99, 0.055), rgba(10, 16, 27, 0.62) 62%);
+}
+.execution-mode-bar.is-frozen {
+  border-color: rgba(69, 224, 161, 0.2);
+  background: linear-gradient(150deg, rgba(69, 224, 161, 0.06), rgba(10, 16, 27, 0.62) 62%);
+}
+.execution-mode-icon {
+  width: 30px;
+  height: 30px;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: var(--amber);
+  background: rgba(247, 187, 99, 0.09);
+  border: 1px solid rgba(247, 187, 99, 0.16);
+}
+.execution-mode-bar.is-frozen .execution-mode-icon {
+  color: var(--green);
+  background: rgba(69, 224, 161, 0.09);
+  border-color: rgba(69, 224, 161, 0.17);
+}
+.execution-mode-copy { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.execution-mode-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; min-width: 0; }
+.execution-mode-head > strong { font-size: 11px; letter-spacing: -0.01em; }
+.execution-mode-copy p { color: var(--muted); font-size: 9.5px; line-height: 1.5; }
+.execution-mode-history {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  color: var(--dim);
+  font-size: 8.5px;
+}
+.execution-mode-history code {
+  min-width: 0;
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: var(--mono);
+}
+.execution-mode-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+  max-width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.execution-mode-run {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  max-width: 380px;
+  color: var(--dim);
+  font-size: 9px;
+  line-height: 1.4;
+}
+.execution-mode-run strong { font-size: 9.5px; }
+.execution-mode-run.is-ok strong { color: var(--green); }
+.execution-mode-run.is-warn strong { color: var(--amber); }
+.execution-mode-run code {
+  min-width: 0;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 8.5px;
+}
+
+.freeze-summary {
+  display: grid;
+  gap: 1px;
+  margin-bottom: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--line);
+  overflow: hidden;
+}
+.freeze-summary > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 9px 11px;
+  background: rgba(11, 17, 29, 0.92);
+}
+.freeze-summary span {
+  color: var(--dim);
+  font-size: 8.5px;
+  letter-spacing: 0.03em;
+}
+.freeze-summary strong { font-size: 12px; line-height: 1.3; }
+.freeze-summary small { color: var(--muted); font-size: 9px; line-height: 1.45; }
+.freeze-summary .execution-mode-ref { max-width: 100%; display: block; font-size: 10px; }
+
+@media (max-width: 640px) {
+  .execution-mode-bar { align-items: flex-start; flex-wrap: wrap; gap: 8px; padding: 10px; }
+  .execution-mode-icon { width: 26px; height: 26px; }
+  .execution-mode-copy { flex-basis: calc(100% - 34px); }
+  .execution-mode-actions { width: 100%; margin-left: 0; justify-content: flex-start; }
+  .execution-mode-actions .btn { flex: 1 1 0; min-width: 0; }
+  .execution-mode-run { flex-basis: 100%; max-width: none; }
+  .execution-mode-history { width: 100%; }
+  .execution-mode-history code { max-width: 100%; }
+  .execution-mode-ref { max-width: 170px; }
+  .freeze-summary .execution-mode-ref { max-width: 100%; }
+  .execution-mode-badge .execution-mode-ref { max-width: 150px; }
+}

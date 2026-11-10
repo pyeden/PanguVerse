@@ -90,6 +90,8 @@ export interface RunSummary {
 export interface RunDetail {
   report: AnyRecord
   plan?: AnyRecord | null
+  execution_mode?: 'debug' | 'frozen' | string
+  frozen_ref?: string
 }
 
 export interface Task {
@@ -310,6 +312,8 @@ export interface Execution {
   summary?: AnyRecord
   phases?: { name: string; status: string; detail?: string }[]
   cancellable: boolean
+  execution_mode?: 'debug' | 'frozen' | string
+  frozen_ref?: string
 }
 
 export interface ExecutionPageData {
@@ -537,6 +541,15 @@ export interface DebugResult {
   ran_at?: string
 }
 
+export interface GoalCheck {
+  id: string
+  kind?: string
+  description?: string
+  passed?: boolean
+  evidence?: string
+  [key: string]: any
+}
+
 export interface Workflow {
   wid: string
   name?: string
@@ -567,6 +580,12 @@ export interface Workflow {
   pending_atoms?: string[]
   replay_status?: string
   replay?: AnyRecord
+  /** 任务执行态：debug（默认，LLM 可自定义节点）/ frozen（确定性执行 wid@rev）。 */
+  execution_mode?: 'debug' | 'frozen' | string
+  frozen_ref?: string
+  frozen_at?: number | null
+  frozen_by?: string
+  goal_checks?: GoalCheck[]
   [key: string]: any
 }
 

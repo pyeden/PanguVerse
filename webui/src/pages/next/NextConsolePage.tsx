@@ -372,7 +372,8 @@ export function NextConsolePage() {
         description="一句话说明目标；不用配置项目、套件或模式。AI 负责拆解、执行、观察与自修，你只在缺密钥、权限和风险点出现。"
         actions={
           <>
-            {demoRunId ? <Badge tone="ok">真实运行 · {demoRunId}</Badge> : realWid ? <Badge tone="ok">真实草稿 · {realWid}</Badge> : <Badge tone="warn">尚未运行 · 可先跑内置演示</Badge>}
+            <Badge tone="warn" dot>调试期 · 允许 LLM 自定义节点</Badge>
+            {demoRunId ? <Badge tone="ok">真实运行 · {demoRunId}</Badge> : realWid ? <Badge tone="ok">真实草稿 · {realWid}</Badge> : <Badge tone="neutral">尚未运行 · 可先跑内置演示</Badge>}
             <Button variant="ghost" size="sm" icon="tasks" onClick={() => navigate('/tasks')}>查看全部任务</Button>
             <Button variant="ghost" size="sm" icon="flow" onClick={() => navigate('/next/workbench/wf-console/node-extract-prices')}>节点工作台</Button>
           </>

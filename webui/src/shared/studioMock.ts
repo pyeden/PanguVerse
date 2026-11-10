@@ -775,6 +775,51 @@ export async function mockPublish(wid: string, rev: number, message: string): Pr
   return { workflow_ref: workflowRef }
 }
 
+export async function mockFreezeWorkflow(
+  wid: string,
+  body: { rev?: number; message: string; checks?: AnyRecord[] },
+): Promise<{ wid: string; execution_mode: 'frozen'; frozen_ref: string; goal_checks: AnyRecord[] }> {
+  const store = load()
+  const workflow = ensure(wid)
+  const rev = Number(body.rev ?? workflow.current_rev ?? 0)
+  const frozenRef = `${wid}@${rev}`
+  const checks = Array.isArray(body.checks) && body.checks.length
+    ? body.checks
+    : Array.isArray(workflow.goal_checks) && workflow.goal_checks.length
+      ? workflow.goal_checks
+      : [
+          { id: 'goal-1', kind: 'assert', description: '固定图执行通过', passed: true, evidence: 'demo' },
+          { id: 'goal-2', kind: 'assert', description: '输出契约一致', passed: true, evidence: 'demo' },
+          { id: 'goal-3', kind: 'assert', description: '无未注册原子', passed: true, evidence: 'demo' },
+        ]
+  workflow.execution_mode = 'frozen'
+  workflow.frozen_ref = frozenRef
+  workflow.frozen_at = now()
+  workflow.frozen_by = 'you'
+  workflow.goal_checks = checks as any
+  workflow.updated_at = now()
+  workflow.audit.push({ ts: now(), actor: 'you', action: 'freeze', rev, note: body.message || `固化 ${frozenRef}` })
+  store.workflows[wid] = workflow
+  save(store)
+  return { wid, execution_mode: 'frozen', frozen_ref: frozenRef, goal_checks: checks }
+}
+
+export async function mockUnfreezeWorkflow(
+  wid: string,
+  body: { message: string },
+): Promise<{ wid: string; execution_mode: 'debug'; previous_frozen_ref: string }> {
+  const store = load()
+  const workflow = ensure(wid)
+  const previous = String(workflow.frozen_ref || '')
+  workflow.execution_mode = 'debug'
+  // 与后端一致：frozen_ref 作为历史保留，不删除。
+  workflow.updated_at = now()
+  workflow.audit.push({ ts: now(), actor: 'you', action: 'unfreeze', rev: workflow.current_rev, note: body.message || '回到调试' })
+  store.workflows[wid] = workflow
+  save(store)
+  return { wid, execution_mode: 'debug', previous_frozen_ref: previous }
+}
+
 export function mockReset(): void {
   try {
     localStorage.removeItem(STORE_KEY)
