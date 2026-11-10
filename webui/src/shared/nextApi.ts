@@ -10,10 +10,10 @@ export interface NextPlanGap {
   suggestion: string
 }
 
-export async function planIntent(intent: string): Promise<{ wid: string; steps: NxPlanStep[]; gaps: NextPlanGap[] }> {
+export async function planIntent(intent: string): Promise<{ wid: string; steps: NxPlanStep[]; gaps: NextPlanGap[]; planner?: string; source?: string }> {
   let workflow
   try {
-    workflow = await studioApi.createDraft({ intent })
+    workflow = await studioApi.createDraft({ intent, allow_llm: true })
   } catch (error) {
     const raw = (error as { data?: { error?: Record<string, unknown> } }).data?.error || {}
     const missingInputs = Array.isArray(raw.missing_inputs) ? raw.missing_inputs.map(String) : []
@@ -57,5 +57,5 @@ export async function planIntent(intent: string): Promise<{ wid: string; steps: 
     } satisfies NxPlanStep
   })
   if (!steps.length) throw new Error('AI 没有生成任何步骤')
-  return { wid: workflow.wid, steps, gaps: [] }
+  return { wid: workflow.wid, steps, gaps: [], planner: workflow.planner, source: workflow.plan_source }
 }

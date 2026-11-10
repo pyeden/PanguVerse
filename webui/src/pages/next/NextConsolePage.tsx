@@ -71,6 +71,7 @@ export function NextConsolePage() {
   const [runState, setRunState] = useState<RunState>('paused')
   const [realWid, setRealWid] = useState('')
   const [planning, setPlanning] = useState(false)
+  const [planSource, setPlanSource] = useState('')
   const [demoRunning, setDemoRunning] = useState(false)
   const [demoRunId, setDemoRunId] = useState('')
   const [phase, setPhase] = useState(3)
@@ -153,9 +154,11 @@ export function NextConsolePage() {
     if (!intent.trim()) setIntent(text)
     setShowTemplates(false)
     setDemoRunId('')
+    setPlanSource('')
     setPlanning(true)
     try {
       const result = await planIntent(text)
+      setPlanSource(result.planner || result.source || '')
       if (result.gaps.length) {
         setRealWid('')
         setRunState('paused')
@@ -432,7 +435,7 @@ export function NextConsolePage() {
         <section className="panel nx-real-banner" aria-label="真实流程草稿">
           <div>
             <strong>AI 已生成真实流程</strong>
-            <span>{realWid} · {plan.length} 个节点 · 真实规划</span>
+            <span>{realWid} · {plan.length} 个节点 · {planSource === 'llm' ? 'LLM 拆解' : '规则/模板拆解'}</span>
           </div>
           <Button
             size="sm"
