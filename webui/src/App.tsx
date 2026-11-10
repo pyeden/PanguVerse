@@ -6,22 +6,13 @@ import { Shell } from './components/Shell'
 import { ToastProvider, Button, Loading } from './components/ui'
 import { Icon } from './components/Icon'
 import { LoginPage } from './pages/LoginPage'
-import { ProjectsPage } from './pages/ProjectsPage'
-import { ProjectHistoryPage, ProjectOverviewPage, ProjectRunPage, ProjectSettingsPage } from './pages/ProjectPages'
 import { RunDetailPage } from './pages/RunDetailPage'
 import { AtomsPage } from './pages/AtomsPage'
 import { TasksPage } from './pages/TasksPage'
-import { ExecutionsPage } from './pages/ExecutionsPage'
-import { HistoryPage } from './pages/HistoryPage'
-import { ReportsPage } from './pages/ReportsPage'
 import { RunsPage } from './pages/RunsPage'
 import { FlowsPage } from './pages/FlowsPage'
 import { OverviewPage } from './pages/OverviewPage'
 import { SettingsPage } from './pages/SettingsPage'
-import { SchedulesPage } from './pages/SchedulesPage'
-import { ArtifactsPage } from './pages/ArtifactsPage'
-import { StudioNewPage } from './pages/StudioNewPage'
-import { StudioExplorePage } from './pages/StudioExplorePage'
 import { StudioCanvasPage } from './pages/StudioCanvasPage'
 import { StudioReviewPage } from './pages/StudioReviewPage'
 import { NextConsolePage } from './pages/next/NextConsolePage'
@@ -94,7 +85,7 @@ export default function App() {
       setAuthDisabled(false)
       setExpired(false)
       setAuthState('out')
-      navigate('/projects', { replace: true })
+      navigate('/overview', { replace: true })
     }
   }
 
@@ -139,7 +130,7 @@ function RoutedPage({ route }: { route: Route }) {
     const target = parts[1] === 'tasks' ? '/tasks' : parts[1] === 'packs' ? '/atoms' : '/atoms'
     return <Redirect to={target} />
   }
-  if (first === 'run' && parts.length === 1) return <Redirect to="/projects" />
+  if (first === 'run' && parts.length === 1) return <Redirect to="/overview" />
   if (first === 'packs') return <Redirect to="/atoms" />
   if (first === 'runs' && parts[1]) return <RunDetailPage key={parts[1]} />
   if (first === 'runs') return <RunsPage />
@@ -167,33 +158,21 @@ function RoutedPage({ route }: { route: Route }) {
     const run = route.query.get('run')
     return <Redirect to={withQuery('/runs', { view: 'artifacts', ...(run ? { run } : {}) })} />
   }
-  if (first === 'projects') return <ProjectsPage />
+  if (first === 'projects') return <Redirect to="/overview" />
   if (first === 'atoms') return <AtomsPage />
-  if (first === 'executions') return <ExecutionsPage />
-  if (first === 'history') return <HistoryPage />
-  if (first === 'reports') return <ReportsPage />
-  if (first === 'schedules') return <SchedulesPage />
-  if (first === 'artifacts') return <ArtifactsPage />
+  if (first === 'schedules') return <Redirect to="/tasks" />
   if (first === 'next') {
     if (parts[1] === 'console') return <NextConsolePage />
     if (parts[1] === 'workbench') return <NextWorkbenchPage wid={parts[2]} nodeId={parts[3]} key={`${parts[2] || ''}-${parts[3] || ''}`} />
     return <Redirect to="/next/console" />
   }
   if (first === 'studio' && (!parts[1] || parts[1] === 'new')) return <Redirect to="/next/console" />
+  if (first === 'studio' && parts[1] === 'explore') return <Redirect to="/tasks" />
   if (first === 'studio') {
-    if (!parts[1] || parts[1] === 'new') return <StudioNewPage />
-    if (parts[1] === 'explore') return <StudioExplorePage eid={parts[2]} key={parts[2] || 'explore-new'} />
     if (parts[2] === 'review') return <StudioReviewPage wid={parts[1]} key={`${parts[1]}-review`} />
     return <StudioCanvasPage wid={parts[1]} key={parts[1]} />
   }
-  if (first === 'p' && parts[1]) {
-    const page = parts[2] || 'overview'
-    if (parts[2] === 'runs' && parts[3]) return <RunDetailPage key={`${parts[3]}-${parts[1]}`} />
-    if (page === 'overview') return <ProjectOverviewPage key={parts[1]} />
-    if (page === 'run') return <ProjectRunPage key={parts[1]} />
-    if (page === 'history') return <ProjectHistoryPage key={parts[1]} />
-    if (page === 'settings') return <ProjectSettingsPage key={parts[1]} />
-  }
+  if (first === 'p') return <Redirect to="/overview" />
   return <NotFound route={route} />
 }
 
@@ -209,7 +188,7 @@ function NotFound({ route }: { route: Route }) {
     <div className="page notfound-page">
       <div className="notfound-mark"><Icon name="flow" size={30} /></div>
       <h1>页面不存在</h1>
-      <p>没有匹配 <code>#{route.path}</code> 的路由。旧入口已经迁移到新的六模块结构。</p>
+      <p>没有匹配 <code>#{route.path}</code> 的路由。旧入口已迁移到概览、任务、运行与资产。</p>
       <div className="notfound-actions">
         <Button variant="primary" onClick={() => navigate('/overview')}>回到概览</Button>
         <Button variant="ghost" onClick={() => navigate('/next/console')}>新建任务</Button>
@@ -226,22 +205,12 @@ function pageTitle(route: Route): string {
   if (first === 'tasks') return route.parts[1] === 'config' ? '运行配置' : '任务'
   if (first === 'runs') return route.parts[1] ? '运行详情' : '运行'
   if (first === 'settings') return '设置'
-  if (first === 'studio') return route.parts[1] === 'explore' ? (route.parts[2] ? '探索回看' : '探索') : route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '任务画布' : '新建任务'
-  if (first === 'p') {
-    const page = route.parts[2]
-    return page === 'run' ? '运行' : page === 'history' ? '项目历史' : page === 'settings' ? '项目设置' : route.parts[2] === 'runs' ? '运行报告' : '项目概览'
-  }
+  if (first === 'studio') return route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '任务画布' : '新建任务'
   const map: Record<string, string> = {
     overview: '概览',
-    projects: '项目',
     atoms: '原子库',
     tasks: '任务',
-    executions: '执行',
-    history: '历史',
-    reports: '报告',
-    schedules: '调度',
-    artifacts: '产出物',
-    runs: '运行报告',
+    runs: '运行',
   }
   return map[first] || 'PanguVerse'
 }

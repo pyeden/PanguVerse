@@ -182,7 +182,7 @@ export function FlowsPage() {
       <PageHeader
         eyebrow={<><span className="live-dot" /> 任务 · 管理</>}
         title="任务"
-        description="任务由一句话生成，可搜索、筛选、重命名与归档；打开画布继续编辑任务图与版本。"
+        description="一句话生成的任务，打开画布继续编辑与发布。"
         actions={
           <>
             <Button variant="ghost" icon="settings" onClick={() => navigate('/tasks/config')}>运行配置</Button>
@@ -233,9 +233,7 @@ export function FlowsPage() {
           icon="tasks"
           title={workflows.length ? '没有匹配的任务' : '还没有任务'}
           actions={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>}
-        >
-          {workflows.length ? '换个关键词或状态筛选。' : '从一句话开始，AI 会拆解成可审阅任务草稿。'}
-        </EmptyState>
+        />
       ) : null}
 
       {filtered.length ? (

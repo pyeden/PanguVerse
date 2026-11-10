@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, studioApi, isStudioMock, onStudioMockChange, normalizeDiff } from '../shared/api'
-import { navigate, href, useRoute } from '../shared/router'
+import { navigate, href, useRoute, withQuery } from '../shared/router'
 import { formatTime, pretty, relativeTime } from '../shared/utils'
 import { blockingValidationErrors } from '../shared/coverage'
 import type { AnyRecord, DiffItem, Risk, StudioDiff, TriggerKind } from '../shared/types'
@@ -143,7 +143,7 @@ export function StudioReviewPage({ wid }: { wid: string }) {
     mutationFn: (taskId: string) => api.runTask(taskId, {}),
     onSuccess: (result) => {
       push(`已开始运行 · ${result.job_id}`, 'ok')
-      navigate(`/executions?job=${encodeURIComponent(result.job_id)}`)
+      navigate(withQuery('/tasks/config', { job: result.job_id }))
     },
     onError: (error: Error) => push(error.message, 'error'),
   })

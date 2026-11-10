@@ -1196,21 +1196,20 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     <div className="studio-page studio-canvas-page">
       <div className="studio-top">
         <div className="studio-top-left">
-          <a className="icon-btn" href={href('/studio/new')} aria-label="返回工作台"><Icon name="arrow" size={18} style={{ transform: 'rotate(180deg)' }} /></a>
+          <a className="icon-btn" href={href('/next/console')} aria-label="返回控制台"><Icon name="arrow" size={18} style={{ transform: 'rotate(180deg)' }} /></a>
           <div className="studio-title">
             <div className="studio-title-line">
               <h1>{workflow.name || '未命名任务'}</h1>
               <StatusBadge status={state} />
               {mock ? <Badge tone="warn">演示</Badge> : null}
               {workflow.origin === 'explore' ? (
-                <a
+                <span
                   className="badge badge-violet explore-origin-chip"
-                  href={href(`/studio/explore/${workflow.explore_id || ''}`)}
                   title="该任务由探索成功后固化，参数来自真实调用值"
                   data-testid="canvas-explore-origin"
                 >
                   <Icon name="bolt" size={11} />来自探索 {workflow.explore_id || 'eid 未知'}
-                </a>
+                </span>
               ) : null}
               {Array.isArray(workflow.pending_atoms) && workflow.pending_atoms.length ? (
                 <Badge tone="warn" className="pending-atoms-chip" data-testid="canvas-pending-atoms">
@@ -1562,7 +1561,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
                         )) : (
                           <div className="debug-empty">
                             <Icon name="terminal" size={20} />
-                            <span>选择节点和模式后运行。调试只使用项目已配置环境，不写入执行历史。</span>
+                            <span>选择节点和模式后运行。调试只使用当前工作区环境，不写入执行历史。</span>
                           </div>
                         )}
                       </div>

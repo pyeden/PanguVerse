@@ -22,7 +22,7 @@ export function RunTable({
   emptyText?: string
 }) {
   if (!runs.length) {
-    return <EmptyState icon="history" title={emptyText} actions={emptyAction}>调整筛选条件，或发起新的运行。</EmptyState>
+    return <EmptyState icon="history" title={emptyText} actions={emptyAction} />
   }
   return (
     <div className="run-table-wrap">
@@ -46,8 +46,7 @@ export function RunTable({
             const counts = runCounts(run)
             const project = projects.find((item) => item.project_id === run.project_id)
             const suite = project?.suites?.find((item) => item.suite_id === run.suite_id)
-            const pid = run.project_id || project?.project_id
-            const runHref = pid ? href(`/p/${pid}/runs/${run.run_id}`) : href(`/runs/${run.run_id}`)
+            const runHref = href(`/runs/${run.run_id}`)
             const trigger = String(run.meta?.trigger || run.meta?.mode || (run.meta?.workflow_ref ? 'task' : 'manual'))
             return (
               <tr key={run.run_id} className={selected.includes(run.run_id) ? 'is-selected' : ''}>
@@ -71,7 +70,7 @@ export function RunTable({
                 <td data-label="执行">
                   <a className="mono run-id-link" href={runHref}>{shortId(run.run_id, 12)}</a>
                   {run.run_id ? (
-                    <a className="run-artifacts-mini" data-testid="run-artifacts-link" data-run-id={run.run_id} href={href(withQuery('/artifacts', { run: run.run_id }))} aria-label={`查看执行 ${run.run_id} 的产出物`}>
+                    <a className="run-artifacts-mini" data-testid="run-artifacts-link" data-run-id={run.run_id} href={href(withQuery(`/runs/${run.run_id}`, { tab: 'artifacts' }))} aria-label={`查看执行 ${run.run_id} 的产出物`}>
                       <Icon name="archive" size={11} />产出物
                     </a>
                   ) : null}

@@ -152,7 +152,7 @@ export function NextConsolePage() {
     setResult({
       ...NX_INITIAL_RESULT,
       title: 'AI 正在执行…',
-      summary: '已拆解意图并开始执行；无需填写项目、套件或模式。',
+      summary: '已拆解意图并开始执行；无需填写表单或模式。',
       evidence: ['正在生成证据…'],
       artifacts: [],
     })
@@ -388,9 +388,9 @@ export function NextConsolePage() {
   return (
     <div className="page nx-page">
       <PageHeader
-        eyebrow={<><span className="live-dot" /> 新建任务 · AI 控制台</>}
+        eyebrow={<><span className="live-dot" /> AI 控制台</>}
         title="新建任务"
-        description="一句话说明目标；不用配置项目、套件或模式。AI 负责拆解、执行、观察与自修，你只在缺密钥、权限和风险点出现。"
+        description="一句话说明目标，AI 拆解成可审阅任务。"
         actions={
           <>
             <Badge tone="warn" dot>调试期 · 允许 LLM 自定义节点</Badge>

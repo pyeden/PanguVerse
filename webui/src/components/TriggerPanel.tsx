@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, api, studioApi } from '../shared/api'
-import { href, navigate } from '../shared/router'
+import { href, navigate, withQuery } from '../shared/router'
 import { copyText, formatDuration, formatTime, relativeUntil } from '../shared/utils'
 import type {
   AnyRecord,
@@ -297,7 +297,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
         <div className="trigger-run-note" data-testid="trigger-run-note">
           <Icon name="play" size={13} />
           <span>已触发运行 · <code>{lastRun.jobId}</code></span>
-          <button type="button" onClick={() => navigate(`/executions?job=${encodeURIComponent(lastRun.jobId)}`)}>查看运行 →</button>
+          <button type="button" onClick={() => navigate(withQuery('/tasks/config', { job: lastRun.jobId }))}>查看运行 →</button>
           <IconButton label="关闭提示" icon="close" onClick={() => setLastRun(null)} />
         </div>
       ) : null}
@@ -561,7 +561,7 @@ export function WorkflowRunsPanel({ workflowRef = '', wid = '' }: { workflowRef?
       {latest.length ? (
         <div className="workflow-run-list">
           {latest.map((run: Execution) => (
-            <a className="workflow-run" key={run.eid} href={href(`/executions?eid=${encodeURIComponent(run.eid)}`)} data-testid={`workflow-run-${run.eid}`}>
+            <a className="workflow-run" key={run.eid} href={href(run.run_id ? `/runs/${run.run_id}` : '/runs')} data-testid={`workflow-run-${run.eid}`}>
               <StatusBadge status={run.status || run.run_status} />
               <div className="workflow-run-main">
                 <strong>{run.trigger || '手动运行'}</strong>

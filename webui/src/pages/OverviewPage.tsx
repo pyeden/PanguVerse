@@ -101,7 +101,7 @@ export function OverviewPage() {
       <PageHeader
         eyebrow={<><span className="live-dot" /> 首页 · 概览</>}
         title="概览"
-        description="今天运行得怎么样、哪些任务在等你处理，一眼看完；新建任务从一句话开始。"
+        description="今日运行、待处理任务与最近运行一览。"
         actions={
           <>
             <Button size="sm" variant="ghost" icon="refresh" onClick={refresh}>刷新</Button>
@@ -153,9 +153,7 @@ export function OverviewPage() {
             actions={<a className="inline-link" href={href('/tasks')}>查看全部任务</a>}
           />
           {!loading && !pendingTasks.length ? (
-            <EmptyState icon="tasks" title="没有待处理任务" actions={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>}>
-              一句话生成的任务草稿会先出现在这里，确认后再发布。
-            </EmptyState>
+            <EmptyState icon="tasks" title="没有待处理任务" actions={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>} />
           ) : null}
           {pendingTasks.length ? (
             <div className="overview-list">
@@ -186,9 +184,7 @@ export function OverviewPage() {
             actions={<a className="inline-link" href={href('/runs')}>全部运行</a>}
           />
           {!loading && !recentRuns.length ? (
-            <EmptyState icon="history" title="还没有运行记录" actions={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>}>
-              发布任务后即可运行，结果会出现在这里。
-            </EmptyState>
+            <EmptyState icon="history" title="还没有运行记录" actions={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>} />
           ) : null}
           {recentRuns.length ? (
             <div className="overview-list">
@@ -218,17 +214,17 @@ export function OverviewPage() {
         <div className="overview-quick-grid">
           <a className="overview-quick is-primary" href={href('/next/console')}>
             <span className="overview-quick-icon"><Icon name="spark" size={18} /></span>
-            <span><strong>新建任务</strong><small>一句话说明目标，AI 拆解成可审阅任务</small></span>
+            <span><strong>新建任务</strong><small>一句话生成可审阅任务</small></span>
             <Icon name="arrow" size={15} className="overview-quick-arrow" />
           </a>
           <a className="overview-quick" href={href('/tasks')}>
             <span className="overview-quick-icon"><Icon name="tasks" size={18} /></span>
-            <span><strong>查看全部任务</strong><small>搜索、筛选、重命名与归档任务</small></span>
+            <span><strong>查看全部任务</strong><small>搜索、筛选与归档</small></span>
             <Icon name="arrow" size={15} className="overview-quick-arrow" />
           </a>
           <a className="overview-quick" href={href('/runs')}>
             <span className="overview-quick-icon"><Icon name="play" size={18} /></span>
-            <span><strong>运行记录</strong><small>查看执行、报告与产出物</small></span>
+            <span><strong>运行记录</strong><small>执行、报告与产出物</small></span>
             <Icon name="arrow" size={15} className="overview-quick-arrow" />
           </a>
         </div>

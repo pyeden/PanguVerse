@@ -44,8 +44,8 @@ import {
 
 export function RunDetailPage() {
   const route = useRoute()
-  const pid = route.parts[0] === 'p' ? route.parts[1] : route.query.get('project') || ''
-  const rid = route.parts[0] === 'p' ? route.parts[3] : route.parts[1]
+  const pid = route.query.get('project') || ''
+  const rid = route.parts[1]
   const { push } = useToast()
   const queryClient = useQueryClient()
   const [caseSearch, setCaseSearch] = useState('')
@@ -117,7 +117,7 @@ export function RunDetailPage() {
     onSuccess: (result) => {
       setRerunOpen(false)
       push('重跑已提交', 'ok')
-      navigate(`/executions?job=${result.job_id}`)
+      navigate(withQuery('/tasks/config', { job: result.job_id }))
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
@@ -221,7 +221,7 @@ export function RunDetailPage() {
       <div className="report-hero">
         <div className="report-hero-main">
           <div className="report-back">
-            {pid ? <a href={href(`/p/${pid}/history`)}><Icon name="arrow" size={14} /> 项目历史</a> : <a href={href('/history')}><Icon name="arrow" size={14} /> 全部历史</a>}
+            <a href={href('/runs')}><Icon name="arrow" size={14} /> 全部运行</a>
             <span>/</span>
             <span className="mono">{rid}</span>
           </div>
@@ -310,9 +310,9 @@ export function RunDetailPage() {
           <section className="panel run-artifacts-panel run-only-artifacts" data-testid="run-artifacts-panel">
             <SectionHeader
               title="产出物"
-              description="执行报告回答「怎么跑的」，任务产出回答「跑出了什么」；均可就地预览或下载。"
+              description="本 run 的产出物，可预览或下载。"
               icon="archive"
-              actions={<a className="inline-link" data-testid="run-artifacts-link" href={href(withQuery('/artifacts', { run: rid }))}>全部产出物 <Icon name="arrow" size={12} /></a>}
+              actions={<a className="inline-link" data-testid="run-artifacts-link" href={href(withQuery(`/runs/${rid}`, { tab: 'artifacts' }))}>全部产出物 <Icon name="arrow" size={12} /></a>}
             />
             {runArtifactsQuery.isLoading ? <Loading label="正在读取产出物…" /> : null}
             {runArtifactsQuery.error ? (
@@ -404,7 +404,7 @@ export function RunDetailPage() {
                 ))}
               </div>
             </div>
-            {!cases.length ? <EmptyState icon="report" title="报告中没有用例">可能是一次规划失败或空场景。</EmptyState> : (
+            {!cases.length ? <EmptyState icon="report" title="报告中没有用例" /> : (
               <div className="case-list">
                 {filteredCases.map((item, index) => {
                   const key = `${item.case_id || item.name}-${index}`
@@ -468,7 +468,7 @@ export function RunDetailPage() {
                   </div>
                 ))}
               </div>
-            ) : <EmptyState icon="shield" title="报告没有阶段明细">旧报告可能没有 phases；可查看原始报告。</EmptyState>}
+            ) : <EmptyState icon="shield" title="报告没有阶段明细" />}
           </section>
 
           <section className="panel run-only-report">
@@ -486,9 +486,7 @@ export function RunDetailPage() {
                 {reportArtifacts.map((artifact) => renderArtifactRow(artifact, 'report'))}
               </div>
             ) : (
-              <EmptyState icon="report" title="没有执行报告产出物" actions={<Button size="sm" variant="ghost" icon="code" onClick={() => setRawOpen(true)}>查看原始报告</Button>}>
-                旧运行可能只保留 report.json。
-              </EmptyState>
+              <EmptyState icon="report" title="没有执行报告产出物" actions={<Button size="sm" variant="ghost" icon="code" onClick={() => setRawOpen(true)}>查看原始报告</Button>} />
             )}
           </section>
         </div>
@@ -525,7 +523,7 @@ export function RunDetailPage() {
               <div className="audit-empty">
                 <Icon name="git" size={19} />
                 <strong>{workflowRef ? '已定位发布版本' : '没有内嵌审计记录'}</strong>
-                <p>{workflowRef ? `报告指向 ${workflowRef}。工作台审阅页可查看完整 audit_tail。` : '当前报告未携带 workflow_ref；仍可通过项目与执行 ID 回溯。'}</p>
+                <p>{workflowRef ? `报告指向 ${workflowRef}。工作台审阅页可查看完整 audit_tail。` : '当前报告未携带 workflow_ref；仍可通过运行 ID 回溯。'}</p>
                 {workflowRef ? <a className="inline-link" href={href(`/studio/${workflowRef.split('@')[0]}/review`)}>打开发布版本 <Icon name="arrow" size={12} /></a> : null}
               </div>
             )}

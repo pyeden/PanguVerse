@@ -71,9 +71,9 @@ export function AtomsPage() {
   return (
     <div className="page atoms-page">
       <PageHeader
-        eyebrow={<><span className="live-dot" /> 六模块 · 料</>}
+        eyebrow={<><span className="live-dot" /> 资产 · 原子库</>}
         title="原子库"
-        description="原子是可编排的最小动作。每个原子暴露输入/输出端口、副作用与来源领域包；AI 只能从这里选择和组合。"
+        description="可编排的最小动作，含输入输出、副作用与来源领域包。"
         actions={<Button variant="ghost" icon="layers" onClick={() => document.getElementById('packs-section')?.scrollIntoView({ behavior: 'smooth' })}>领域包 {packs.length}</Button>}
       />
 
@@ -107,7 +107,7 @@ export function AtomsPage() {
       {atomsQuery.error ? <ErrorState error={atomsQuery.error} onRetry={() => atomsQuery.refetch()} title="原子库读取失败" /> : null}
 
       {!atomsQuery.isLoading && !filtered.length ? (
-        <EmptyState icon="atoms" title="没有匹配的原子" actions={<Button size="sm" onClick={reset}>清除筛选</Button>}>换一个关键词，或切换领域/分类。</EmptyState>
+        <EmptyState icon="atoms" title="没有匹配的原子" actions={<Button size="sm" onClick={reset}>清除筛选</Button>} />
       ) : null}
 
       <div className="atom-grid">

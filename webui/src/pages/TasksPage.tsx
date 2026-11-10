@@ -186,18 +186,18 @@ export function TasksPage() {
   const jobDisplay = jobQuery.data ? jobStatusMeta(jobQuery.data) : null
   return (
     <div className="page tasks-page">
-      {published ? <div className="publish-success"><span className="publish-success-icon"><Icon name="git" size={20} /></span><div><strong>已发布任务版本 {published}</strong><p>创建一个任务绑定这个不可变版本，或到项目设置把它绑定为套件。</p></div><Button size="sm" variant="ghost" onClick={() => openCreate()}>换个方式新建</Button></div> : null}
+      {published ? <div className="publish-success"><span className="publish-success-icon"><Icon name="git" size={20} /></span><div><strong>已发布任务版本 {published}</strong><p>创建一个任务绑定这个不可变版本。</p></div><Button size="sm" variant="ghost" onClick={() => openCreate()}>换个方式新建</Button></div> : null}
       <PageHeader
         eyebrow={<><span className="live-dot" /> 运行配置 · 可运行任务</>}
         title="运行配置"
-        description="维护可运行任务：固定场景、自然语言意图或已发布任务版本。图只能在任务画布出新版本，已发布任务不可就地改图。"
-        actions={<><Button variant="ghost" icon="tasks" onClick={() => navigate('/tasks')}>任务列表</Button><Button variant="ghost" icon="spark" onClick={() => navigate('/studio/new')}>从任务画布发布</Button><Button variant="primary" icon="plus" onClick={openCreate}>新建任务</Button></>}
+        description="维护可运行任务与运行入口；任务图在画布中出新版本。"
+        actions={<><Button variant="ghost" icon="tasks" onClick={() => navigate('/tasks')}>任务列表</Button><Button variant="primary" icon="plus" onClick={openCreate}>新建任务</Button></>}
       />
 
       <div className="task-stats">
         <div><span>任务总数</span><strong>{tasks.length}</strong><small>{tasks.filter((task) => task.workflow_ref).length} 个来自发布任务</small></div>
-        <div><span>最近运行失败</span><strong className={tasks.some((task) => task.last_status === 'failed') ? 'bad' : 'ok'}>{tasks.filter((task) => task.last_status === 'failed').length}</strong><small>失败定义不等于报告失败</small></div>
-        <div><span>固定场景</span><strong>{tasks.filter((task) => task.mode === 'scenario').length}</strong><small>可绑定项目 / 套件</small></div>
+        <div><span>最近运行失败</span><strong className={tasks.some((task) => task.last_status === 'failed') ? 'bad' : 'ok'}>{tasks.filter((task) => task.last_status === 'failed').length}</strong><small>最近一次运行失败的任务</small></div>
+        <div><span>固定场景</span><strong>{tasks.filter((task) => task.mode === 'scenario').length}</strong><small>固定 YAML 场景</small></div>
         <div><span>发布任务</span><strong>{tasks.filter((task) => task.mode === 'workflow').length}</strong><small>绑定 wid@rev</small></div>
         {includeArchived ? <div><span>已归档</span><strong>{archivedCount}</strong><small>仅显示，不参与运行</small></div> : null}
       </div>
@@ -228,9 +228,7 @@ export function TasksPage() {
       {tasksQuery.error ? <ErrorState error={tasksQuery.error} onRetry={() => tasksQuery.refetch()} /> : null}
 
       {!tasksQuery.isLoading && !filtered.length ? (
-        <EmptyState icon="tasks" title={tasks.length ? '没有匹配的任务' : '还没有任务'} actions={<Button size="sm" variant="primary" icon="plus" onClick={openCreate}>新建任务</Button>}>
-          {tasks.length ? '换个关键词或模式筛选。' : '从任务画布发布任务，或创建固定场景任务。'}
-        </EmptyState>
+        <EmptyState icon="tasks" title={tasks.length ? '没有匹配的任务' : '还没有任务'} actions={<Button size="sm" variant="primary" icon="plus" onClick={openCreate}>新建任务</Button>} />
       ) : null}
 
       {filtered.length ? (
