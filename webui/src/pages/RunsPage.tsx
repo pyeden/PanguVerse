@@ -76,7 +76,7 @@ export function RunsPage() {
             <RunTable
               runs={filtered}
               projects={projects}
-              emptyAction={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/studio/new')}>去流程页新建</Button>}
+              emptyAction={<Button size="sm" variant="primary" icon="spark" onClick={() => navigate('/next/console')}>去新建任务</Button>}
               emptyText={filter === 'all' ? '还没有运行记录' : '当前筛选下没有运行'}
             />
           ) : null}

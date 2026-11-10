@@ -58,7 +58,7 @@ export function SettingsPage() {
           <SectionHeader icon="flow" title="快捷入口" description="新结构只保留 5 个顶层入口" />
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
             <a className="inline-link" href={href('/next/console')}>首页 · AI 控制台</a>
-            <a className="inline-link" href={href('/studio/new')}>流程 · 新建流程</a>
+            <a className="inline-link" href={href('/studio/new')}>任务 · 新建任务</a>
             <a className="inline-link" href={href('/runs')}>运行 · 统一 Run</a>
             <a className="inline-link" href={href('/atoms')}>资产 · 原子库</a>
             <a className="inline-link" href={href('/runs?view=reports')}>报告 · 运行视图</a>

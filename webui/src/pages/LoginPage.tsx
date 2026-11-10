@@ -61,7 +61,7 @@ export function LoginPage({
           </a>
           <div className="story-copy">
             <div className="eyebrow"><span className="live-dot" /> AI + 人工裁决的自动化闭环</div>
-            <h1>把一句话<br />变成<span>可审阅的流程</span></h1>
+            <h1>把一句话<br />变成<span>可审阅的任务</span></h1>
             <p>意图识别、可视化编排、单步调试、逐条审阅、不可变发布。每一步都留下 AI 提议与人工裁决的痕迹。</p>
           </div>
 

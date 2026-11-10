@@ -7,7 +7,7 @@ export interface Route {
 }
 
 export function parseHash(hash = window.location.hash): Route {
-  const raw = (hash || '').replace(/^#/, '') || '/projects'
+  const raw = (hash || '').replace(/^#/, '') || '/overview'
   const qIndex = raw.indexOf('?')
   const path = qIndex >= 0 ? raw.slice(0, qIndex) : raw
   const query = new URLSearchParams(qIndex >= 0 ? raw.slice(qIndex + 1) : '')
@@ -27,8 +27,8 @@ export function useRoute(): Route {
     const onChange = () => setRoute(parseHash())
     window.addEventListener('hashchange', onChange)
     if (!window.location.hash) {
-      history.replaceState(null, '', '#/projects')
-      setRoute(parseHash('#/projects'))
+      history.replaceState(null, '', '#/overview')
+      setRoute(parseHash('#/overview'))
     }
     return () => window.removeEventListener('hashchange', onChange)
   }, [])

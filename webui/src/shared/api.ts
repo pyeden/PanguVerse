@@ -442,13 +442,40 @@ function triggerResult(payload: AnyRecord): WorkflowTriggerResult {
 }
 
 export const studioApi = {
-  async listDrafts(): Promise<Workflow[]> {
+  async listDrafts(includeArchived = false): Promise<Workflow[]> {
     const mode = await ensureStudioMode()
     const { mockListWorkflows } = await import('./studioMock')
-    if (mode) return mockListWorkflows()
-    const payload = await request<AnyRecord>('api/studio/drafts')
+    if (mode) return mockListWorkflows(includeArchived)
+    const suffix = includeArchived ? '?include_archived=1' : ''
+    const payload = await request<AnyRecord>(`api/studio/drafts${suffix}`)
     const items = Array.isArray(payload) ? payload : payload.drafts || payload.workflows || []
     return (items as AnyRecord[]).map((item) => normalizeWorkflow(item))
+  },
+
+  async renameWorkflow(wid: string, name: string): Promise<{ wid: string; name: string; current_rev?: number }> {
+    return realOrMock(
+      () => request<{ wid: string; name: string; current_rev?: number }>(`api/studio/${encode(wid)}`, {
+        method: 'PATCH',
+        body: { name },
+      }),
+      async () => {
+        const { mockRenameWorkflow } = await import('./studioMock')
+        return mockRenameWorkflow(wid, name)
+      },
+    )
+  },
+
+  async archiveWorkflow(wid: string, archived = true): Promise<{ wid: string; archived_at: number | null }> {
+    return realOrMock(
+      () => request<{ wid: string; archived_at: number | null }>(`api/studio/${encode(wid)}/archive`, {
+        method: 'POST',
+        body: { archived },
+      }),
+      async () => {
+        const { mockArchiveWorkflow } = await import('./studioMock')
+        return mockArchiveWorkflow(wid, archived)
+      },
+    )
   },
 
   async createDraft(body: { intent: string; domain_pack?: string; exclude_atoms?: string[]; allow_llm?: boolean }): Promise<Workflow> {

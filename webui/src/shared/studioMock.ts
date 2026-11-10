@@ -229,7 +229,7 @@ function save(store: MockStore): void {
 function ensure(wid: string): StoredWorkflow {
   const store = load()
   const workflow = store.workflows[wid]
-  if (!workflow) throw new Error('流程不存在')
+  if (!workflow) throw new Error('任务不存在')
   return workflow
 }
 
@@ -242,6 +242,8 @@ function normalize(workflow: StoredWorkflow, rev?: number): Workflow {
     current_rev: workflow.current_rev,
     rev: targetRev,
     graph,
+    node_count: graph.nodes?.length || 0,
+    archived_at: workflow.archived_at ?? null,
     validation: validateGraph(graph),
   })
 }
@@ -331,7 +333,7 @@ function validateGraph(graph: StudioGraph): Validation {
       risks.push({ id: `risk-secret-${node.node_id}`, kind: 'secret', message: `${node.name || node.atom} 使用密钥变量（出口已打码）`, severity: 'medium', node_ids: [node.node_id], requires_ack: true })
     }
   })
-  if (!graph.nodes.length) errors.push({ id: 'empty-graph', message: '流程至少需要一个节点' })
+  if (!graph.nodes.length) errors.push({ id: 'empty-graph', message: '任务至少需要一个节点' })
   return { errors, warnings, risks }
 }
 
@@ -342,9 +344,10 @@ function validateWorkflow(wid: string, rev?: number): Validation {
   return validateGraph(revision?.graph || workflow.graph)
 }
 
-export async function mockListWorkflows(): Promise<Workflow[]> {
+export async function mockListWorkflows(includeArchived = false): Promise<Workflow[]> {
   const store = load()
   return Object.values(store.workflows)
+    .filter((workflow) => includeArchived || !workflow.archived_at)
     .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
     .map((workflow) => normalize(workflow))
 }
@@ -356,7 +359,7 @@ export async function mockCreateDraft(body: { intent: string; domain_pack?: stri
   const wid = uid('w')
   const workflow: StoredWorkflow = {
     wid,
-    name: body.intent.trim().slice(0, 28) || '未命名流程',
+    name: body.intent.trim().slice(0, 28) || '未命名任务',
     intent: body.intent,
     domain_pack: pack,
     state: 'draft',
@@ -719,6 +722,30 @@ export async function mockApplyDiff(wid: string, proposedRev: number, accepted: 
   return normalize(workflow)
 }
 
+export async function mockRenameWorkflow(wid: string, name: string): Promise<{ wid: string; name: string; current_rev: number }> {
+  const store = load()
+  const workflow = ensure(wid)
+  const nextName = name.trim()
+  if (!nextName) throw new Error('任务名称不能为空')
+  workflow.name = nextName
+  workflow.updated_at = now()
+  workflow.audit.push({ ts: now(), actor: 'you', action: 'rename', rev: workflow.current_rev, note: nextName })
+  store.workflows[wid] = workflow
+  save(store)
+  return { wid, name: nextName, current_rev: Number(workflow.current_rev || 0) }
+}
+
+export async function mockArchiveWorkflow(wid: string, archived = true): Promise<{ wid: string; archived_at: number | null }> {
+  const store = load()
+  const workflow = ensure(wid)
+  workflow.archived_at = archived ? now() : null
+  workflow.updated_at = now()
+  workflow.audit.push({ ts: now(), actor: 'you', action: archived ? 'archive' : 'unarchive', rev: workflow.current_rev, note: archived ? '归档任务' : '取消归档任务' })
+  store.workflows[wid] = workflow
+  save(store)
+  return { wid, archived_at: workflow.archived_at }
+}
+
 export async function mockSetState(wid: string, to: 'review' | 'approved' | 'rejected', note: string): Promise<Workflow> {
   const store = load()
   const workflow = ensure(wid)
@@ -734,7 +761,7 @@ export async function mockSetState(wid: string, to: 'review' | 'approved' | 'rej
 export async function mockPublish(wid: string, rev: number, message: string): Promise<{ workflow_ref: string }> {
   const store = load()
   const workflow = ensure(wid)
-  if (workflow.state !== 'approved') throw new Error('流程尚未批准，不能发布')
+  if (workflow.state !== 'approved') throw new Error('任务尚未批准，不能发布')
   if (!message.trim()) throw new Error('版本说明不能为空')
   const workflowRef = `${wid}@${rev}`
   workflow.published_ref = workflowRef

@@ -1051,8 +1051,8 @@ function StudioCanvasInner({ wid }: { wid: string }) {
     return atoms.filter((atom) => !query || `${atom.name} ${atom.description || ''} ${atom.category}`.toLowerCase().includes(query)).slice(0, 40)
   }, [addSearch, atoms])
 
-  if (workflowQuery.isLoading) return <div className="page"><Loading label="正在读取流程…" /></div>
-  if (workflowQuery.error || !workflow) return <div className="page"><ErrorState error={workflowQuery.error} onRetry={() => workflowQuery.refetch()} title="流程读取失败" /></div>
+  if (workflowQuery.isLoading) return <div className="page"><Loading label="正在读取任务…" /></div>
+  if (workflowQuery.error || !workflow) return <div className="page"><ErrorState error={workflowQuery.error} onRetry={() => workflowQuery.refetch()} title="任务读取失败" /></div>
   const currentRev = workflow.current_rev ?? 0
   const debugSummary = debugSession?.summary || { passed: 0, failed: 0, skipped: 0, total: workflow.graph?.nodes?.length || 0 }
   const totalCount = debugTotal || Number(debugSummary.total ?? 0) || workflow.graph?.nodes?.length || 0
@@ -1095,14 +1095,14 @@ function StudioCanvasInner({ wid }: { wid: string }) {
           <a className="icon-btn" href={href('/studio/new')} aria-label="返回工作台"><Icon name="arrow" size={18} style={{ transform: 'rotate(180deg)' }} /></a>
           <div className="studio-title">
             <div className="studio-title-line">
-              <h1>{workflow.name || '未命名流程'}</h1>
+              <h1>{workflow.name || '未命名任务'}</h1>
               <StatusBadge status={state} />
               {mock ? <Badge tone="warn">演示</Badge> : null}
               {workflow.origin === 'explore' ? (
                 <a
                   className="badge badge-violet explore-origin-chip"
                   href={href(`/studio/explore/${workflow.explore_id || ''}`)}
-                  title="该流程由探索成功后固化，参数来自真实调用值"
+                  title="该任务由探索成功后固化，参数来自真实调用值"
                   data-testid="canvas-explore-origin"
                 >
                   <Icon name="bolt" size={11} />来自探索 {workflow.explore_id || 'eid 未知'}
@@ -1156,7 +1156,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         </div>
       </div>
 
-      <nav className="studio-tabs" aria-label="流程视图" data-testid="studio-tabs">
+      <nav className="studio-tabs" aria-label="任务视图" data-testid="studio-tabs">
         <button type="button" className={tab === 'canvas' ? 'is-active' : ''} aria-current={tab === 'canvas' ? 'page' : undefined} onClick={() => setTab('canvas')}>
           <Icon name="flow" size={14} />Canvas
         </button>
@@ -1571,7 +1571,7 @@ function StudioCanvasInner({ wid }: { wid: string }) {
         ) : (
         <aside className={`side-panel studio-node-panel ${panelOpen ? 'is-mobile-open' : ''}`}>
           <div className="side-panel-head">
-            <div><span className="side-kicker">{selectedNode ? '节点设置' : '流程检查'}</span><h2>{selectedNode?.name || '未选择节点'}</h2></div>
+            <div><span className="side-kicker">{selectedNode ? '节点设置' : '任务检查'}</span><h2>{selectedNode?.name || '未选择节点'}</h2></div>
             <div className="side-head-actions">
               <IconButton label="折叠属性面板" icon="chevron" className="node-panel-collapse" onClick={() => setNodeRailCollapsed(true)} />
               <IconButton label="关闭面板" icon="close" className="mobile-only" onClick={() => setPanelOpen(false)} />

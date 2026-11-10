@@ -16,6 +16,7 @@ import { HistoryPage } from './pages/HistoryPage'
 import { ReportsPage } from './pages/ReportsPage'
 import { RunsPage } from './pages/RunsPage'
 import { FlowsPage } from './pages/FlowsPage'
+import { OverviewPage } from './pages/OverviewPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { SchedulesPage } from './pages/SchedulesPage'
 import { ArtifactsPage } from './pages/ArtifactsPage'
@@ -126,17 +127,23 @@ export default function App() {
 
 function RoutedPage({ route }: { route: Route }) {
   const parts = route.parts
-  const first = parts[0] || 'projects'
+  const first = parts[0] || 'overview'
 
   if (first === 'platform') {
     const target = parts[1] === 'tasks' ? '/tasks' : parts[1] === 'packs' ? '/atoms' : '/atoms'
     return <Redirect to={target} />
   }
-  if (['overview', 'run'].includes(first) && parts.length === 1) return <Redirect to="/projects" />
+  if (first === 'run' && parts.length === 1) return <Redirect to="/projects" />
   if (first === 'packs') return <Redirect to="/atoms" />
   if (first === 'runs' && parts[1]) return <RunDetailPage key={parts[1]} />
   if (first === 'runs') return <RunsPage />
-  if (first === 'flows') return <FlowsPage />
+  if (first === 'overview') return <OverviewPage />
+  if (first === 'flows') return <Redirect to={withQuery('/tasks', route.query)} />
+  if (first === 'tasks') {
+    if (parts[1] === 'config') return <TasksPage />
+    if (route.query.get('focus') || route.query.get('published')) return <Redirect to={withQuery('/tasks/config', route.query)} />
+    return <FlowsPage />
+  }
   if (first === 'settings') return <SettingsPage />
   if (first === 'executions' || first === 'history') return <Redirect to="/runs" />
   if (first === 'reports') return <Redirect to={withQuery('/runs', { view: 'reports' })} />
@@ -146,7 +153,6 @@ function RoutedPage({ route }: { route: Route }) {
   }
   if (first === 'projects') return <ProjectsPage />
   if (first === 'atoms') return <AtomsPage />
-  if (first === 'tasks') return <TasksPage />
   if (first === 'executions') return <ExecutionsPage />
   if (first === 'history') return <HistoryPage />
   if (first === 'reports') return <ReportsPage />
@@ -189,25 +195,28 @@ function NotFound({ route }: { route: Route }) {
       <h1>页面不存在</h1>
       <p>没有匹配 <code>#{route.path}</code> 的路由。旧入口已经迁移到新的六模块结构。</p>
       <div className="notfound-actions">
-        <Button variant="primary" onClick={() => navigate('/projects')}>回到项目</Button>
-        <Button variant="ghost" onClick={() => navigate('/studio/new')}>打开工作台</Button>
+        <Button variant="primary" onClick={() => navigate('/overview')}>回到概览</Button>
+        <Button variant="ghost" onClick={() => navigate('/next/console')}>新建任务</Button>
       </div>
     </div>
   )
 }
 
 function pageTitle(route: Route): string {
-  const first = route.parts[0] || 'projects'
-  if (first === 'next') return route.parts[1] === 'workbench' ? '节点工作台' : 'AI 控制台'
-  if (first === 'flows') return '流程'
+  const first = route.parts[0] || 'overview'
+  if (first === 'overview') return '概览'
+  if (first === 'next') return route.parts[1] === 'workbench' ? '节点工作台' : '新建任务'
+  if (first === 'flows') return '任务'
+  if (first === 'tasks') return route.parts[1] === 'config' ? '运行配置' : '任务'
   if (first === 'runs') return route.parts[1] ? '运行详情' : '运行'
   if (first === 'settings') return '设置'
-  if (first === 'studio') return route.parts[1] === 'explore' ? (route.parts[2] ? '探索回看' : '探索') : route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '流程画布' : '新建流程'
+  if (first === 'studio') return route.parts[1] === 'explore' ? (route.parts[2] ? '探索回看' : '探索') : route.parts[2] === 'review' ? '审阅与发布' : route.parts[1] && route.parts[1] !== 'new' ? '任务画布' : '新建任务'
   if (first === 'p') {
     const page = route.parts[2]
     return page === 'run' ? '运行' : page === 'history' ? '项目历史' : page === 'settings' ? '项目设置' : route.parts[2] === 'runs' ? '运行报告' : '项目概览'
   }
   const map: Record<string, string> = {
+    overview: '概览',
     projects: '项目',
     atoms: '原子库',
     tasks: '任务',
@@ -241,7 +250,7 @@ class ErrorBoundary extends Component<{ children: ReactNode }, { error: Error | 
           <p>{this.state.error.message}</p>
           <div className="notfound-actions">
             <Button variant="primary" onClick={() => window.location.reload()}>重新加载</Button>
-            <Button variant="ghost" onClick={() => { this.setState({ error: null }); navigate('/projects') }}>回到项目</Button>
+            <Button variant="ghost" onClick={() => { this.setState({ error: null }); navigate('/overview') }}>回到概览</Button>
           </div>
         </div>
       )

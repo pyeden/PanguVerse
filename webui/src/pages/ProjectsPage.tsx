@@ -86,7 +86,7 @@ export function ProjectsPage() {
       <PageHeader
         eyebrow={<><span className="live-dot" /> 六模块 · 域</>}
         title="项目"
-        description="每个项目是一组套件、共享环境与运行历史的归属。把被测系统放在这里，再绑定已发布流程。"
+        description="每个项目是一组套件、共享环境与运行历史的归属。把被测系统放在这里，再绑定已发布任务。"
         actions={
           <>
             <Button variant="ghost" icon="history" onClick={() => navigate('/history')}>跨项目历史</Button>
@@ -123,7 +123,7 @@ export function ProjectsPage() {
         <EmptyState
           icon="projects"
           title="先建一个项目"
-          actions={<><Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>新建项目</Button><Button variant="ghost" onClick={() => navigate('/studio/new')}>先造流程</Button></>}
+          actions={<><Button variant="primary" icon="plus" onClick={() => setCreateOpen(true)}>新建项目</Button><Button variant="ghost" onClick={() => navigate('/studio/new')}>先建任务</Button></>}
         >
           项目把站点地址、环境与套件放在一起；之后每次运行、报告和审计都会自动归属到这里。
         </EmptyState>
@@ -140,8 +140,8 @@ export function ProjectsPage() {
       ) : null}
 
       <SectionHeader
-        title="项目与流程的关系"
-        description="项目负责“在哪里跑”，工作台负责“跑什么”。已发布流程绑定到项目后才会进入正式执行。"
+        title="项目与任务的关系"
+        description="项目负责“在哪里跑”，任务画布负责“跑什么”。已发布任务绑定到项目后才会进入正式执行。"
         icon="git"
         actions={<Button size="sm" variant="ghost" icon="arrow" onClick={() => navigate('/studio/new')}>打开工作台</Button>}
       />
@@ -149,7 +149,7 @@ export function ProjectsPage() {
         <div className="relation-card">
           <span className="relation-index">01</span>
           <Icon name="spark" size={21} />
-          <strong>工作台产出流程</strong>
+          <strong>工作台产出任务</strong>
           <p>意图 → 图 → 调试 → 审阅 → 不可变发布，得到 <code>wid@rev</code>。</p>
         </div>
         <div className="relation-arrow"><Icon name="arrow" size={18} /></div>
@@ -157,7 +157,7 @@ export function ProjectsPage() {
           <span className="relation-index">02</span>
           <Icon name="link" size={21} />
           <strong>绑定项目环境</strong>
-          <p>发布后的流程作为任务，绑定项目 base_url 与已配置 env，禁止临时 URL 覆盖。</p>
+          <p>发布后的任务绑定项目 base_url 与已配置 env，禁止临时 URL 覆盖。</p>
         </div>
         <div className="relation-arrow"><Icon name="arrow" size={18} /></div>
         <div className="relation-card">

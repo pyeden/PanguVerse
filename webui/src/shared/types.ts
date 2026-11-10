@@ -428,7 +428,7 @@ export interface CoverageStat {
   matched: number
   total: number
   ratio: number
-  /** 发布门禁：探索固化流程为 advisory，普通草稿为 blocking。 */
+  /** 发布门禁：探索固化任务为 advisory，普通草稿为 blocking。 */
   gate?: 'advisory' | 'blocking' | string
   /** 未匹配节点的原子与原因，供前端折叠展示。 */
   unmatched_details?: CoverageUnmatchedDetail[]
@@ -560,6 +560,8 @@ export interface Workflow {
   audit_tail?: AnyRecord[]
   created_at?: number
   updated_at?: number
+  node_count?: number
+  archived_at?: number | null
   origin?: 'ai' | 'human' | 'explore' | string
   explore_id?: string
   pending_atoms?: string[]

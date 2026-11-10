@@ -2,6 +2,7 @@ import type { ReactElement, SVGProps } from 'react'
 
 export type IconName =
   | 'spark'
+  | 'home'
   | 'flow'
   | 'projects'
   | 'atoms'
@@ -47,6 +48,7 @@ export type IconName =
   | 'archive'
 
 const paths: Record<IconName, ReactElement> = {
+  home: <><path d="M4 10.5 12 4l8 6.5" /><path d="M6 9.5V20h12V9.5" /><path d="M10 20v-5.5h4V20" /></>,
   spark: <><path d="M12 3l1.35 5.05L18 9.5l-4.65 1.45L12 16l-1.35-5.05L6 9.5l4.65-1.45L12 3Z" /><path d="M18.5 15l.65 2.35L21.5 18l-2.35.65L18.5 21l-.65-2.35L15.5 18l2.35-.65L18.5 15Z" /></>,
   flow: <><rect x="3" y="4" width="6" height="5" rx="1.5" /><rect x="15" y="15" width="6" height="5" rx="1.5" /><path d="M9 6.5h2.5a3 3 0 0 1 3 3v4a3 3 0 0 0 3 3H18" /></>,
   projects: <><path d="M3.5 7.5h6l1.7 2H20v8.7a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2V7.5Z" /><path d="M3.5 9.5V6a2 2 0 0 1 2-2h3l1.7 2h6.3a2 2 0 0 1 2 2v1.5" /></>,

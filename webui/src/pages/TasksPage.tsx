@@ -28,7 +28,7 @@ const modeMeta: Record<string, { label: string; tone: 'cyan' | 'violet' | 'neutr
   intent: { label: '意图', tone: 'violet', hint: '自然语言规划' },
   demo: { label: '演示', tone: 'neutral', hint: '内置演示闭环' },
   regression: { label: '回归', tone: 'warn', hint: '复用沉淀库' },
-  workflow: { label: '流程', tone: 'violet', hint: '发布版本 wid@rev' },
+  workflow: { label: '发布任务', tone: 'violet', hint: '发布版本 wid@rev' },
 }
 
 export function TasksPage() {
@@ -38,7 +38,7 @@ export function TasksPage() {
   const includeArchived = route.query.get('include_archived') === '1'
   const tasksQuery = useQuery({ queryKey: ['tasks', includeArchived], queryFn: () => api.tasks(includeArchived) })
   const scenariosQuery = useQuery({ queryKey: ['scenarios'], queryFn: api.scenarios, staleTime: 60_000 })
-  const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: studioApi.listDrafts, staleTime: 15_000 })
+  const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: () => studioApi.listDrafts(), staleTime: 15_000 })
   const [search, setSearch] = useState('')
   const [modeFilter, setModeFilter] = useState('all')
   const [editorOpen, setEditorOpen] = useState(false)
@@ -127,7 +127,7 @@ export function TasksPage() {
       if (!form.name.trim()) throw new Error('请填写任务名称')
       if (form.mode === 'scenario' && !form.scenario) throw new Error('请选择场景文件')
       if (form.mode === 'intent' && !form.intent.trim()) throw new Error('请填写意图')
-      if (form.mode === 'workflow' && !form.workflow_ref.trim()) throw new Error('请选择已发布流程')
+      if (form.mode === 'workflow' && !form.workflow_ref.trim()) throw new Error('请选择已发布任务')
       const body: AnyRecord = {
         name: form.name.trim(),
         mode: form.mode,
@@ -145,7 +145,7 @@ export function TasksPage() {
       setEditorOpen(false)
       push(editing ? '任务已更新' : '任务已创建', 'ok')
       if (!editing) setDetail(task)
-      if (route.query.get('published')) navigate('/tasks', { replace: true })
+      if (route.query.get('published')) navigate('/tasks/config', { replace: true })
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
@@ -168,7 +168,7 @@ export function TasksPage() {
       setDetail(null)
       queryClient.invalidateQueries({ queryKey: ['tasks'] })
       push('任务已提交运行', 'ok')
-      navigate(withQuery('/tasks', { job: result.job_id }), { replace: true })
+      navigate(withQuery('/tasks/config', { job: result.job_id }), { replace: true })
     },
     onError: (error: Error) => push(error.message, 'error'),
   })
@@ -177,7 +177,7 @@ export function TasksPage() {
     if (!published || publishedHandled || !publishedWorkflows.length) return
     const target = publishedWorkflows.find((workflow) => workflow.published_ref === published)
     setEditing(null)
-    setForm({ name: target?.name ? `${target.name} 任务` : '发布流程任务', mode: 'workflow', scenario: '', intent: '', workflow_ref: published, regression: false, no_llm: false })
+    setForm({ name: target?.name ? `${target.name} 任务` : '发布任务', mode: 'workflow', scenario: '', intent: '', workflow_ref: published, regression: false, no_llm: false })
     setEnv({})
     setEditorOpen(true)
     setPublishedHandled(true)
@@ -185,19 +185,19 @@ export function TasksPage() {
 
   return (
     <div className="page tasks-page">
-      {published ? <div className="publish-success"><span className="publish-success-icon"><Icon name="git" size={20} /></span><div><strong>已发布流程 {published}</strong><p>创建一个任务绑定这个不可变版本，或到项目设置把它绑定为套件。</p></div><Button size="sm" variant="ghost" onClick={() => openCreate()}>换个方式新建</Button></div> : null}
+      {published ? <div className="publish-success"><span className="publish-success-icon"><Icon name="git" size={20} /></span><div><strong>已发布任务版本 {published}</strong><p>创建一个任务绑定这个不可变版本，或到项目设置把它绑定为套件。</p></div><Button size="sm" variant="ghost" onClick={() => openCreate()}>换个方式新建</Button></div> : null}
       <PageHeader
-        eyebrow={<><span className="live-dot" /> 六模块 · 活</>}
-        title="任务"
-        description="任务 = 已发布流程或可复用的运行入口。图只能在工坊出新版本，已发布任务不可就地改图。"
-        actions={<><Button variant="ghost" icon="spark" onClick={() => navigate('/studio/new')}>从工作台发布</Button><Button variant="primary" icon="plus" onClick={openCreate}>新建任务</Button></>}
+        eyebrow={<><span className="live-dot" /> 运行配置 · 可运行任务</>}
+        title="运行配置"
+        description="维护可运行任务：固定场景、自然语言意图或已发布任务版本。图只能在任务画布出新版本，已发布任务不可就地改图。"
+        actions={<><Button variant="ghost" icon="tasks" onClick={() => navigate('/tasks')}>任务列表</Button><Button variant="ghost" icon="spark" onClick={() => navigate('/studio/new')}>从任务画布发布</Button><Button variant="primary" icon="plus" onClick={openCreate}>新建任务</Button></>}
       />
 
       <div className="task-stats">
-        <div><span>任务总数</span><strong>{tasks.length}</strong><small>{tasks.filter((task) => task.workflow_ref).length} 个来自发布流程</small></div>
+        <div><span>任务总数</span><strong>{tasks.length}</strong><small>{tasks.filter((task) => task.workflow_ref).length} 个来自发布任务</small></div>
         <div><span>最近运行失败</span><strong className={tasks.some((task) => task.last_status === 'failed') ? 'bad' : 'ok'}>{tasks.filter((task) => task.last_status === 'failed').length}</strong><small>失败定义不等于报告失败</small></div>
         <div><span>固定场景</span><strong>{tasks.filter((task) => task.mode === 'scenario').length}</strong><small>可绑定项目 / 套件</small></div>
-        <div><span>流程任务</span><strong>{tasks.filter((task) => task.mode === 'workflow').length}</strong><small>绑定 wid@rev</small></div>
+        <div><span>发布任务</span><strong>{tasks.filter((task) => task.mode === 'workflow').length}</strong><small>绑定 wid@rev</small></div>
         {includeArchived ? <div><span>已归档</span><strong>{archivedCount}</strong><small>仅显示，不参与运行</small></div> : null}
       </div>
 
@@ -215,7 +215,7 @@ export function TasksPage() {
           const next = new URLSearchParams(route.query)
           if (includeArchived) next.delete('include_archived')
           else next.set('include_archived', '1')
-          navigate(withQuery('/tasks', next), { replace: true })
+          navigate(withQuery('/tasks/config', next), { replace: true })
         }} aria-pressed={includeArchived} data-testid="toggle-archived">
           <span className="toggle-track"><span /></span>
           显示已归档
@@ -228,7 +228,7 @@ export function TasksPage() {
 
       {!tasksQuery.isLoading && !filtered.length ? (
         <EmptyState icon="tasks" title={tasks.length ? '没有匹配的任务' : '还没有任务'} actions={<Button size="sm" variant="primary" icon="plus" onClick={openCreate}>新建任务</Button>}>
-          {tasks.length ? '换个关键词或模式筛选。' : '从工作台发布流程，或创建固定场景任务。'}
+          {tasks.length ? '换个关键词或模式筛选。' : '从任务画布发布任务，或创建固定场景任务。'}
         </EmptyState>
       ) : null}
 
@@ -260,7 +260,7 @@ export function TasksPage() {
                 </div>
                 <div className="task-last">
                   {task.last_run_id ? (
-                    <a href={href(task.workflow_ref ? `/tasks?focus=${task.task_id}` : `/history?focus=${task.last_run_id}`)} className="task-last-link">
+                    <a href={href(task.workflow_ref ? `/tasks/config?focus=${task.task_id}` : `/history?focus=${task.last_run_id}`)} className="task-last-link">
                       <StatusBadge status={task.last_status || 'done'} />
                       <span>{task.last_status === 'failed' ? '最近失败' : task.last_status === 'passed' || task.last_status === 'done' ? '最近成功' : statusLabel(task.last_status)}</span>
                     </a>
@@ -293,7 +293,7 @@ export function TasksPage() {
             actions={
               <>
                 {jobQuery.data ? <StatusBadge status={jobQuery.data.status} /> : null}
-                <Button size="sm" variant="ghost" icon="close" onClick={() => { setActiveJob(''); navigate('/tasks', { replace: true }) }}>关闭</Button>
+                <Button size="sm" variant="ghost" icon="close" onClick={() => { setActiveJob(''); navigate('/tasks/config', { replace: true }) }}>关闭</Button>
               </>
             }
           />
@@ -320,7 +320,7 @@ export function TasksPage() {
         open={editorOpen}
         onClose={() => setEditorOpen(false)}
         title={editing ? '编辑任务' : '新建任务'}
-        subtitle="已发布流程的图不可在此修改；本表单只维护运行入口与环境。"
+        subtitle="已发布任务的图不可在此修改；本表单只维护运行入口与环境。"
         size="lg"
         footer={<><Button variant="ghost" onClick={() => setEditorOpen(false)}>取消</Button><Button variant="primary" loading={save.isPending} onClick={() => save.mutate()}>{editing ? '保存任务' : '创建任务'}</Button></>}
       >
@@ -331,7 +331,7 @@ export function TasksPage() {
             <option value="intent">意图（自然语言）</option>
             <option value="demo">演示</option>
             <option value="regression">回归</option>
-            <option value="workflow">已发布流程</option>
+            <option value="workflow">已发布任务</option>
           </Select>
         </Field>
         {form.mode === 'scenario' ? (
@@ -348,7 +348,7 @@ export function TasksPage() {
           <Field label="意图"><textarea className="textarea" rows={4} value={form.intent} onChange={(event) => setForm({ ...form, intent: event.target.value })} placeholder="用一句自然语言描述要验证什么" /></Field>
         ) : null}
         {form.mode === 'workflow' ? (
-          <Field label="已发布流程" hint="只执行发布时的不可变版本；图变更需回工作台出新版本。">
+          <Field label="已发布任务" hint="只执行发布时的不可变版本；图变更需回任务画布出新版本。">
             {publishedWorkflows.length ? (
               <Select value={form.workflow_ref} onChange={(event) => setForm({ ...form, workflow_ref: event.target.value })}>
                 <option value="">选择发布版本</option>

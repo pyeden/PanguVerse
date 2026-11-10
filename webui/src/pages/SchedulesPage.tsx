@@ -264,7 +264,7 @@ export function SchedulesPage() {
       <PageHeader
         eyebrow={<><span className="live-dot" /> 自动 · 调度</>}
         title="调度"
-        description="让流程按 cron、固定间隔或 webhook 自己跑起来。重叠触发会被跳过，不会堆叠 batch。"
+        description="让任务按 cron、固定间隔或 webhook 自己跑起来。重叠触发会被跳过，不会堆叠 batch。"
         actions={
           <>
             <Button variant="ghost" icon="refresh" onClick={() => queryClient.invalidateQueries({ queryKey: ['schedules'] })}>刷新</Button>

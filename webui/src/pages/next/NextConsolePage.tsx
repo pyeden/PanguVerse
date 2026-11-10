@@ -196,17 +196,17 @@ export function NextConsolePage() {
         id: 'real-plan',
         at: '刚刚',
         kind: 'success',
-        text: `AI 已生成真实流程 ${result.wid} · ${result.steps.length} 步；下一步在工作台调试或上线。`,
+        text: `AI 已生成真实任务 ${result.wid} · ${result.steps.length} 步；下一步在工作台调试或上线。`,
       }])
       setNeeds(NX_INITIAL_NEEDS)
       setResult({
         ...NX_INITIAL_RESULT,
-        title: '真实流程已生成',
-        summary: `AI 已拆解为 ${result.steps.length} 步，等待在工作台调试或上线。`,
+        title: '真实任务已生成',
+        summary: `AI 已把目标拆解为 ${result.steps.length} 步任务，等待在工作台调试或上线。`,
         evidence: [`workflow ${result.wid}`, `${result.steps.length} 个节点`, '真实规划'],
         artifacts: [],
       })
-      push('AI 已生成真实流程草稿', 'ok')
+      push('AI 已生成真实任务草稿', 'ok')
     } catch (error) {
       startMock(text)
       push(`真实规划失败，已切回演示数据：${(error as Error).message}`, 'warn')
@@ -268,7 +268,7 @@ export function NextConsolePage() {
       setResult({
         ...NX_INITIAL_RESULT,
         title: '内置演示完成',
-        summary: '本地 mock API 全流程通过；可以打开真实运行详情查看报告与证据。',
+        summary: '本地 mock API 全链路通过；可以打开真实运行详情查看报告与证据。',
         evidence: [`run ${job.run_id || '—'}`, `${job.phases?.length || 0} 个阶段`, '真实执行'],
         artifacts: [],
       })
@@ -367,12 +367,13 @@ export function NextConsolePage() {
   return (
     <div className="page nx-page">
       <PageHeader
-        eyebrow={<><span className="live-dot" /> AI 控制台 · 默认 AI 执行</>}
-        title={<>说出目标，<span className="text-gradient">AI 开始干活</span></>}
-        description="不用配置项目、套件或模式。AI 负责拆解、执行、观察与自修；你只在缺密钥、权限和风险点出现。"
+        eyebrow={<><span className="live-dot" /> 新建任务 · AI 控制台</>}
+        title="新建任务"
+        description="一句话说明目标；不用配置项目、套件或模式。AI 负责拆解、执行、观察与自修，你只在缺密钥、权限和风险点出现。"
         actions={
           <>
             {demoRunId ? <Badge tone="ok">真实运行 · {demoRunId}</Badge> : realWid ? <Badge tone="ok">真实草稿 · {realWid}</Badge> : <Badge tone="warn">尚未运行 · 可先跑内置演示</Badge>}
+            <Button variant="ghost" size="sm" icon="tasks" onClick={() => navigate('/tasks')}>查看全部任务</Button>
             <Button variant="ghost" size="sm" icon="flow" onClick={() => navigate('/next/workbench/wf-console/node-extract-prices')}>节点工作台</Button>
           </>
         }
@@ -432,19 +433,22 @@ export function NextConsolePage() {
       </section>
 
       {realWid ? (
-        <section className="panel nx-real-banner" aria-label="真实流程草稿">
+        <section className="panel nx-real-banner" aria-label="真实任务草稿">
           <div>
-            <strong>AI 已生成真实流程</strong>
+            <strong>AI 已生成真实任务</strong>
             <span>{realWid} · {plan.length} 个节点 · {planSource === 'llm' ? 'LLM 拆解' : '规则/模板拆解'}</span>
           </div>
-          <Button
-            size="sm"
-            variant="primary"
-            icon="flow"
-            onClick={() => navigate(`/next/workbench/${realWid}/${plan[0]?.id || ''}`)}
-          >
-            打开节点工作台
-          </Button>
+          <div className="nx-real-actions">
+            <Button size="sm" variant="ghost" icon="tasks" onClick={() => navigate('/tasks')}>查看全部任务</Button>
+            <Button
+              size="sm"
+              variant="primary"
+              icon="flow"
+              onClick={() => navigate(`/next/workbench/${realWid}/${plan[0]?.id || ''}`)}
+            >
+              打开节点工作台
+            </Button>
+          </div>
         </section>
       ) : null}
 

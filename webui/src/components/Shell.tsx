@@ -8,8 +8,8 @@ import { Icon, type IconName } from './Icon'
 import { Badge, IconButton, StatusBadge } from './ui'
 
 const navItems: { id: string; label: string; href: string; icon: IconName; hint?: string }[] = [
-  { id: 'home', label: '首页', href: '/next/console', icon: 'spark', hint: 'AI' },
-  { id: 'flows', label: '流程', href: '/flows', icon: 'flow', hint: '管' },
+  { id: 'home', label: '首页', href: '/overview', icon: 'home', hint: '览' },
+  { id: 'tasks', label: '任务', href: '/tasks', icon: 'tasks', hint: '管' },
   { id: 'runs', label: '运行', href: '/runs', icon: 'play', hint: '跑' },
   { id: 'assets', label: '资产', href: '/atoms', icon: 'atoms', hint: '料' },
   { id: 'settings', label: '设置', href: '/settings', icon: 'settings', hint: '配' },
@@ -20,9 +20,9 @@ function isCanvasRoute(route: Route): boolean {
 }
 
 function navActive(route: Route): string {
-  const first = route.parts[0] || 'next'
-  if (first === 'next' || first === 'projects') return 'home'
-  if (first === 'flows' || first === 'studio' || first === 'tasks' || first === 'schedules' || first === 'explore') return 'flows'
+  const first = route.parts[0] || 'overview'
+  if (first === 'overview' || first === 'projects') return 'home'
+  if (first === 'next' || first === 'flows' || first === 'studio' || first === 'tasks' || first === 'schedules' || first === 'explore') return 'tasks'
   if (first === 'runs' || first === 'executions' || first === 'history' || first === 'reports' || first === 'artifacts' || first === 'p') return 'runs'
   if (first === 'atoms' || first === 'packs' || first === 'platform') return 'assets'
   if (first === 'settings') return 'settings'
@@ -30,26 +30,29 @@ function navActive(route: Route): string {
 }
 
 function crumbs(route: Route, projects: Project[]): { label: string; href?: string }[] {
-  const first = route.parts[0] || 'next'
+  const first = route.parts[0] || 'overview'
+  if (first === 'overview') return [{ label: '概览' }]
   if (first === 'next') {
-    return [{ label: '首页' }, ...(route.parts[1] === 'workbench' ? [{ label: '节点工作台' }] : [])]
+    return [{ label: '任务', href: '/tasks' }, ...(route.parts[1] === 'workbench' ? [{ label: '节点工作台' }] : [{ label: '新建任务' }])]
   }
   if (first === 'runs') return [{ label: '运行' }, ...(route.parts[1] ? [{ label: '运行详情' }] : [])]
-  if (first === 'flows') return [{ label: '流程' }]
+  if (first === 'flows' || first === 'tasks') {
+    if (route.parts[1] === 'config') return [{ label: '任务', href: '/tasks' }, { label: '运行配置' }]
+    return [{ label: '任务' }]
+  }
   if (first === 'settings') return [{ label: '设置' }]
   if (first === 'atoms') return [{ label: '资产' }, { label: '原子库' }]
   if (first === 'packs') return [{ label: '资产' }, { label: '领域包' }]
   if (first === 'executions' || first === 'history') return [{ label: '运行' }]
   if (first === 'reports') return [{ label: '运行' }, { label: '报告' }]
   if (first === 'artifacts') return [{ label: '运行' }, { label: '产出物' }]
-  if (first === 'tasks') return [{ label: '流程' }, { label: '任务' }]
-  if (first === 'schedules') return [{ label: '流程' }, { label: '调度' }]
-  if (first === 'projects') return [{ label: '首页' }, { label: '项目' }]
+  if (first === 'schedules') return [{ label: '任务', href: '/tasks' }, { label: '调度' }]
+  if (first === 'projects') return [{ label: '首页', href: '/overview' }, { label: '项目' }]
   if (first === 'studio') {
-    if (route.parts[1] === 'new') return [{ label: '流程' }, { label: '新建流程' }]
-    if (route.parts[1] === 'explore') return [{ label: '流程', href: '/studio/new' }, { label: '探索' }, ...(route.parts[2] ? [{ label: '回看' }] : [])]
-    if (route.parts[2] === 'review') return [{ label: '流程', href: '/studio/new' }, { label: '画布', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
-    return [{ label: '流程', href: '/studio/new' }, { label: '画布' }]
+    if (route.parts[1] === 'new') return [{ label: '任务', href: '/tasks' }, { label: '新建任务' }]
+    if (route.parts[1] === 'explore') return [{ label: '任务', href: '/tasks' }, { label: '探索' }, ...(route.parts[2] ? [{ label: '回看' }] : [])]
+    if (route.parts[2] === 'review') return [{ label: '任务', href: '/tasks' }, { label: '画布', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
+    return [{ label: '任务', href: '/tasks' }, { label: '画布' }]
   }
   if (first === 'p') {
     const pid = route.parts[1]
@@ -109,7 +112,7 @@ export function Shell({
       {mobileOpen ? <button className="sidebar-scrim" aria-label="关闭导航" onClick={() => setMobileOpen(false)} /> : null}
       <aside className={`sidebar ${mobileOpen ? 'is-open' : ''}`} aria-label="主导航">
         <div className="brand-row">
-          <a className="brand" href={href('/projects')} aria-label="PanguVerse 首页">
+          <a className="brand" href={href('/overview')} aria-label="PanguVerse 首页">
             <span className="brand-mark" aria-hidden="true">
               <svg viewBox="0 0 32 32"><path d="M7 25 16 5l9 20z" /><path d="M11.4 19.5h9.2" /></svg>
             </span>
@@ -124,7 +127,7 @@ export function Shell({
         <button className="create-flow" type="button" onClick={() => navigate('/next/console')}>
           <span className="create-flow-icon"><Icon name="plus" size={17} /></span>
           <span>
-            <strong>新建流程</strong>
+            <strong>新建任务</strong>
             <small>从一句话开始</small>
           </span>
           <span className="key-hint">N</span>
@@ -210,7 +213,7 @@ export function Shell({
               <span className={`model-dot ${status?.llm_enabled ? 'on' : ''}`} />
               {status?.llm_enabled ? 'AI 在线' : '规则模式'}
             </span>
-            <a href={href('/next/console')} className="topbar-create"><Icon name="spark" size={15} />新建流程</a>
+            <a href={href('/next/console')} className="topbar-create"><Icon name="spark" size={15} />新建任务</a>
           </div>
         </header>
         <main id="main-content" className={`content ${isCanvasRoute(route) ? 'content-canvas' : ''}`} tabIndex={-1}>

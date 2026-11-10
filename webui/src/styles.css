@@ -2531,3 +2531,46 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .run-detail-page[data-tab="artifacts"] .run-only-steps,
 .run-detail-page[data-tab="artifacts"] .run-only-evidence,
 .run-detail-page[data-tab="artifacts"] .run-only-report { display: none !important; }
+
+/* ── 概览首页：KPI / 待处理 / 最近运行 / 快捷入口 ───────────────────── */
+.overview-grid { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); gap: 12px; align-items: start; }
+.overview-grid > .panel { min-width: 0; }
+.overview-list { display: flex; flex-direction: column; gap: 6px; }
+.overview-row { display: flex; align-items: center; gap: 10px; padding: 10px 11px; border: 1px solid var(--line); border-radius: 10px; background: linear-gradient(150deg, rgba(17, 26, 43, .45), rgba(10, 16, 27, .5)); color: inherit; text-decoration: none; min-width: 0; }
+.overview-row:hover { border-color: var(--line-strong); background: linear-gradient(150deg, rgba(20, 31, 51, .6), rgba(11, 18, 30, .6)); }
+.overview-row-main { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.overview-row-title { font-size: 11.5px; font-weight: 620; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.overview-row-meta { color: var(--dim); font-size: 9px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.overview-row-side { flex: 0 0 auto; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; max-width: 42%; }
+.overview-row-time { color: var(--dim); font-size: 8.5px; white-space: nowrap; }
+.overview-quick-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+.overview-quick { display: flex; align-items: center; gap: 11px; padding: 13px; border: 1px solid var(--line); border-radius: 12px; background: linear-gradient(150deg, rgba(17, 26, 43, .5), rgba(10, 16, 27, .55)); color: inherit; text-decoration: none; min-width: 0; transition: border-color .15s ease, transform .15s ease; }
+.overview-quick:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.overview-quick.is-primary { border-color: rgba(94, 234, 212, .24); background: linear-gradient(150deg, rgba(94, 234, 212, .08), rgba(146, 133, 255, .05)); }
+.overview-quick > span:nth-child(2) { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1; }
+.overview-quick strong { font-size: 11.5px; }
+.overview-quick small { color: var(--dim); font-size: 9px; line-height: 1.45; }
+.overview-quick-icon { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 9px; background: rgba(94, 234, 212, .08); color: var(--cyan); }
+.overview-quick-arrow { flex: 0 0 auto; color: var(--dim); }
+.overview-quick:hover .overview-quick-arrow { color: var(--cyan); }
+
+.task-name-link { color: var(--text); font-size: 11.5px; font-weight: 640; text-decoration: none; }
+.task-name-link:hover { text-decoration: underline; text-underline-offset: 3px; }
+.workflow-card .task-copy { flex: 1 1 auto; }
+.nx-real-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: 0 0 auto; }
+
+@media (max-width: 900px) {
+  .overview-grid { grid-template-columns: minmax(0, 1fr); }
+  .overview-quick-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .overview-row-side { max-width: 46%; }
+}
+
+@media (max-width: 640px) {
+  .overview-quick-grid { grid-template-columns: minmax(0, 1fr); }
+  .overview-row { align-items: flex-start; flex-wrap: wrap; padding: 9px 10px; }
+  .overview-row-side { width: 100%; max-width: none; flex-direction: row; align-items: center; justify-content: flex-start; padding-left: 44px; }
+  .overview-row-main { flex-basis: calc(100% - 44px); }
+  .overview-quick { padding: 11px; }
+  .nx-real-actions { width: 100%; }
+  .nx-real-actions .btn { flex: 1; }
+}

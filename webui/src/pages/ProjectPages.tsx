@@ -172,7 +172,7 @@ export function ProjectOverviewPage() {
       <section className="panel">
         <SectionHeader
           title="套件与绑定"
-          description="套件决定运行目标；流程发布后在任务模块绑定到项目环境。"
+          description="套件决定运行目标；任务发布后在运行配置中绑定到项目环境。"
           icon="layers"
           actions={<Button size="sm" variant="ghost" icon="plus" onClick={() => navigate(`/p/${pid}/settings`)}>管理套件</Button>}
         />
@@ -203,7 +203,7 @@ export function ProjectOverviewPage() {
       </section>
 
       <section className="panel">
-        <SectionHeader title="流程绑定" description="项目套件可以直接绑定已发布流程；执行只读发布版本。" icon="git" actions={<Button size="sm" variant="ghost" icon="settings" onClick={() => navigate(`/p/${pid}/settings`)}>绑定流程</Button>} />
+        <SectionHeader title="任务绑定" description="项目套件可以直接绑定已发布任务；执行只读发布版本。" icon="git" actions={<Button size="sm" variant="ghost" icon="settings" onClick={() => navigate(`/p/${pid}/settings`)}>绑定任务</Button>} />
         {workflowSuites.length ? (
           <div className="workflow-binding-list">
             {workflowSuites.map((suite) => (
@@ -225,8 +225,8 @@ export function ProjectOverviewPage() {
               <span className="binding-node"><Icon name="play" size={16} /></span>
             </div>
             <div>
-              <strong>把发布流程绑定为项目套件</strong>
-              <p>在项目设置中新增套件时选择「已发布流程」，无需场景文件；报告会携带 <code>workflow_ref</code> 回溯到发布版本。</p>
+              <strong>把发布任务绑定为项目套件</strong>
+              <p>在项目设置中新增套件时选择「已发布任务」，无需场景文件；报告会携带 <code>workflow_ref</code> 回溯到发布版本。</p>
             </div>
             <Button variant="ghost" size="sm" icon="plus" onClick={() => navigate(`/p/${pid}/settings`)}>去绑定</Button>
           </div>
@@ -640,7 +640,7 @@ export function ProjectSettingsPage() {
   const { push } = useToast()
   const projectQuery = useQuery({ queryKey: ['project', pid], queryFn: () => api.project(pid), enabled: !!pid })
   const scenariosQuery = useQuery({ queryKey: ['scenarios'], queryFn: api.scenarios, staleTime: 60_000 })
-  const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: studioApi.listDrafts, staleTime: 15_000 })
+  const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: () => studioApi.listDrafts(), staleTime: 15_000 })
   const [name, setName] = useState('')
   const [baseUrl, setBaseUrl] = useState('')
   const [env, setEnv] = useState<AnyRecord>({})
@@ -680,7 +680,7 @@ export function ProjectSettingsPage() {
     mutationFn: async () => {
       if (!suiteName.trim()) throw new Error('请填写套件名称')
       if (suiteSource === 'scenario' && !suiteScenario) throw new Error('请选择场景文件')
-      if (suiteSource === 'workflow' && !suiteWorkflow) throw new Error('请选择已发布流程')
+      if (suiteSource === 'workflow' && !suiteWorkflow) throw new Error('请选择已发布任务')
       const tags = suiteTags.split(/[,，\s]+/).map((item) => item.trim()).filter(Boolean)
       const body = { name: suiteName.trim(), ...(suiteSource === 'scenario' ? { scenario: suiteScenario } : { workflow_ref: suiteWorkflow }), tags, ...(Object.keys(suiteEnv).length ? { env: suiteEnv } : {}) }
       if (editingSuite) return api.updateSuite(pid, editingSuite.suite_id, body)
@@ -778,7 +778,7 @@ export function ProjectSettingsPage() {
       <section className="panel">
         <SectionHeader
           title="套件"
-          description={`${project.suites?.length || 0} 个套件绑定到本项目；每个套件对应场景文件或已发布流程。`}
+          description={`${project.suites?.length || 0} 个套件绑定到本项目；每个套件对应场景文件或已发布任务。`}
           icon="layers"
           actions={<Button size="sm" variant="primary" icon="plus" onClick={openAddSuite}>添加套件</Button>}
         />
@@ -802,7 +802,7 @@ export function ProjectSettingsPage() {
           </div>
         ) : (
           <EmptyState icon="layers" title="还没有套件" actions={<Button size="sm" variant="primary" icon="plus" onClick={openAddSuite}>添加第一个套件</Button>}>
-            套件把项目环境与场景文件或已发布流程绑定，是批量运行的执行单元。
+            套件把项目环境与场景文件或已发布任务绑定，是批量运行的执行单元。
           </EmptyState>
         )}
       </section>
@@ -823,7 +823,7 @@ export function ProjectSettingsPage() {
         <Field label="执行目标">
           <div className="segmented" style={{ alignSelf: 'flex-start' }}>
             <button type="button" className={suiteSource === 'scenario' ? 'is-active' : ''} onClick={() => setSuiteSource('scenario')}>场景文件</button>
-            <button type="button" className={suiteSource === 'workflow' ? 'is-active' : ''} onClick={() => setSuiteSource('workflow')}>已发布流程</button>
+            <button type="button" className={suiteSource === 'workflow' ? 'is-active' : ''} onClick={() => setSuiteSource('workflow')}>已发布任务</button>
           </div>
         </Field>
         {suiteSource === 'scenario' ? (
@@ -841,7 +841,7 @@ export function ProjectSettingsPage() {
           <Field label="发布版本" hint="只执行不可变版本；图变更需回工作台出新版本并重新绑定。">
             {publishedWorkflows.length ? (
               <Select value={suiteWorkflow} onChange={(event) => setSuiteWorkflow(event.target.value)}>
-                <option value="">选择发布流程</option>
+                <option value="">选择发布任务</option>
                 {publishedWorkflows.map((workflow) => <option key={workflow.published_ref} value={workflow.published_ref}>{workflow.name || workflow.wid} · {workflow.published_ref}</option>)}
               </Select>
             ) : <input className="input mono" value={suiteWorkflow} onChange={(event) => setSuiteWorkflow(event.target.value)} placeholder="w-xxxxxxxx@0" />}

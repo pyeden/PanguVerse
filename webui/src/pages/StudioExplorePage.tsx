@@ -577,7 +577,7 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
       <PageHeader
         eyebrow={<><span className="live-dot" /> 工作台 · 先跑通再固化</>}
         title={<>探索模式：<span className="text-gradient">让 AI 真的跑一遍</span></>}
-        description="AI 在沙箱里调用原子或写脚本，直到确定性校验通过；成功轨迹再固化为可重放的流程。LLM 自述不算成功。"
+        description="AI 在沙箱里调用原子或写脚本，直到确定性校验通过；成功轨迹再固化为可重放的任务。LLM 自述不算成功。"
         actions={
           <>
             <Button size="sm" variant="ghost" icon="refresh" onClick={() => setHistoryTick((value) => value + 1)}>刷新历史</Button>
@@ -783,7 +783,7 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
                 onClick={crystallize}
                 data-testid="explore-crystallize"
               >
-                {crystallizing ? '正在固化…' : '固化为流程'}
+                {crystallizing ? '正在固化…' : '固化为任务'}
               </Button>
             ) : (
               <span className="explore-runhead-hint">
@@ -1097,7 +1097,7 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
           {crystallizeResult ? (
             <section className="panel explore-crystallize-result" data-testid="explore-crystallize-result">
               <div className="explore-col-head">
-                <div><h3>已固化为流程草稿</h3><span>参数来自真实调用值；重放不依赖 LLM。</span></div>
+                <div><h3>已固化为任务草稿</h3><span>参数来自真实调用值；重放不依赖 LLM。</span></div>
                 <Badge tone={crystallizeResult.replay?.status === 'passed' ? 'ok' : 'bad'}>
                   重放 {crystallizeResult.replay?.status === 'passed' ? '通过' : '未通过'}
                 </Badge>
@@ -1188,7 +1188,7 @@ export function StudioExplorePage({ eid: routeEid }: { eid?: string }) {
         {historyLoading ? <Loading label="读取历史探索…" /> : null}
         {historyError ? <div className="explore-history-error"><Icon name="warning" size={15} />{historyError}</div> : null}
         {!historyLoading && !historyError && !history.length ? (
-          <EmptyState icon="history" title="还没有探索记录">在上方启动第一次探索；跑通后即可固化为画布流程。</EmptyState>
+          <EmptyState icon="history" title="还没有探索记录">在上方启动第一次探索；跑通后即可固化为画布任务。</EmptyState>
         ) : (
           <div className="explore-history-list">
             {history.map((item) => (

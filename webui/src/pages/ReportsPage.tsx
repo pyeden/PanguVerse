@@ -355,7 +355,7 @@ export function ReportsPage() {
                 {selectedArtifactsSettled && !selectedDeliverables.length ? (
                   <div className="run-artifact-empty" data-testid="report-deliverables-empty">
                     <Icon name="archive" size={17} />
-                    <span>本流程没有声明任务产出</span>
+                    <span>本任务没有声明任务产出</span>
                   </div>
                 ) : null}
                 {selectedDeliverables.length ? (

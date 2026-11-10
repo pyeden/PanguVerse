@@ -148,7 +148,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
 
   const createTrigger = useMutation({
     mutationFn: () => {
-      if (!canCreate) throw new Error('流程尚未发布，无法创建触发器')
+      if (!canCreate) throw new Error('任务尚未发布，无法创建触发器')
       const body: WorkflowTriggerCreate = { workflow_ref: workflowRef, kind: createKind }
       if (createKind === 'schedule') {
         if (scheduleMode === 'cron') {
@@ -253,7 +253,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
             variant="ghost"
             icon="clock"
             disabled={!canCreate || unsupported}
-            title={!canCreate ? '流程发布后才能创建触发器' : unsupported ? '当前服务未启用触发器接口' : '创建定时触发器'}
+            title={!canCreate ? '任务发布后才能创建触发器' : unsupported ? '当前服务未启用触发器接口' : '创建定时触发器'}
             onClick={() => openCreate('schedule')}
           >创建定时</Button>
           <Button
@@ -261,7 +261,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
             variant="ghost"
             icon="link"
             disabled={!canCreate || unsupported}
-            title={!canCreate ? '流程发布后才能创建触发器' : unsupported ? '当前服务未启用触发器接口' : '创建 Webhook 触发器'}
+            title={!canCreate ? '任务发布后才能创建触发器' : unsupported ? '当前服务未启用触发器接口' : '创建 Webhook 触发器'}
             onClick={() => openCreate('webhook')}
           >创建 Webhook</Button>
         </>
@@ -273,7 +273,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
   const body = (
     <>
       {!canCreate && !unsupported ? (
-        <div className="trigger-hint"><Icon name="warning" size={13} />该流程尚未发布。发布后可创建定时或 Webhook 触发器。</div>
+        <div className="trigger-hint"><Icon name="warning" size={13} />该任务尚未发布。发布后可创建定时或 Webhook 触发器。</div>
       ) : null}
 
       {tokenReveal ? (
@@ -406,7 +406,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
         open={createOpen}
         onClose={() => { if (!createTrigger.isPending) setCreateOpen(false) }}
         title={createKind === 'webhook' ? '创建 Webhook 触发器' : '创建定时触发器'}
-        subtitle={workflowRef ? `绑定 ${workflowRef}` : '流程尚未发布'}
+        subtitle={workflowRef ? `绑定 ${workflowRef}` : '任务尚未发布'}
         size="md"
         footer={
           <>
@@ -526,7 +526,7 @@ export function WorkflowRunsPanel({ workflowRef = '', wid = '' }: { workflowRef?
         <SectionHeader title="最近运行" description="按发布版本过滤" icon="history" />
         <div className="trigger-empty">
           <Icon name="git" size={20} />
-          <strong>该流程尚未发布</strong>
+          <strong>该任务尚未发布</strong>
           <p>发布后产生的运行会按 workflow_ref 汇总在这里。</p>
           {wid ? <Button size="sm" variant="ghost" icon="git" onClick={() => navigate(`/studio/${wid}/review`)}>去发布</Button> : null}
         </div>

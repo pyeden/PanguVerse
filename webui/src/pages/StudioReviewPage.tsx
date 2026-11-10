@@ -173,8 +173,8 @@ export function StudioReviewPage({ wid }: { wid: string }) {
       ? `存在 ${blockingErrors.length} 个校验错误`
       : ''
 
-  if (workflowQuery.isLoading) return <div className="page"><Loading label="正在读取流程…" /></div>
-  if (workflowQuery.error || !workflow) return <div className="page"><ErrorState error={workflowQuery.error} onRetry={() => workflowQuery.refetch()} title="流程读取失败" /></div>
+  if (workflowQuery.isLoading) return <div className="page"><Loading label="正在读取任务…" /></div>
+  if (workflowQuery.error || !workflow) return <div className="page"><ErrorState error={workflowQuery.error} onRetry={() => workflowQuery.refetch()} title="任务读取失败" /></div>
 
   return (
     <div className="studio-page studio-review-page">
@@ -183,7 +183,7 @@ export function StudioReviewPage({ wid }: { wid: string }) {
           <a className="icon-btn" href={href(`/studio/${wid}`)} aria-label="返回画布"><Icon name="arrow" size={18} style={{ transform: 'rotate(180deg)' }} /></a>
           <div>
             <div className="eyebrow"><span className="live-dot" /> 审阅与发布 · {wid}</div>
-            <div className="review-title-line"><h1>{workflow.name || '未命名流程'}</h1><StatusBadge status={displayState} />{mock ? <Badge tone="warn">演示</Badge> : null}</div>
+            <div className="review-title-line"><h1>{workflow.name || '未命名任务'}</h1><StatusBadge status={displayState} />{mock ? <Badge tone="warn">演示</Badge> : null}</div>
             <p className="review-sub">{workflow.intent || '未记录意图'} · 比较 rev {baseRev} → rev {reviewedRev}</p>
           </div>
         </div>
@@ -212,7 +212,7 @@ export function StudioReviewPage({ wid }: { wid: string }) {
         <>
           <div className="publish-success">
             <span className="publish-success-icon"><Icon name="check" size={22} /></span>
-            <div><strong>流程已发布为 {publishedRef}</strong><p>版本不可变。可立即运行，或创建触发器后无需离开本页管理；报告会携带该 workflow_ref 回溯到本次审阅。</p></div>
+            <div><strong>任务已发布为 {publishedRef}</strong><p>版本不可变。可立即运行，或创建触发器后无需离开本页管理；报告会携带该 workflow_ref 回溯到本次审阅。</p></div>
             <Button size="sm" variant="ghost" icon="tasks" onClick={() => navigate(`/tasks?published=${encodeURIComponent(publishedRef)}`)}>去任务</Button>
           </div>
           <div className="publish-next" data-testid="publish-next-actions">
@@ -394,14 +394,14 @@ export function StudioReviewPage({ wid }: { wid: string }) {
         </section>
 
         <section className="panel publish-panel">
-          <SectionHeader title="发布为流程" description="P0 只发布为流程；封存为原子在 P1。" icon="git" />
+          <SectionHeader title="发布为任务" description="P0 只发布为任务；封存为原子在 P1。" icon="git" />
           <div className="publish-state">
             <span>目标版本</span><strong className="mono">{wid}@{reviewedRev}</strong>
           </div>
           <Field label="版本说明" hint="不可为空；会写入新版本的审计与任务元信息。">
             <textarea className="textarea" rows={3} value={message} onChange={(event) => setMessage(event.target.value)} placeholder="例如：补充订单断言与超时保护，批准上线。" />
           </Field>
-          <Button variant="primary" size="lg" icon="git" className="full-width" disabled={!!publishGate} title={publishGate || '发布'} loading={publish.isPending} onClick={() => publish.mutate()}>发布流程 @{reviewedRev}</Button>
+          <Button variant="primary" size="lg" icon="git" className="full-width" disabled={!!publishGate} title={publishGate || '发布'} loading={publish.isPending} onClick={() => publish.mutate()}>发布任务 @{reviewedRev}</Button>
           {publishGate ? <p className="gate-hint center">{publishGate}</p> : <p className="publish-ready"><Icon name="shield" size={13} />门禁通过，发布后版本不可变</p>}
         </section>
       </div>

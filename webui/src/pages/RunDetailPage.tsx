@@ -344,14 +344,14 @@ export function RunDetailPage() {
                 <div className="run-artifact-group-head">
                   <div>
                     <strong><Icon name="archive" size={14} />任务产出</strong>
-                    <p>跑出了什么 · 本次流程声明的交付文件</p>
+                    <p>跑出了什么 · 本次任务声明的交付文件</p>
                   </div>
                   <Badge tone="cyan">{taskOutputs.length} 项</Badge>
                 </div>
                 {artifactsSettled && !taskOutputs.length ? (
                   <div className="run-artifact-empty" data-testid="run-task-outputs-empty">
                     <Icon name="archive" size={18} />
-                    <span>本流程没有声明任务产出</span>
+                    <span>本任务没有声明任务产出</span>
                   </div>
                 ) : null}
                 {taskOutputs.length ? (

@@ -61,7 +61,7 @@ export function StudioNewPage() {
   } | null>(null)
   const atomsQuery = useQuery({ queryKey: ['atoms'], queryFn: api.atoms, staleTime: 60_000 })
   const packsQuery = useQuery({ queryKey: ['packs'], queryFn: api.packs, staleTime: 60_000 })
-  const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: studioApi.listDrafts })
+  const draftsQuery = useQuery({ queryKey: ['studio-drafts'], queryFn: () => studioApi.listDrafts() })
   const atoms = atomsQuery.data || []
   const packs = packsQuery.data || []
   const drafts = draftsQuery.data || []
@@ -138,7 +138,7 @@ export function StudioNewPage() {
     <div className="page studio-new-page">
       <PageHeader
         eyebrow={<><span className="live-dot" /> 工作台 · 意图识别</>}
-        title={<>一句话，生成<span className="text-gradient">可审阅的流程</span></>}
+        title={<>一句话，生成<span className="text-gradient">可审阅的任务</span></>}
         description="AI 只负责提议：拆解意图、选择原子、生成初稿。你可以在画布上改、锁、调试，再逐条审阅后发布。"
         actions={<a className="btn btn-ghost btn-sm" href={href('/atoms')}><Icon name="atoms" size={15} />查看能力清单</a>}
       />
@@ -148,9 +148,9 @@ export function StudioNewPage() {
           <span className="gap-panel-icon"><Icon name="warning" size={17} /></span>
           <div className="gap-panel-body">
             {planError.code === 'missing_inputs' ? (
-              <strong>没有生成流程：缺少输入（422）</strong>
+              <strong>没有生成任务：缺少输入（422）</strong>
             ) : (
-              <strong>没有生成流程：能力缺口（422 {planError.missing.length ? `· 缺少 ${planError.missing.length} 个原子` : ''}）</strong>
+              <strong>没有生成任务：能力缺口（422 {planError.missing.length ? `· 缺少 ${planError.missing.length} 个原子` : ''}）</strong>
             )}
             <p>{planError.message}</p>
             {planError.missingInputs.length ? (
@@ -174,7 +174,7 @@ export function StudioNewPage() {
       {mock ? (
         <div className="demo-banner">
           <span className="demo-icon"><Icon name="terminal" size={16} /></span>
-          <div><strong>Studio 演示模式</strong><p><code>/api/studio/*</code> 尚未就绪，当前流程保存在浏览器本地，用来验证交互与门禁。后端就绪后刷新页面会自动切回真实接口。</p></div>
+          <div><strong>Studio 演示模式</strong><p><code>/api/studio/*</code> 尚未就绪，当前任务保存在浏览器本地，用来验证交互与门禁。后端就绪后刷新页面会自动切回真实接口。</p></div>
           <Badge tone="warn">未联调</Badge>
         </div>
       ) : null}
@@ -238,7 +238,7 @@ export function StudioNewPage() {
               <span>调试只使用项目已配置环境；发布前必须经过审阅与风险确认。</span>
             </div>
             <Button variant="primary" size="lg" icon="spark" loading={create.isPending} onClick={submit} disabled={!intent.trim()}>
-              {create.isPending ? '正在生成初稿…' : '生成流程初稿'}
+              {create.isPending ? '正在生成初稿…' : '生成任务初稿'}
             </Button>
           </div>
         </section>
@@ -282,15 +282,15 @@ export function StudioNewPage() {
 
       <section className="draft-section">
         <SectionHeader
-          title="最近流程"
+          title="最近任务"
           description="草案、待审、已发布都保留在本地 Studio 目录；新版本不覆盖旧 rev。"
           icon="history"
           actions={<Button size="sm" variant="ghost" icon="refresh" onClick={() => draftsQuery.refetch()}>刷新</Button>}
         />
-        {draftsQuery.isLoading ? <Loading label="读取流程…" /> : null}
+        {draftsQuery.isLoading ? <Loading label="读取任务…" /> : null}
         {draftsQuery.error ? <ErrorState error={draftsQuery.error} onRetry={() => draftsQuery.refetch()} /> : null}
         {!draftsQuery.isLoading && !draftsQuery.error && !drafts.length ? (
-          <EmptyState icon="flow" title="还没有流程">填写上面的意图，生成第一个可审阅初稿。</EmptyState>
+          <EmptyState icon="flow" title="还没有任务">填写上面的意图，生成第一个可审阅初稿。</EmptyState>
         ) : (
           <div className="draft-grid">
             {drafts.map((workflow) => <DraftCard key={workflow.wid} workflow={workflow} />)}
