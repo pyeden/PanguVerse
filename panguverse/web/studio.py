@@ -910,6 +910,8 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
     graph = graph_from_plan(plan, origin="ai")
     for node in graph["nodes"]:
         _helper_node(node)
+    # LLM 可能把意图说明拼进 URL；落库前先裁成纯 URL，避免运行期编码错误
+    param_fill.sanitize_url_params(graph["nodes"], registry)
 
     # 生成阶段就做一次「参数可用性」审计：显式 URL / 站点别名解析出的 URL
     # 按原子输入端口自动填入所有带 url 的必填端口，不针对具体原子写特判。
@@ -2222,6 +2224,7 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
         origin="ai",
         locked=[str(node.get("id")) for node in revision.get("nodes") or [] if node.get("locked")],
     )
+    param_fill.sanitize_url_params(proposed["nodes"], _registry())
     autofilled: list[dict[str, Any]] = []
     if guard.url and str(guard.domain or "") in _WEB_DOMAINS:
         autofilled = param_fill.fill_url_params(

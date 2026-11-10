@@ -32,6 +32,59 @@ HTTP_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 _MISSING = object()
 
 
+#: URL 里不该出现的字符：空白与 CJK 文本（多半是意图说明被拼进了 URL）
+_URL_STOP_RE = re.compile(r"[\s\u3000-\u303f\u4e00-\u9fff\uff00-\uffef]")
+
+
+def sanitize_url(value: Any) -> str:
+    """把「URL + 意图说明」裁成纯 URL。
+
+    LLM 偶尔会把整句意图拼进 url 端口（``https://www.bing.com/网站提取今天热点``），
+    直接用会让 HTTP 客户端在非 ASCII 字符上抛编码错误。这里按第一个空白/CJK 字符截断，
+    只对 http(s) 字面量生效，不影响正常的路径与查询串。
+    """
+    if not isinstance(value, str):
+        return ""
+    text = value.strip()
+    if not HTTP_URL_RE.match(text):
+        return text
+    match = _URL_STOP_RE.search(text)
+    if match:
+        text = text[: match.start()]
+    return text.rstrip(" \t,，。;；")
+
+
+def sanitize_url_params(nodes: Iterable[dict[str, Any]], registry: Any) -> list[dict[str, Any]]:
+    """就地修正所有 URL 端口上的「URL + 说明」混合值，返回修正记录。"""
+    records: list[dict[str, Any]] = []
+    for node in nodes:
+        atom_name = str(node.get("atom") or "")
+        if not atom_name or not registry.has(atom_name):
+            continue
+        atom = registry.get(atom_name)
+        params = node.get("params")
+        if not isinstance(params, dict):
+            continue
+        for port in atom.input_ports():
+            if not is_url_port(port.name):
+                continue
+            current = params.get(port.name)
+            fixed = sanitize_url(current)
+            if isinstance(current, str) and fixed and fixed != current.strip():
+                params[port.name] = fixed
+                records.append(
+                    {
+                        "node_id": str(node.get("id") or ""),
+                        "atom": atom_name,
+                        "param": port.name,
+                        "previous": current,
+                        "value": fixed,
+                        "source": "sanitize",
+                    }
+                )
+    return records
+
+
 def is_url_port(name: str) -> bool:
     """端口名是否表示一个 URL 目标（数据驱动，不绑定具体原子）。"""
     return bool(URL_PORT_RE.search(str(name or "")))
@@ -84,7 +137,8 @@ def fill_url_params(
     记录形如 ``{node_id, atom, param, value, source, previous}``；``previous`` 只在
     覆盖了非空值时出现，便于前端解释「模板默认值被替换」。
     """
-    target = str(url or "").strip()
+    # 入口统一归一化：意图里解析出的「URL + 说明」同样要裁成纯 URL
+    target = sanitize_url(str(url or "").strip())
     if not target:
         return []
     records: list[dict[str, Any]] = []
