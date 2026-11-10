@@ -24,6 +24,8 @@ check_http = Atom(
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import inspect
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -31,6 +33,25 @@ from typing import Any
 
 from .context import RunContext
 from .contract import Effect, Port, ports_from, retry_safe
+
+
+def _resolve_output_dir(kwargs: dict[str, Any], ctx: RunContext) -> dict[str, Any]:
+    """把相对的 ``output_dir`` 落到本次运行的 workspace，而不是服务进程 cwd。
+
+    约定见 ``RunContext.output_dir``：一次 run 的产物应写到 run workspace，
+    否则断言（按 run workspace 解析相对路径）会找不到文件，多 run 也会互相覆盖。
+    """
+    value = kwargs.get("output_dir")
+    if not isinstance(value, str) or not value.strip():
+        return kwargs
+    candidate = Path(value).expanduser()
+    if candidate.is_absolute():
+        return kwargs
+    base = getattr(ctx, "output_dir", None)
+    if not base:
+        return kwargs
+    kwargs["output_dir"] = str((Path(str(base)).expanduser() / candidate).resolve())
+    return kwargs
 
 
 @dataclass
@@ -149,6 +170,7 @@ class Atom:
     def invoke(self, ctx: RunContext, inputs: Mapping[str, Any]) -> dict[str, Any]:
         """执行原子。``inputs`` 应已由引擎解析完模板。"""
         kwargs = self._normalize_inputs(inputs)
+        kwargs = _resolve_output_dir(kwargs, ctx)
         try:
             result = self.fn(ctx, **kwargs) if self.wants_ctx else self.fn(**kwargs)
         except TypeError as exc:  # 参数不匹配 → 计划有问题，属于 error

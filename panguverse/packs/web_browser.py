@@ -723,7 +723,8 @@ class WebBrowserSemantics(GenericSemantics):
     def planning_hints(self) -> tuple[str, ...]:
         return (
             "需要 JS 渲染后的页面用 web_open（Chrome 无头 --dump-dom）；纯服务端 HTML 可用 web_research.http_get_page",
-            "web_open.html 默认截断到 4000 字符；需要完整 DOM 时把 max_chars 调大",
+            "web_open.html 是渲染后的 DOM：内嵌 JSON/注释会被丢掉；给「解析原始 HTML」的原子传 source 时优先用 http_request/http_get_page 的原始文本",
+            "web_open.html 受 max_chars 限制（默认 4000 字符）；需要完整 DOM 时把 max_chars 调大",
             "链接用 web_extract_links(${open.html})，正文用 web_get_text(${open.html})",
             "动态内容用 web_wait_for_text 轮询；它的 timeout 明确失败且不可重试",
             "web_screenshot 的 path 相对 workspace 根（.panguverse/artifacts/web/…）",
