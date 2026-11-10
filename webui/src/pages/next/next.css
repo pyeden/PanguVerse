@@ -72,6 +72,19 @@
   box-shadow: 0 0 0 3px rgba(94, 234, 212, 0.08);
 }
 .nx-intent-hint { color: var(--dim); font-size: 9.5px; }
+.nx-intent-error {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #ffb1bb;
+  font-size: 10px;
+  line-height: 1.45;
+}
+.nx-intent-error svg { flex: 0 0 auto; }
+.nx-intent-box.has-error .nx-intent-input {
+  border-color: rgba(255, 113, 133, .52);
+  box-shadow: 0 0 0 3px rgba(255, 113, 133, .07);
+}
 .nx-intent-actions { display: flex; gap: 8px; flex-wrap: wrap; padding-bottom: 2px; }
 
 .nx-templates {
@@ -452,6 +465,10 @@
   .nx-flow-strip { grid-template-columns: 1fr 1fr; }
   .nx-contract-grid { grid-template-columns: 1fr; }
   .nx-debug-row { grid-template-columns: 58px 48px 38px minmax(0, 1fr); }
+}
+@media (max-width: 520px) {
+  .nx-real-banner { flex-direction: column; align-items: stretch; }
+  .nx-real-banner > .nx-real-actions { flex-direction: row; flex-wrap: wrap; }
 }
 @media (max-width: 420px) {
   .nx-plan-flow { grid-template-columns: 1fr; }

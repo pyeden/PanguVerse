@@ -47,13 +47,15 @@ export class ApiError extends Error {
   status: number
   code: string
   data?: AnyRecord
+  retryAfterSeconds?: number
 
-  constructor(message: string, status = 0, code = '', data?: AnyRecord) {
+  constructor(message: string, status = 0, code = '', data?: AnyRecord, retryAfterSeconds?: number) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
     this.data = data
+    this.retryAfterSeconds = retryAfterSeconds
   }
 }
 
@@ -114,7 +116,20 @@ export async function request<T>(path: string, options: RequestOptions = {}): Pr
       `请求失败（HTTP ${response.status}）`
     const code = (body?.error && typeof body.error === 'object' && body.error.code) || `http_${response.status}`
     const data = body && typeof body === 'object' ? body : undefined
-    throw new ApiError(String(message), response.status, String(code), data)
+    const errorBody = body?.error && typeof body.error === 'object' ? body.error as AnyRecord : null
+    const retryRaw = [
+      body?.retry_after_seconds,
+      errorBody?.retry_after_seconds,
+      response.headers.get('Retry-After'),
+    ].find((value) => value !== undefined && value !== null && value !== '')
+    const retryAfterSeconds = retryRaw === undefined ? 0 : Number(retryRaw)
+    throw new ApiError(
+      String(message),
+      response.status,
+      String(code),
+      data,
+      Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0 ? retryAfterSeconds : undefined,
+    )
   }
   return (noContent ? null : payload) as T
 }

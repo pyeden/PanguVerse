@@ -48,7 +48,14 @@ export function LoginPage({
       onSuccess(result.user || username.trim())
     } catch (err) {
       const apiError = err as ApiError
-      setError(apiError.message || '登录失败')
+      if (apiError.status === 429) {
+        const retrySeconds = Number(apiError.retryAfterSeconds || 0)
+        setError(retrySeconds > 0
+          ? `尝试过多，请 ${Math.max(1, Math.ceil(retrySeconds / 60))} 分钟后再试`
+          : apiError.message || '尝试过多，请稍后再试')
+      } else {
+        setError(apiError.message || '登录失败')
+      }
       setPassword('')
       passwordRef.current?.focus()
     } finally {

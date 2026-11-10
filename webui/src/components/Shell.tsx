@@ -51,8 +51,8 @@ function crumbs(route: Route, projects: Project[]): { label: string; href?: stri
   if (first === 'studio') {
     if (route.parts[1] === 'new') return [{ label: '任务', href: '/tasks' }, { label: '新建任务' }]
     if (route.parts[1] === 'explore') return [{ label: '任务', href: '/tasks' }, { label: '探索' }, ...(route.parts[2] ? [{ label: '回看' }] : [])]
-    if (route.parts[2] === 'review') return [{ label: '任务', href: '/tasks' }, { label: '画布', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
-    return [{ label: '任务', href: '/tasks' }, { label: '画布' }]
+    if (route.parts[2] === 'review') return [{ label: '任务', href: '/tasks' }, { label: '任务画布', href: `/studio/${route.parts[1]}` }, { label: '审阅' }]
+    return [{ label: '任务', href: '/tasks' }, { label: '任务画布' }]
   }
   if (first === 'p') {
     const pid = route.parts[1]

@@ -1327,13 +1327,13 @@ function StudioCanvasInner({ wid }: { wid: string }) {
 
       <nav className="studio-tabs" aria-label="任务视图" data-testid="studio-tabs">
         <button type="button" className={tab === 'canvas' ? 'is-active' : ''} aria-current={tab === 'canvas' ? 'page' : undefined} onClick={() => setTab('canvas')}>
-          <Icon name="flow" size={14} />Canvas
+          <Icon name="flow" size={14} />画布
         </button>
         <button type="button" className={tab === 'triggers' ? 'is-active' : ''} aria-current={tab === 'triggers' ? 'page' : undefined} onClick={() => setTab('triggers')}>
-          <Icon name="clock" size={14} />Triggers
+          <Icon name="clock" size={14} />触发器
         </button>
         <button type="button" className={tab === 'runs' ? 'is-active' : ''} aria-current={tab === 'runs' ? 'page' : undefined} onClick={() => setTab('runs')}>
-          <Icon name="history" size={14} />Runs
+          <Icon name="history" size={14} />运行
         </button>
         <span className="studio-tabs-hint">
           {workflow.published_ref ? <><Icon name="git" size={12} /><code>{workflow.published_ref}</code></> : '尚未发布'}

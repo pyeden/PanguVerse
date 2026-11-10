@@ -395,7 +395,7 @@ export function TriggerPanel({ wid, workflowRef = '', compact = false, showCreat
       ) : (
         <SectionHeader
           title="触发器"
-          description="定时 / 间隔 / Webhook；运行记录见 Runs。"
+          description="定时 / 间隔 / Webhook；运行记录见「运行」页。"
           icon="clock"
           actions={headActions}
         />

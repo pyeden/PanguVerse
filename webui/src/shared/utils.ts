@@ -256,6 +256,40 @@ export function statusLabel(status: string | undefined): string {
   return map[status || 'none'] || status || '未知'
 }
 
+export type StatusTone = 'ok' | 'bad' | 'warn' | 'run' | 'dim'
+
+/**
+ * job 的展示口径：终态优先用用例结果说话，避免后端 status=done/failed
+ * 与「已完成」文案互相矛盾，也避免失败 job 被读成全部通过。
+ */
+export function jobStatusMeta(job: { status?: string; summary?: AnyRecord; conclusion?: AnyRecord } | null | undefined): {
+  label: string
+  tone: StatusTone
+  status: string
+} {
+  const status = job?.status || 'none'
+  const summary = job?.summary || {}
+  const total = num(summary.total)
+  const failed = num(summary.failed)
+  const errored = num(summary.errored)
+  const passed = num(summary.passed, Math.max(0, total - failed - errored))
+  const inFlight = ['running', 'queued', 'pending', 'cancelling'].includes(status)
+  if (!inFlight && total > 0) {
+    if (errored > 0) return { label: `有异常 ${errored}/${total}`, tone: 'bad', status }
+    if (failed > 0) return { label: `有失败 ${failed}/${total}`, tone: 'bad', status }
+    if (passed >= total) {
+      const executionFailed = ['failed', 'error', 'errored'].includes(status)
+      return {
+        label: executionFailed ? `用例全过 ${passed}/${total} · 执行失败` : `用例全过 ${passed}/${total}`,
+        tone: executionFailed ? 'warn' : 'ok',
+        status,
+      }
+    }
+    return { label: `${passed}/${total} 通过`, tone: 'warn', status }
+  }
+  return { label: statusLabel(status), tone: classForStatus(status) as StatusTone, status }
+}
+
 export function errorText(value: unknown): string {
   if (value === null || value === undefined || value === '') return ''
   if (typeof value === 'string') return value

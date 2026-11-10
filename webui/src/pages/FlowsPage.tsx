@@ -23,6 +23,7 @@ import {
 } from '../components/ui'
 
 type StateFilter = 'all' | 'draft' | 'review' | 'published'
+type SortBy = 'updated' | 'name' | 'status'
 
 const STATE_META: Record<string, { label: string; tone: 'ok' | 'warn' | 'bad' | 'neutral' }> = {
   draft: { label: '草稿', tone: 'neutral' },
@@ -74,6 +75,7 @@ export function FlowsPage() {
   })
   const [search, setSearch] = useState('')
   const [stateFilter, setStateFilter] = useState<StateFilter>('all')
+  const [sortBy, setSortBy] = useState<SortBy>('updated')
   const [renameTarget, setRenameTarget] = useState<Workflow | null>(null)
   const [renameName, setRenameName] = useState('')
   const [renameError, setRenameError] = useState('')
@@ -83,6 +85,12 @@ export function FlowsPage() {
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase()
+    const byUpdated = (a: Workflow, b: Workflow) => Number(b.updated_at || 0) - Number(a.updated_at || 0)
+    const stateRank = (workflow: Workflow) => {
+      if (isPublished(workflow)) return 0
+      const ranks: Record<string, number> = { approved: 1, review: 2, draft: 3, rejected: 4, deprecated: 5 }
+      return ranks[stateOf(workflow)] ?? 9
+    }
     return workflows
       .filter((workflow) => {
         if (stateFilter !== 'all') {
@@ -95,8 +103,18 @@ export function FlowsPage() {
         if (!query) return true
         return `${workflow.name || ''} ${workflow.intent || ''} ${workflow.wid}`.toLowerCase().includes(query)
       })
-      .sort((a, b) => Number(b.updated_at || 0) - Number(a.updated_at || 0))
-  }, [search, stateFilter, workflows])
+      .sort((a, b) => {
+        if (sortBy === 'name') {
+          const byName = (a.name || a.wid).localeCompare(b.name || b.wid, 'zh-Hans-CN')
+          return byName || byUpdated(a, b)
+        }
+        if (sortBy === 'status') {
+          const byState = stateRank(a) - stateRank(b)
+          return byState || byUpdated(a, b)
+        }
+        return byUpdated(a, b)
+      })
+  }, [search, stateFilter, sortBy, workflows])
 
   const refreshLists = () => {
     void queryClient.invalidateQueries({ queryKey: ['studio-drafts-list'] })
@@ -187,6 +205,11 @@ export function FlowsPage() {
           <option value="draft">草稿</option>
           <option value="review">待审</option>
           <option value="published">已发布</option>
+        </Select>
+        <Select className="sort-select" value={sortBy} onChange={(event) => setSortBy(event.target.value as SortBy)} aria-label="任务排序" data-testid="task-sort">
+          <option value="updated">更新时间（新→旧）</option>
+          <option value="name">名称</option>
+          <option value="status">状态</option>
         </Select>
         <span className="toolbar-spacer" />
         <button

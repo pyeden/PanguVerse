@@ -75,12 +75,22 @@ export function Badge({
   )
 }
 
-export function StatusBadge({ status, className = '' }: { status?: string; className?: string }) {
-  const tone = classForStatus(status || 'none') as 'ok' | 'bad' | 'warn' | 'run' | 'dim'
+export function StatusBadge({
+  status,
+  label,
+  tone: toneOverride,
+  className = '',
+}: {
+  status?: string
+  label?: string
+  tone?: 'ok' | 'bad' | 'warn' | 'run' | 'dim'
+  className?: string
+}) {
+  const tone = toneOverride || (classForStatus(status || 'none') as 'ok' | 'bad' | 'warn' | 'run' | 'dim')
   return (
     <span className={`badge status-badge tone-${tone} ${className}`}>
       <span className="status-dot" aria-hidden="true" />
-      {statusLabel(status)}
+      {label || statusLabel(status)}
     </span>
   )
 }

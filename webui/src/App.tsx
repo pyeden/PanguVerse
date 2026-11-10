@@ -26,6 +26,7 @@ import { StudioCanvasPage } from './pages/StudioCanvasPage'
 import { StudioReviewPage } from './pages/StudioReviewPage'
 import { NextConsolePage } from './pages/next/NextConsolePage'
 import { NextWorkbenchPage } from './pages/next/NextWorkbenchPage'
+import { clearConsoleContext } from './shared/nextConsoleContext'
 
 type AuthState = 'loading' | 'in' | 'out'
 
@@ -60,6 +61,7 @@ export default function App() {
 
   useEffect(() => {
     const onUnauthorized = () => {
+      clearConsoleContext()
       setAuthState((current) => {
         if (current === 'in') setExpired(true)
         return 'out'
@@ -86,6 +88,7 @@ export default function App() {
     try {
       await api.logout()
     } finally {
+      clearConsoleContext()
       queryClient.clear()
       setUser('')
       setAuthDisabled(false)
@@ -148,7 +151,17 @@ function RoutedPage({ route }: { route: Route }) {
     return <FlowsPage />
   }
   if (first === 'settings') return <SettingsPage />
-  if (first === 'executions' || first === 'history') return <Redirect to="/runs" />
+  if (first === 'executions' || first === 'history') {
+    if (first === 'history') {
+      const focus = route.query.get('focus')
+      if (focus) {
+        const next = new URLSearchParams(route.query)
+        next.delete('focus')
+        return <Redirect to={withQuery(`/runs/${encodeURIComponent(focus)}`, next)} />
+      }
+    }
+    return <Redirect to="/runs" />
+  }
   if (first === 'reports') return <Redirect to={withQuery('/runs', { view: 'reports' })} />
   if (first === 'artifacts') {
     const run = route.query.get('run')

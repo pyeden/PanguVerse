@@ -47,7 +47,7 @@ export function RunTable({
             const project = projects.find((item) => item.project_id === run.project_id)
             const suite = project?.suites?.find((item) => item.suite_id === run.suite_id)
             const pid = run.project_id || project?.project_id
-            const runHref = pid ? href(`/p/${pid}/runs/${run.run_id}`) : href(`/history?focus=${run.run_id}`)
+            const runHref = pid ? href(`/p/${pid}/runs/${run.run_id}`) : href(`/runs/${run.run_id}`)
             const trigger = String(run.meta?.trigger || run.meta?.mode || (run.meta?.workflow_ref ? 'task' : 'manual'))
             return (
               <tr key={run.run_id} className={selected.includes(run.run_id) ? 'is-selected' : ''}>

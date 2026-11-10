@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { navigate } from '../../shared/router'
 import {
   NX_DEBUG_ROWS,
@@ -23,6 +23,7 @@ import {
   type NxTimelineEvent,
 } from '../../shared/nextMock'
 import { planIntent } from '../../shared/nextApi'
+import { clearConsoleContext, loadConsoleContext, saveConsoleContext } from '../../shared/nextConsoleContext'
 import { api } from '../../shared/api'
 import { Icon } from '../../components/Icon'
 import { Badge, Button, PageHeader, Progress, SectionHeader, useToast } from '../../components/ui'
@@ -66,22 +67,31 @@ function phaseStatus(status: string): NxStatus {
 
 export function NextConsolePage() {
   const { push } = useToast()
-  const [intent, setIntent] = useState(NX_INITIAL_INTENT)
+  const intentRef = useRef<HTMLTextAreaElement>(null)
+  const [savedContext] = useState(() => loadConsoleContext())
+  const [intent, setIntent] = useState(savedContext?.intent || NX_INITIAL_INTENT)
+  const [intentError, setIntentError] = useState('')
   const [showTemplates, setShowTemplates] = useState(false)
   const [runState, setRunState] = useState<RunState>('paused')
-  const [realWid, setRealWid] = useState('')
+  const [realWid, setRealWid] = useState(savedContext?.wid || '')
   const [planning, setPlanning] = useState(false)
-  const [planSource, setPlanSource] = useState('')
+  const [planSource, setPlanSource] = useState(savedContext?.source || '')
   const [demoRunning, setDemoRunning] = useState(false)
   const [demoRunId, setDemoRunId] = useState('')
-  const [phase, setPhase] = useState(3)
-  const [plan, setPlan] = useState<NxPlanStep[]>(NX_INITIAL_PLAN)
-  const [timeline, setTimeline] = useState<NxTimelineEvent[]>(NX_INITIAL_TIMELINE)
-  const [feed, setFeed] = useState<NxFeedItem[]>(NX_INITIAL_FEED)
+  const [phase, setPhase] = useState(savedContext ? Math.min(3, savedContext.steps.length) : 3)
+  const [plan, setPlan] = useState<NxPlanStep[]>(savedContext?.steps || NX_INITIAL_PLAN)
+  const [timeline, setTimeline] = useState<NxTimelineEvent[]>(savedContext ? [] : NX_INITIAL_TIMELINE)
+  const [feed, setFeed] = useState<NxFeedItem[]>(savedContext ? [{ id: 'restored-context', at: '上次', kind: 'observe', text: `已恢复上次生成的草稿 ${savedContext.wid} · ${savedContext.steps.length} 步。` }] : NX_INITIAL_FEED)
   const [debugRows] = useState<NxDebugRow[]>(NX_DEBUG_ROWS)
-  const [needs, setNeeds] = useState<NxNeed[]>(NX_INITIAL_NEEDS)
+  const [needs, setNeeds] = useState<NxNeed[]>(savedContext ? [] : NX_INITIAL_NEEDS)
   const [suggestion, setSuggestion] = useState<NxSuggestion>(NX_INITIAL_SUGGESTION)
-  const [result, setResult] = useState<NxResult>(NX_INITIAL_RESULT)
+  const [result, setResult] = useState<NxResult>(savedContext ? {
+    ...NX_INITIAL_RESULT,
+    title: '已恢复上次任务草稿',
+    summary: `${savedContext.wid} · ${savedContext.steps.length} 步；可继续打开工作台调试或上线。`,
+    evidence: [`workflow ${savedContext.wid}`, '会话恢复'],
+    artifacts: [],
+  } : NX_INITIAL_RESULT)
   const [humanCount, setHumanCount] = useState(1)
   const [aiActions, setAiActions] = useState(8)
 
@@ -150,15 +160,23 @@ export function NextConsolePage() {
 
   const start = async () => {
     if (runState === 'running' || planning || demoRunning) return
-    const text = intent.trim() || NX_TEMPLATES[0].intent
-    if (!intent.trim()) setIntent(text)
+    const text = intent.trim()
+    if (!text) {
+      setIntentError('请先描述目标')
+      setShowTemplates(false)
+      intentRef.current?.focus()
+      return
+    }
+    setIntentError('')
     setShowTemplates(false)
     setDemoRunId('')
     setPlanSource('')
+    clearConsoleContext()
     setPlanning(true)
     try {
       const result = await planIntent(text)
-      setPlanSource(result.planner || result.source || '')
+      const source = result.planner || result.source || ''
+      setPlanSource(source)
       if (result.gaps.length) {
         setRealWid('')
         setRunState('paused')
@@ -206,6 +224,7 @@ export function NextConsolePage() {
         evidence: [`workflow ${result.wid}`, `${result.steps.length} 个节点`, '真实规划'],
         artifacts: [],
       })
+      saveConsoleContext({ wid: result.wid, steps: result.steps, source, intent: text })
       push('AI 已生成真实任务草稿', 'ok')
     } catch (error) {
       startMock(text)
@@ -217,6 +236,7 @@ export function NextConsolePage() {
 
   const runDemo = async () => {
     if (demoRunning || planning || runState === 'running') return
+    clearConsoleContext()
     setDemoRunning(true)
     setDemoRunId('')
     setRealWid('')
@@ -284,6 +304,7 @@ export function NextConsolePage() {
 
   const applyTemplate = (template: (typeof NX_TEMPLATES)[number]) => {
     setIntent(template.intent)
+    setIntentError('')
     setShowTemplates(false)
     push(`已套用模板「${template.title}」`, 'ok')
   }
@@ -383,24 +404,37 @@ export function NextConsolePage() {
       <section className="nx-hero panel" aria-label="意图输入">
         <div className="nx-hero-glow" aria-hidden="true" />
         <div className="nx-intent-row">
-          <label className="nx-intent-box">
+          <label className={`nx-intent-box ${intentError ? 'has-error' : ''}`}>
             <span className="nx-intent-label">
               <Icon name="spark" size={14} />
               一句话说明目标
               <span className="nx-intent-optional">无需填表</span>
             </span>
             <textarea
+              ref={intentRef}
               className="nx-intent-input"
               rows={2}
               value={intent}
-              onChange={(event) => setIntent(event.target.value)}
+              onChange={(event) => {
+                setIntent(event.target.value)
+                if (intentError) setIntentError('')
+              }}
               onKeyDown={(event) => {
                 if ((event.metaKey || event.ctrlKey) && event.key === 'Enter') start()
               }}
               placeholder="例如：每天 9 点抓取竞品价格，异常时发飞书提醒，并生成对比报告"
               aria-label="一句话说明目标"
+              aria-invalid={intentError ? true : undefined}
+              aria-describedby={intentError ? 'nx-intent-error' : undefined}
             />
-            <span className="nx-intent-hint">⌘ / Ctrl + ↵ 拆解 · 示例需要可访问 URL；想先看效果点「跑内置演示」</span>
+            {intentError ? (
+              <span className="nx-intent-error" id="nx-intent-error" role="alert">
+                <Icon name="warning" size={12} />
+                {intentError}
+              </span>
+            ) : (
+              <span className="nx-intent-hint">⌘ / Ctrl + ↵ 拆解 · 示例需要可访问 URL；想先看效果点「跑内置演示」</span>
+            )}
           </label>
           <div className="nx-intent-actions">
             <Button variant="primary" size="lg" icon={planning || runState === 'running' ? 'refresh' : 'spark'} disabled={runState === 'running' || planning || demoRunning} onClick={start}>
@@ -427,7 +461,7 @@ export function NextConsolePage() {
           <div className="nx-suggestions">
             <span>试试：</span>
             {['把 3 个竞品站点的价格做成日报', '表单缺字段自动补全并通知', '网页内容变化时发飞书'].map((text) => (
-              <button key={text} type="button" onClick={() => setIntent(text)}>{text}</button>
+              <button key={text} type="button" onClick={() => { setIntent(text); setIntentError('') }}>{text}</button>
             ))}
           </div>
         )}

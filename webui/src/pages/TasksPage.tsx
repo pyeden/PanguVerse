@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { api, studioApi } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
-import { errorText, formatDuration, formatTime, relativeTime, shortId, statusLabel, statusOf, classForStatus } from '../shared/utils'
+import { errorText, formatDuration, formatTime, jobStatusMeta, relativeTime, shortId, statusLabel, statusOf, classForStatus } from '../shared/utils'
 import type { AnyRecord, Job, Scenario, Task, Workflow } from '../shared/types'
 import { Icon } from '../components/Icon'
 import {
@@ -183,6 +183,7 @@ export function TasksPage() {
     setPublishedHandled(true)
   }, [published, publishedWorkflows.length, publishedHandled])
 
+  const jobDisplay = jobQuery.data ? jobStatusMeta(jobQuery.data) : null
   return (
     <div className="page tasks-page">
       {published ? <div className="publish-success"><span className="publish-success-icon"><Icon name="git" size={20} /></span><div><strong>已发布任务版本 {published}</strong><p>创建一个任务绑定这个不可变版本，或到项目设置把它绑定为套件。</p></div><Button size="sm" variant="ghost" onClick={() => openCreate()}>换个方式新建</Button></div> : null}
@@ -260,7 +261,7 @@ export function TasksPage() {
                 </div>
                 <div className="task-last">
                   {task.last_run_id ? (
-                    <a href={href(task.workflow_ref ? `/tasks/config?focus=${task.task_id}` : `/history?focus=${task.last_run_id}`)} className="task-last-link">
+                    <a href={href(task.workflow_ref ? `/tasks/config?focus=${task.task_id}` : `/runs/${task.last_run_id}`)} className="task-last-link">
                       <StatusBadge status={task.last_status || 'done'} />
                       <span>{task.last_status === 'failed' ? '最近失败' : task.last_status === 'passed' || task.last_status === 'done' ? '最近成功' : statusLabel(task.last_status)}</span>
                     </a>
@@ -292,7 +293,7 @@ export function TasksPage() {
             icon="terminal"
             actions={
               <>
-                {jobQuery.data ? <StatusBadge status={jobQuery.data.status} /> : null}
+                {jobQuery.data && jobDisplay ? <StatusBadge status={jobQuery.data.status} label={jobDisplay.label} tone={jobDisplay.tone} /> : null}
                 <Button size="sm" variant="ghost" icon="close" onClick={() => { setActiveJob(''); navigate('/tasks/config', { replace: true }) }}>关闭</Button>
               </>
             }
@@ -423,10 +424,13 @@ function TaskDetail({ task, onArchive }: { task: Task; onArchive: (archived: boo
 }
 
 function JobPanel({ job }: { job: Job }) {
+  const display = jobStatusMeta(job)
+  const inFlight = ['running', 'queued', 'pending', 'cancelling'].includes(job.status)
+  const hasRun = !!job.run_id && !inFlight
   return (
     <div className="job-view">
       <div className="job-summary">
-        <div><span>状态</span><strong className={`tone-${classForStatus(job.status)}`}>{statusLabel(job.status)}</strong></div>
+        <div><span>状态</span><strong className={`tone-${display.tone}`}>{display.label}</strong></div>
         <div><span>耗时</span><strong>{formatDuration(job.elapsed_ms)}</strong></div>
         <div><span>模式</span><strong>{job.mode || '—'}</strong></div>
         <div><span>结果</span><strong>{job.summary?.total ? `${job.summary.passed || 0}/${job.summary.total}` : '—'}</strong></div>
@@ -442,9 +446,14 @@ function JobPanel({ job }: { job: Job }) {
           </div>
         ))}
       </div>
-      {job.status === 'done' && job.run_id ? (
-        <a className="btn btn-primary btn-sm" href={href(job.run_id ? `/history?focus=${job.run_id}` : '/history')}>查看运行报告 <Icon name="arrow" size={14} /></a>
-      ) : job.status === 'failed' ? <Badge tone="bad">执行失败，请检查阶段详情</Badge> : <Loading label="执行中，自动刷新…" />}
+      <div className="job-footer">
+        {hasRun ? (
+          <a className="btn btn-primary btn-sm" href={href(`/runs/${job.run_id}`)}>查看运行报告 <Icon name="arrow" size={14} /></a>
+        ) : null}
+        {job.status === 'failed' ? <Badge tone="bad">执行失败，请检查阶段详情</Badge> : null}
+        {inFlight ? <Loading label="执行中，自动刷新…" /> : null}
+        {!inFlight && !hasRun && job.status !== 'failed' ? <Badge tone="neutral">未生成运行报告</Badge> : null}
+      </div>
     </div>
   )
 }

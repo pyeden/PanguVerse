@@ -834,6 +834,7 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
 .job-summary span { color: var(--dim); font-size: 8.5px; }
 .job-summary strong { font-size: 13px; }
 .job-view { display: flex; flex-direction: column; gap: 10px; }
+.job-footer { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .phase-list { display: flex; flex-direction: column; }
 .phase-row { display: flex; align-items: center; gap: 8px; padding: 6px 0; border-bottom: 1px solid rgba(154,177,214,.07); font-size: 9.5px; }
 .phase-row strong { font-size: 9.5px; min-width: 70px; }
@@ -1504,6 +1505,7 @@ input[type="checkbox"] { accent-color: var(--cyan-deep); width: 13px; height: 13
   .task-target { max-width: 100%; }
   .task-meta { gap: 3px; }
   .task-actions .btn { flex: 1; }
+  .job-summary { grid-template-columns: 1fr 1fr; }
   .report-hero { padding-bottom: 13px; }
   .report-title-row h1 { font-size: 23px; }
   .report-actions { width: 100%; justify-content: flex-start; }
