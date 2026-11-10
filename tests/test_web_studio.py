@@ -823,3 +823,146 @@ def test_param_fill_is_port_contract_driven() -> None:
     assert param_fill.audit_param_gaps(missing, registry)[0]["reason"] == "missing"
     blank = [{"id": "n6", "atom": "fake_fetch", "params": {"target_url": "   "}}]
     assert param_fill.audit_param_gaps(blank, registry)[0]["reason"] == "empty"
+
+
+# --------------------------------------------------------------------------- #
+# 任务重命名 / 归档 / 列表过滤
+# --------------------------------------------------------------------------- #
+def _new_draft(api: WebAPI) -> dict[str, Any]:
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "备份配置文件并校验备份存在", "domain_pack": "local_fs"},
+    )
+    assert status == 201, draft
+    return draft
+
+
+def _audit_entries(api: WebAPI, wid: str) -> list[dict[str, Any]]:
+    path = api.root / ".panguverse" / "studio" / wid / "audit.jsonl"
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def test_rename_workflow_updates_name_without_touching_graph(api: WebAPI) -> None:
+    draft = _new_draft(api)
+    wid = draft["wid"]
+    studio_dir = api.root / ".panguverse" / "studio" / wid
+    workflow_before = json.loads((studio_dir / "workflow.json").read_text(encoding="utf-8"))
+    revision_before = (studio_dir / "revisions" / "0.json").read_bytes()
+
+    status, body = call(api, "PATCH", f"/api/studio/{wid}", {"name": "  备份配置  "})
+    assert status == 200, body
+    assert body == {"wid": wid, "name": "备份配置", "current_rev": 0}
+
+    workflow_after = json.loads((studio_dir / "workflow.json").read_text(encoding="utf-8"))
+    assert workflow_after["name"] == "备份配置"
+    assert workflow_after["current_rev"] == 0
+    # 版本文件（图/节点/环境）保持不可变
+    assert (studio_dir / "revisions" / "0.json").read_bytes() == revision_before
+
+    status, detail = call(api, "GET", f"/api/studio/{wid}")
+    assert status == 200, detail
+    assert detail["name"] == "备份配置"
+    assert detail["current_rev"] == 0
+    assert detail["graph"]["nodes"] == draft["graph"]["nodes"]
+    assert detail["graph"]["edges"] == draft["graph"]["edges"]
+
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    assert status == 200
+    assert listing["drafts"][0]["name"] == "备份配置"
+    assert listing["drafts"][0]["current_rev"] == 0
+
+    entry = _audit_entries(api, wid)[-1]
+    assert entry["action"] == "rename"
+    assert entry["from"] == workflow_before["name"]
+    assert entry["to"] == "备份配置"
+    assert entry["wid"] == wid
+    assert entry["actor"] == "local"
+
+
+def test_rename_workflow_validation(api: WebAPI) -> None:
+    draft = _new_draft(api)
+    wid = draft["wid"]
+
+    for payload in ({"name": ""}, {"name": "   "}, {"name": None}, {"name": 123}):
+        status, body = call(api, "PATCH", f"/api/studio/{wid}", payload)
+        assert status == 400, (payload, body)
+        assert body["error"]["code"] == "bad_request"
+
+    status, body = call(api, "PATCH", f"/api/studio/{wid}", {"name": "名" * 201})
+    assert status == 400, body
+    assert body["error"]["code"] == "bad_request"
+
+    # 边界值 200 字符合法
+    status, body = call(api, "PATCH", f"/api/studio/{wid}", {"name": "名" * 200})
+    assert status == 200, body
+    assert len(body["name"]) == 200
+
+    status, body = call(api, "PATCH", "/api/studio/w-abcdef12", {"name": "不存在"})
+    assert status == 404, body
+    assert body["error"]["code"] == "not_found"
+
+    status, body = call(api, "PATCH", "/api/studio/not-a-wid", {"name": "x"})
+    assert status == 400, body
+    assert body["error"]["code"] == "bad_request"
+
+
+def test_archive_hides_draft_and_include_archived_lists_it(api: WebAPI) -> None:
+    archived_draft = _new_draft(api)
+    visible_draft = _new_draft(api)
+    wid = archived_draft["wid"]
+
+    status, body = call(api, "POST", f"/api/studio/{wid}/archive", {"archived": True})
+    assert status == 200, body
+    assert body["wid"] == wid
+    assert isinstance(body["archived_at"], float)
+
+    workflow = json.loads(
+        (api.root / ".panguverse" / "studio" / wid / "workflow.json").read_text(encoding="utf-8")
+    )
+    assert workflow["archived_at"] == body["archived_at"]
+
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    assert status == 200
+    assert [item["wid"] for item in listing["drafts"]] == [visible_draft["wid"]]
+
+    status, listing = call(api, "GET", "/api/studio/drafts?include_archived=1")
+    assert status == 200
+    assert {item["wid"] for item in listing["drafts"]} == {wid, visible_draft["wid"]}
+    archived_item = next(item for item in listing["drafts"] if item["wid"] == wid)
+    assert archived_item["archived_at"] == body["archived_at"]
+    assert archived_item["node_count"] == len(archived_draft["graph"]["nodes"])
+
+    status, body = call(api, "POST", f"/api/studio/{wid}/archive", {"archived": False})
+    assert status == 200, body
+    assert body["archived_at"] is None
+    assert "archived_at" not in json.loads(
+        (api.root / ".panguverse" / "studio" / wid / "workflow.json").read_text(encoding="utf-8")
+    )
+
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    assert {item["wid"] for item in listing["drafts"]} == {wid, visible_draft["wid"]}
+
+    actions = [entry["action"] for entry in _audit_entries(api, wid)]
+    assert "archive" in actions and "unarchive" in actions
+
+
+def test_archive_is_idempotent_and_validates_input(api: WebAPI) -> None:
+    draft = _new_draft(api)
+    wid = draft["wid"]
+
+    status, first = call(api, "POST", f"/api/studio/{wid}/archive", {"archived": True})
+    assert status == 200, first
+    status, second = call(api, "POST", f"/api/studio/{wid}/archive", {"archived": True})
+    assert status == 200, second
+    assert second["archived_at"] == first["archived_at"]
+
+    for payload in ({}, {"archived": "yes"}, {"archived": 1}, {"archived": None}):
+        status, body = call(api, "POST", f"/api/studio/{wid}/archive", payload)
+        assert status == 400, (payload, body)
+        assert body["error"]["code"] == "bad_request"
+
+    status, body = call(api, "POST", "/api/studio/w-abcdef12/archive", {"archived": True})
+    assert status == 404, body
+    assert body["error"]["code"] == "not_found"

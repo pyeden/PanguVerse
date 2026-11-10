@@ -1241,8 +1241,72 @@ def record_replay(
     }
 
 
+def rename_workflow(
+    root: Path, wid: str, payload: Any, *, actor: str = "local"
+) -> dict[str, Any]:
+    """重命名任务：只改展示名，不改图、不产生新版本。"""
+    data = _as_dict(payload)
+    name = _clean_text(data.get("name"), field="name", required=True, limit=200)
+    workflow = read_workflow(root, wid)
+    old_name = str(workflow.get("name") or "")
+    workflow["name"] = name
+    workflow["updated_at"] = time.time()
+    # 版本文件不可变：只改 workflow 的展示名，不改任何 revisions/*.json。
+    _write_workflow(root, wid, workflow)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "rename",
+            "actor": actor,
+            "wid": wid,
+            "from": old_name,
+            "to": name,
+            "rev": workflow.get("current_rev"),
+            "note": "",
+        },
+    )
+    return {"wid": wid, "name": name, "current_rev": workflow.get("current_rev")}
+
+
+def archive_workflow(
+    root: Path, wid: str, payload: Any, *, actor: str = "local"
+) -> dict[str, Any]:
+    """软归档 / 取消归档任务；默认列表隐藏，历史版本与发布记录不受影响。"""
+    data = _as_dict(payload)
+    archived = data.get("archived")
+    if not isinstance(archived, bool):
+        raise StudioError("bad_request", "archived 必须是布尔值")
+    workflow = read_workflow(root, wid)
+    was_archived = bool(workflow.get("archived_at"))
+    if archived:
+        # 重复归档保持原时间戳，状态稳定可重试。
+        if not was_archived:
+            workflow["archived_at"] = time.time()
+    else:
+        workflow.pop("archived_at", None)
+    workflow["updated_at"] = time.time()
+    _write_workflow(root, wid, workflow)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "archive" if archived else "unarchive",
+            "actor": actor,
+            "wid": wid,
+            "from": was_archived,
+            "to": archived,
+            "rev": workflow.get("current_rev"),
+            "note": "",
+        },
+    )
+    return {"wid": wid, "archived_at": workflow.get("archived_at")}
+
+
 def list_drafts(
-    root: Path, *, status: str | None = None, domain_pack: str | None = None
+    root: Path,
+    *,
+    status: str | None = None,
+    domain_pack: str | None = None,
+    include_archived: bool = False,
 ) -> dict[str, Any]:
     base = studio_root(root)
     items: list[dict[str, Any]] = []
@@ -1253,6 +1317,8 @@ def list_drafts(
             try:
                 workflow = read_workflow(root, child.name)
             except StudioError:
+                continue
+            if not include_archived and workflow.get("archived_at"):
                 continue
             if status and workflow.get("state") != status:
                 continue
@@ -1274,6 +1340,7 @@ def list_drafts(
                     "state": workflow.get("state"),
                     "current_rev": workflow.get("current_rev"),
                     "published_ref": workflow.get("published_ref"),
+                    "archived_at": workflow.get("archived_at"),
                     "node_count": node_count,
                     "created_at": workflow.get("created_at"),
                     "updated_at": workflow.get("updated_at"),
@@ -1308,7 +1375,12 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
     revision_pack = str(revision.get("domain_pack") or "")
     return {
         "wid": wid,
-        "name": _revision_name(revision, workflow),
+        # 当前版本以 workflow.name 为准（重命名只改它）；回看历史版本仍用版本自带名称。
+        "name": (
+            (str(workflow.get("name") or "").strip() or _revision_name(revision, workflow))
+            if target_rev == int(workflow.get("current_rev") or 0)
+            else _revision_name(revision, workflow)
+        ),
         "intent": revision_intent or str(workflow.get("intent") or ""),
         "domain_pack": revision_pack or str(workflow.get("domain_pack") or ""),
         "planner": str(revision.get("planner") or ""),
@@ -3473,6 +3545,7 @@ __all__ = [
     "STUDIO_DIRNAME",
     "StudioError",
     "apply_diff",
+    "archive_workflow",
     "audit_tail",
     "create_draft",
     "create_draft_from_graph",
@@ -3486,6 +3559,7 @@ __all__ = [
     "read_revision",
     "read_workflow",
     "record_replay",
+    "rename_workflow",
     "replan",
     "review",
     "transition_state",

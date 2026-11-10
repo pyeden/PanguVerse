@@ -737,6 +737,7 @@ class WebAPI:
                         self.root,
                         status=_first(query, "status"),
                         domain_pack=_first(query, "domain_pack"),
+                        include_archived=_flag_query(query, "include_archived"),
                     )
                 )
             raise ApiError("not_found", "接口不存在")
@@ -756,6 +757,10 @@ class WebAPI:
         wid = rest[0]
         tail = rest[1:]
         if not tail:
+            if method == "PATCH":
+                return json_response(
+                    studio.rename_workflow(self.root, wid, body, actor=actor)
+                )
             if method != "GET":
                 raise ApiError("not_found", "接口不存在")
             default_rev = int(studio.read_workflow(self.root, wid).get("current_rev") or 0)
@@ -776,6 +781,10 @@ class WebAPI:
                 return json_response(studio.replan(self.root, wid, body, actor=actor))
             if action == "apply-diff" and method == "POST":
                 return json_response(studio.apply_diff(self.root, wid, body, actor=actor))
+            if action == "archive" and method == "POST":
+                return json_response(
+                    studio.archive_workflow(self.root, wid, body, actor=actor)
+                )
             if action == "validate" and method == "POST":
                 return json_response(self._studio_validate(wid, body))
             if action == "debug" and method == "POST":
