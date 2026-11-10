@@ -63,6 +63,9 @@ _URL_KEY_RE = re.compile(
 STATES = ("draft", "review", "approved", "rejected")
 TRANSITIONS = ("review", "approved", "rejected")
 DEBUG_MODES = ("only", "from_start", "downstream")
+#: 任务执行态：debug 为调试期（允许 LLM 自定义节点），frozen 为生产期（固定图）。
+EXECUTION_MODES = ("debug", "frozen")
+DEFAULT_EXECUTION_MODE = "debug"
 #: 探索固化流程：覆盖率 / 意图匹配 / 能力缺口仅 advisory，不阻断发布。
 _ADVISORY_CODES = frozenset(
     {"intent_mismatch", "capability_gap", "intent_coverage_advisory"}
@@ -82,6 +85,7 @@ _STATUS_BY_CODE = {
     "intent_mismatch": 409,
     "capability_gap": 409,
     "atom_missing": 409,
+    "no_successful_run": 409,
     "not_general": 422,
     "replay_failed": 422,
     "internal_error": 500,
@@ -117,6 +121,12 @@ def validate_wid(wid: Any) -> str:
     if not isinstance(wid, str) or not WID_RE.match(wid):
         raise StudioError("bad_request", "wid 非法（应形如 w-8f3a1c）")
     return wid
+
+
+def execution_mode_of(workflow: Mapping[str, Any] | None) -> str:
+    """读取执行态；旧 workflow.json 缺字段一律按 debug（兼容历史数据）。"""
+    value = str((workflow or {}).get("execution_mode") or "").strip()
+    return value if value in EXECUTION_MODES else DEFAULT_EXECUTION_MODE
 
 
 def _as_rev(value: Any, *, field: str = "rev") -> int:
@@ -980,6 +990,12 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "current_rev": 0,
         "locked": [],
         "published_ref": "",
+        # additive：新任务从调试态开始，缺字段的旧任务按 debug 解释。
+        "execution_mode": DEFAULT_EXECUTION_MODE,
+        "frozen_ref": "",
+        "frozen_at": None,
+        "frozen_by": "",
+        "goal_checks": [],
         "env_schema": env_schema,
         "created_at": now,
         "updated_at": now,
@@ -1102,6 +1118,11 @@ def create_draft_from_graph(
         "current_rev": 0,
         "locked": [],
         "published_ref": "",
+        "execution_mode": DEFAULT_EXECUTION_MODE,
+        "frozen_ref": "",
+        "frozen_at": None,
+        "frozen_by": "",
+        "goal_checks": [],
         "env_schema": env_schema,
         "created_at": now,
         "updated_at": now,
@@ -1340,6 +1361,9 @@ def list_drafts(
                     "state": workflow.get("state"),
                     "current_rev": workflow.get("current_rev"),
                     "published_ref": workflow.get("published_ref"),
+                    "execution_mode": execution_mode_of(workflow),
+                    "frozen_ref": workflow.get("frozen_ref") or "",
+                    "frozen_at": workflow.get("frozen_at"),
                     "archived_at": workflow.get("archived_at"),
                     "node_count": node_count,
                     "created_at": workflow.get("created_at"),
@@ -1403,6 +1427,12 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
         "env_schema": revision.get("env_schema") or [],
         "locked": workflow.get("locked") or [],
         "published_ref": workflow.get("published_ref") or "",
+        # additive：执行态与固化产物；历史 workflow.json 缺字段 → debug。
+        "execution_mode": execution_mode_of(workflow),
+        "frozen_ref": workflow.get("frozen_ref") or "",
+        "frozen_at": workflow.get("frozen_at"),
+        "frozen_by": workflow.get("frozen_by") or "",
+        "goal_checks": list(workflow.get("goal_checks") or []),
         "graph": _graph_of(revision),
         "ui": _read_ui(root, wid),
     }
@@ -2671,6 +2701,272 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
     }
 
 
+# --------------------------------------------------------------------------- #
+# 任务执行态：固化 / 回到调试
+# --------------------------------------------------------------------------- #
+def _run_matches_ref(entry: Mapping[str, Any], ref: str) -> bool:
+    meta = entry.get("meta")
+    if not isinstance(meta, Mapping):
+        return False
+    if str(meta.get("workflow_ref") or "") == ref:
+        return True
+    config = meta.get("run_config")
+    return isinstance(config, Mapping) and str(config.get("workflow_ref") or "") == ref
+
+
+def _run_succeeded(report: Mapping[str, Any]) -> bool:
+    conclusion = report.get("conclusion")
+    if isinstance(conclusion, Mapping) and isinstance(conclusion.get("success"), bool):
+        return bool(conclusion["success"])
+    summary = report.get("summary")
+    return bool(summary.get("success")) if isinstance(summary, Mapping) else False
+
+
+def _latest_report_for_ref(root: Path, ref: str) -> dict[str, Any] | None:
+    """按 ``workflow_ref=wid@rev`` 找最近一次运行的 report.json。
+
+    只看 ``runs/*/report.json``（与 /api/runs 同源）；运行历史按 started_at 倒序。
+    """
+    from . import service
+
+    for entry in service.list_runs(root, limit=100000):
+        if not _run_matches_ref(entry, ref):
+            continue
+        directory = entry.get("dir")
+        if not isinstance(directory, str) or not directory:
+            return None
+        path = Path(directory) / "report.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, dict) else None
+    return None
+
+
+def _goal_checks_from_report(report: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """从最近成功运行的断言步骤生成 goal_checks。
+
+    优先取 ``assert_*`` 原子（含探索固化的 assert 标签）；没有断言节点时退化为
+    用例级检查，保证固化产物始终有可展示、可核对的验收清单。
+    """
+    checks: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for case in report.get("cases") or []:
+        if not isinstance(case, Mapping):
+            continue
+        case_id = str(case.get("case_id") or "case")
+        case_name = str(case.get("name") or case_id)
+        for step in case.get("steps") or []:
+            if not isinstance(step, Mapping):
+                continue
+            atom = str(step.get("atom") or "")
+            tags = {str(tag) for tag in step.get("tags") or []}
+            if not (atom.startswith("assert_") or "assert" in tags):
+                continue
+            step_id = str(step.get("step_id") or atom or "assert")
+            check_id = f"{case_id}:{step_id}"
+            if check_id in seen:
+                suffix = 2
+                while f"{check_id}#{suffix}" in seen:
+                    suffix += 1
+                check_id = f"{check_id}#{suffix}"
+            seen.add(check_id)
+            checks.append(
+                {
+                    "id": check_id,
+                    "kind": atom or "assert",
+                    "description": str(step.get("name") or atom or step_id),
+                    "passed": str(step.get("status") or "") == "passed",
+                    "evidence": {
+                        "case_id": case_id,
+                        "case": case_name,
+                        "step_id": step_id,
+                        "atom": atom,
+                        "status": str(step.get("status") or ""),
+                    },
+                }
+            )
+    if checks:
+        return checks
+    for case in report.get("cases") or []:
+        if not isinstance(case, Mapping):
+            continue
+        case_id = str(case.get("case_id") or "case")
+        status = str(case.get("status") or "")
+        checks.append(
+            {
+                "id": f"case:{case_id}",
+                "kind": "case",
+                "description": str(case.get("name") or case_id),
+                "passed": status == "passed",
+                "evidence": {"case_id": case_id, "status": status},
+            }
+        )
+    return checks
+
+
+def _clean_goal_checks(value: Any) -> list[dict[str, Any]] | None:
+    """规范化调用方传入的 checks；``None`` 表示未传（改由运行断言生成）。"""
+    if value is None:
+        return None
+    if not isinstance(value, list):
+        raise StudioError("bad_request", "checks 必须是数组")
+    checks: list[dict[str, Any]] = []
+    for index, item in enumerate(value):
+        if not isinstance(item, Mapping):
+            raise StudioError("bad_request", f"checks[{index}] 必须是对象")
+        description = _clean_text(
+            item.get("description") or "", field=f"checks[{index}].description", limit=500
+        )
+        evidence = item.get("evidence")
+        if evidence is None:
+            evidence = ""
+        elif not isinstance(evidence, (str, Mapping, list)):
+            raise StudioError(
+                "bad_request", f"checks[{index}].evidence 必须是字符串/对象/数组"
+            )
+        checks.append(
+            {
+                "id": _clean_text(
+                    item.get("id") or f"check-{index + 1}",
+                    field=f"checks[{index}].id",
+                    required=True,
+                    limit=200,
+                ),
+                "kind": _clean_text(
+                    item.get("kind") or "manual",
+                    field=f"checks[{index}].kind",
+                    limit=100,
+                ),
+                "description": description,
+                "passed": bool(item.get("passed", False)),
+                "evidence": copy.deepcopy(evidence),
+            }
+        )
+    return checks
+
+
+def _freeze_missing_atoms(
+    root: Path, nodes: Iterable[Mapping[str, Any]]
+) -> list[dict[str, Any]]:
+    """固化硬门禁：固定图只能引用当前工作区已注册原子；草稿节点同样阻断。"""
+    from ..core.workspace_packs import workspace_registry
+
+    registry = workspace_registry(root, _registry())
+    missing: list[dict[str, Any]] = []
+    for node in nodes:
+        node_id = str(node.get("id") or "")
+        atom = str(node.get("atom") or "").strip()
+        if isinstance(node.get("draft"), Mapping):
+            missing.append(
+                {"atom": atom or "draft", "node_id": node_id, "reason": "draft_not_registered"}
+            )
+            continue
+        try:
+            registry.get(atom)
+        except AtomNotFoundError:
+            missing.append({"atom": atom, "node_id": node_id, "reason": "atom_not_registered"})
+    return missing
+
+
+def freeze(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
+    """把某个成功运行过的版本固化为生产态；不新增 revision、不改图。"""
+    validate_wid(wid)
+    data = _as_dict(payload)
+    workflow = read_workflow(root, wid)
+    rev_raw = data.get("rev")
+    rev = int(workflow.get("current_rev") or 0) if rev_raw is None else _as_rev(rev_raw, field="rev")
+    message = _clean_text(data.get("message"), field="message", required=True, limit=500)
+    revision = read_revision(root, wid, rev)
+    ref = f"{wid}@{rev}"
+
+    report = _latest_report_for_ref(root, ref)
+    if report is None or not _run_succeeded(report):
+        raise StudioError(
+            "no_successful_run",
+            "该版本最近一次运行未成功，不能固化（请先跑通）",
+            status=409,
+            details={"workflow_ref": ref, "run_found": report is not None},
+        )
+
+    checks = _clean_goal_checks(data.get("checks"))
+    goal_checks = checks if checks is not None else _goal_checks_from_report(report)
+
+    missing = _freeze_missing_atoms(root, revision.get("nodes") or [])
+    if missing:
+        raise StudioError(
+            "capability_gap",
+            "图中存在未注册原子，固化必须是已注册原子："
+            + ", ".join(item["atom"] for item in missing),
+            status=409,
+            details={"missing_atoms": missing, "workflow_ref": ref},
+        )
+
+    previous_mode = execution_mode_of(workflow)
+    previous_ref = str(workflow.get("frozen_ref") or "")
+    now = time.time()
+    workflow["execution_mode"] = "frozen"
+    workflow["frozen_ref"] = ref
+    workflow["frozen_at"] = now
+    workflow["frozen_by"] = actor
+    workflow["goal_checks"] = copy.deepcopy(goal_checks)
+    workflow["updated_at"] = now
+    _write_workflow(root, wid, workflow)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "freeze",
+            "actor": actor,
+            "wid": wid,
+            "from": previous_mode,
+            "to": "frozen",
+            "rev": rev,
+            "frozen_ref": ref,
+            "previous_frozen_ref": previous_ref or None,
+            "goal_checks": len(goal_checks),
+            "note": message,
+        },
+    )
+    return {
+        "wid": wid,
+        "execution_mode": "frozen",
+        "frozen_ref": ref,
+        "goal_checks": goal_checks,
+    }
+
+
+def unfreeze(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
+    """回到调试态；保留 frozen_ref 作为历史，不删除已固化版本。"""
+    validate_wid(wid)
+    data = _as_dict(payload)
+    message = _clean_text(data.get("message"), field="message", required=True, limit=500)
+    workflow = read_workflow(root, wid)
+    previous_mode = execution_mode_of(workflow)
+    previous_ref = str(workflow.get("frozen_ref") or "")
+    workflow["execution_mode"] = DEFAULT_EXECUTION_MODE
+    workflow["updated_at"] = time.time()
+    _write_workflow(root, wid, workflow)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "unfreeze",
+            "actor": actor,
+            "wid": wid,
+            "from": previous_mode,
+            "to": DEFAULT_EXECUTION_MODE,
+            "rev": workflow.get("current_rev"),
+            "frozen_ref": previous_ref or None,
+            "note": message,
+        },
+    )
+    return {
+        "wid": wid,
+        "execution_mode": DEFAULT_EXECUTION_MODE,
+        "previous_frozen_ref": previous_ref,
+    }
+
+
 def load_published(root: Path, ref: Any) -> dict[str, Any]:
     if not isinstance(ref, str):
         raise StudioError("bad_request", "workflow_ref 必须是字符串")
@@ -3539,7 +3835,9 @@ def get_debug_session(root: Path, sid: str, *, cursor: int = 0) -> dict[str, Any
 
 
 __all__ = [
+    "DEFAULT_EXECUTION_MODE",
     "DIR_MODE",
+    "EXECUTION_MODES",
     "FILE_MODE",
     "STATE_DIRNAME",
     "STUDIO_DIRNAME",
@@ -3550,6 +3848,8 @@ __all__ = [
     "create_draft",
     "create_draft_from_graph",
     "debug_workflow",
+    "execution_mode_of",
+    "freeze",
     "get_debug_session",
     "get_workflow",
     "list_drafts",
@@ -3563,5 +3863,6 @@ __all__ = [
     "replan",
     "review",
     "transition_state",
+    "unfreeze",
     "validate_nodes",
 ]

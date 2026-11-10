@@ -655,7 +655,20 @@ def _workflow_task(
         from . import studio  # 局部导入：避免模块级循环
 
         published = studio.load_published(root, request.workflow_ref)
+        workflow = published.get("workflow") or {}
+        execution_mode = studio.execution_mode_of(workflow)
+        frozen_ref = str(workflow.get("frozen_ref") or "")
+        # 运行守卫：frozen 只执行 wid@rev 的固定节点图——不规划、不生成节点，
+        # 也不调用 ExploreAgent；debug 同样只执行已发布的固定图（节点自定义发生在
+        # 调试/编辑阶段，不发生在工作流运行里）。两种模式都不开启 LLM 规划。
         plan = studio.plan_from_revision(published)
+        plan.meta = {
+            **plan.meta,
+            "execution_mode": execution_mode,
+            "llm_planning": "disabled",
+        }
+        if frozen_ref:
+            plan.meta["frozen_ref"] = frozen_ref
         baseline = load_last_env(root)
         request_env = dict(request.env)
         axe = build_axe(root, enable_llm=False)
@@ -676,6 +689,7 @@ def _workflow_task(
                 "scenario": "",
                 "intent": plan.intent,
                 "workflow_ref": request.workflow_ref,
+                "execution_mode": execution_mode,
                 "regression": bool(request.regression),
                 "no_llm": True,
                 "uses_mock": False,
@@ -685,6 +699,8 @@ def _workflow_task(
             attribution=attribution,
             extra_meta={
                 "workflow_ref": request.workflow_ref,
+                "execution_mode": execution_mode,
+                **({"frozen_ref": frozen_ref} if frozen_ref else {}),
                 "trigger_id": trigger_id,
                 "trigger": trigger_name,
                 **(extra_meta or {}),

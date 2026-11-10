@@ -785,6 +785,10 @@ class WebAPI:
                 return json_response(
                     studio.archive_workflow(self.root, wid, body, actor=actor)
                 )
+            if action == "freeze" and method == "POST":
+                return json_response(studio.freeze(self.root, wid, body, actor=actor))
+            if action == "unfreeze" and method == "POST":
+                return json_response(studio.unfreeze(self.root, wid, body, actor=actor))
             if action == "validate" and method == "POST":
                 return json_response(self._studio_validate(wid, body))
             if action == "debug" and method == "POST":
