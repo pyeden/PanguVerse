@@ -503,7 +503,7 @@ def test_a54_project_summary_matches_reports(web: Client) -> None:
         add_suite(web, project_id, "scenarios/fail.yaml", name="失败")
         started = run_project(web, project_id)
         batch = web.wait_batch(started["batch_id"])
-        assert batch["status"] == "done"
+        assert batch["status"] == "failed"  # 有套件用例失败，批次不再是假 done
 
         reports = {
             entry["run_id"]: disk_report(web, entry["run_id"]) for entry in batch["suites"]
@@ -565,12 +565,16 @@ def test_a55_batch_serial_aggregate_reconciles(web: Client) -> None:
         }
 
         batch = web.wait_batch(started["batch_id"])
-        assert batch["status"] == "done", batch
+        assert batch["status"] == "failed", batch  # 失败套件让批次失败
         assert len(batch["suites"]) == 2
         assert len({entry["run_id"] for entry in batch["suites"]}) == 2  # 每套件一个 run
         for job_id in job_ids:  # 每个套件一个 job，且能在 /api/jobs 查到
             job = web.wait_job(job_id)
-            assert job["status"] == "done"
+            assert job["status"] in ("done", "failed")
+        assert [web.wait_job(job_id)["status"] for job_id in job_ids] == [
+            "done",
+            "failed",
+        ]
 
         # 串行：后一个 run 开始时间不早于前一个 run 结束时间
         ordered = sorted(

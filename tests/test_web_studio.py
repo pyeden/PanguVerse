@@ -126,6 +126,71 @@ def test_graphifier_does_not_invent_edges_for_unknown_vars() -> None:
 # --------------------------------------------------------------------------- #
 # 草案 / 图 / 校验
 # --------------------------------------------------------------------------- #
+def test_add_data_edge_via_node_id_persists_new_revision(api: WebAPI) -> None:
+    """P1：via 用节点 id 建数据边不得被局部变量 root 遮蔽，必须真正落盘。"""
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "备份配置文件并校验备份存在", "domain_pack": "local_fs"},
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    base_rev = draft["rev"]
+    nodes = draft["graph"]["nodes"]
+    from_id = str(nodes[0]["id"])
+    to_id = str(nodes[-1]["id"])
+    assert from_id != to_id
+
+    status, body = call(
+        api,
+        "POST",
+        f"/api/studio/{wid}/edges",
+        {"from": from_id, "to": to_id, "via": from_id},
+    )
+    assert status == 201, body
+    assert body["rev"] == base_rev + 1
+    data_edges = [
+        edge
+        for edge in body["graph"]["edges"]
+        if edge["from"] == from_id and edge["to"] == to_id
+    ]
+    assert len(data_edges) == 1, data_edges
+    assert data_edges[0]["kind"] == "data"
+    assert data_edges[0]["via"] == from_id
+    assert data_edges[0]["order_only"] is False
+
+    # 真正写进了新版本文件，而不是把路径列表当工作区根目录。
+    workflow = studio.read_workflow(api.root, wid)
+    assert workflow["current_rev"] == base_rev + 1
+    revision = studio.read_revision(api.root, wid, base_rev + 1)
+    assert any(
+        edge.get("from") == from_id
+        and edge.get("to") == to_id
+        and edge.get("kind") == "data"
+        for edge in revision["edges"]
+    )
+
+    # 顺序边仍正常：反向补一条 order 边（不与已有 data 边冲突）。
+    status, ordered = call(
+        api,
+        "POST",
+        f"/api/studio/{wid}/edges",
+        {"from": to_id, "to": from_id, "kind": "order"},
+    )
+    assert status == 201, ordered
+    assert ordered["rev"] == base_rev + 2
+    order_edges = [
+        edge
+        for edge in ordered["graph"]["edges"]
+        if edge["from"] == to_id and edge["to"] == from_id
+    ]
+    assert len(order_edges) == 1, order_edges
+    assert order_edges[0]["kind"] == "order"
+    assert order_edges[0]["via"] is None
+    assert order_edges[0]["order_only"] is True
+
+
 def test_create_draft_graph_and_permissions(api: WebAPI) -> None:
     status, body = call(
         api,

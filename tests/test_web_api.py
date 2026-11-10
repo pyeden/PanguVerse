@@ -481,8 +481,8 @@ def test_all_errored_job_is_failed(web: WebClient) -> None:
     assert detail["report"]["summary"]["errored"] >= 1
 
 
-def test_assertion_failure_stays_done(web: WebClient) -> None:
-    """F3 反向：真实断言失败（非全 errored）仍是 done + conclusion.success=false。"""
+def test_assertion_failure_marks_job_failed(web: WebClient) -> None:
+    """P2：真实断言失败 = 用例未全通过，即使进程正常结束也必须 failed。"""
     scenarios = web.workspace / "scenarios"
     scenarios.mkdir(parents=True, exist_ok=True)
     (scenarios / "cli_fail.yaml").write_text(
@@ -505,9 +505,69 @@ def test_assertion_failure_stays_done(web: WebClient) -> None:
     )
     assert status == 202, data
     job = web.wait_job(data["job_id"])
-    assert job["status"] == "done", job
+    assert job["status"] == "failed", job
     assert job["summary"]["failed"] == 1
+    assert job["summary"]["success"] is False
     assert job["conclusion"]["success"] is False
+    # phases 不受终态判据影响，仍保留完整阶段轨迹
+    assert [phase["name"] for phase in job["phases"]] == [
+        "plan",
+        "validate",
+        "execute",
+        "heal",
+        "report",
+        "artifacts",
+        "evolve",
+    ]
+
+
+def test_job_failed_when_only_one_of_six_cases_passes(web: WebClient) -> None:
+    """P2：1/6 通过 → job.status=failed（不是 done），phases 保持完整。"""
+    scenarios = web.workspace / "scenarios"
+    scenarios.mkdir(parents=True, exist_ok=True)
+    cases = []
+    for index in range(6):
+        if index == 0:
+            step = "      - id: ok\n        use: set_var\n        with: {name: marker, value: 1}\n"
+        else:
+            step = (
+                "      - id: check\n"
+                "        use: assert_json\n"
+                "        with:\n"
+                "          path: value\n"
+                "          equals: 1\n"
+                "          source:\n"
+                "            value: 2\n"
+            )
+        cases.append(
+            f"  - id: case_{index}\n    name: 用例 {index}\n    steps:\n{step}"
+        )
+    (scenarios / "one_of_six.yaml").write_text(
+        "name: 1/6 通过\ncases:\n" + "".join(cases), encoding="utf-8"
+    )
+
+    status, data = web.post_json(
+        "/api/runs", {"mode": "scenario", "scenario": "scenarios/one_of_six.yaml"}
+    )
+    assert status == 202, data
+    job = web.wait_job(data["job_id"])
+    assert job["status"] == "failed", job
+    assert job["summary"]["total"] == 6
+    assert job["summary"]["passed"] == 1
+    assert job["summary"]["failed"] == 5
+    assert job["summary"]["success"] is False
+    assert [phase["name"] for phase in job["phases"]] == [
+        "plan",
+        "validate",
+        "execute",
+        "heal",
+        "report",
+        "artifacts",
+        "evolve",
+    ]
+    status, detail = web.get_json(f"/api/runs/{job['run_id']}")
+    assert status == 200
+    assert detail["report"]["summary"]["passed"] == 1
 
 
 def test_scenario_from_workspace(web: WebClient) -> None:

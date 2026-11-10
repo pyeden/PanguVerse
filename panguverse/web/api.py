@@ -900,7 +900,14 @@ class WebAPI:
         retry_after = self.auth.rate_limit_retry(client_ip)
         if retry_after:
             return json_response(
-                {"error": {"code": "too_many_attempts", "message": "尝试过多，请 5 分钟后再试"}},
+                {
+                    "error": {
+                        "code": "too_many_attempts",
+                        "message": "尝试过多，请 5 分钟后再试",
+                    },
+                    # additive：前端可直接展示倒计时；Retry-After 头保持兼容。
+                    "retry_after_seconds": retry_after,
+                },
                 status=429,
                 headers={"Retry-After": str(retry_after)},
             )

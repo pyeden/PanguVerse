@@ -997,6 +997,7 @@ def create_draft(root: Path, payload: Any, *, actor: str = "local") -> dict[str,
         "frozen_ref": "",
         "frozen_at": None,
         "frozen_by": "",
+        "freeze_history": [],
         "goal_checks": [],
         "env_schema": env_schema,
         "created_at": now,
@@ -1124,6 +1125,7 @@ def create_draft_from_graph(
         "frozen_ref": "",
         "frozen_at": None,
         "frozen_by": "",
+        "freeze_history": [],
         "goal_checks": [],
         "env_schema": env_schema,
         "created_at": now,
@@ -1434,6 +1436,11 @@ def get_workflow(root: Path, wid: str, *, rev: int | None = None) -> dict[str, A
         "frozen_ref": workflow.get("frozen_ref") or "",
         "frozen_at": workflow.get("frozen_at"),
         "frozen_by": workflow.get("frozen_by") or "",
+        "freeze_history": [
+            dict(item)
+            for item in (workflow.get("freeze_history") or [])
+            if isinstance(item, Mapping)
+        ],
         "goal_checks": list(workflow.get("goal_checks") or []),
         "graph": _graph_of(revision),
         "ui": _read_ui(root, wid),
@@ -2126,8 +2133,10 @@ def add_edge(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dic
             raise StudioError("bad_request", "数据边必须提供 via（变量名）")
         producer = next(node for node in nodes if str(node.get("id")) == from_id)
         produced = set((producer.get("capture") or {}).keys()) | {from_id}
-        root = template_roots("${" + via_text + "}")
-        name = root[0] if root else via_text
+        # 注意：变量名不能用 ``root``，否则会遮蔽入参 ``root: Path``，
+        # 后续 ``_commit_revision``/``_node_payload`` 会把路径列表当工作区根目录用。
+        var_roots = template_roots("${" + via_text + "}")
+        name = var_roots[0] if var_roots else via_text
         if name not in produced:
             raise StudioError(
                 "bad_request",
@@ -2909,6 +2918,19 @@ def freeze(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
     previous_mode = execution_mode_of(workflow)
     previous_ref = str(workflow.get("frozen_ref") or "")
     now = time.time()
+    history = workflow.get("freeze_history")
+    if not isinstance(history, list):
+        history = []
+    history = [dict(item) for item in history if isinstance(item, Mapping)]
+    history.append(
+        {
+            "frozen_ref": ref,
+            "frozen_at": now,
+            "frozen_by": actor,
+            "message": message,
+        }
+    )
+    workflow["freeze_history"] = history
     workflow["execution_mode"] = "frozen"
     workflow["frozen_ref"] = ref
     workflow["frozen_at"] = now

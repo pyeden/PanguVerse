@@ -129,7 +129,12 @@ class Job:
                 self.summary = summary
             if conclusion is not None:
                 self.conclusion = conclusion
-            self.status = DONE
+            # 进程正常结束不等于用例全通过：只有 summary.success 明确为真才 done。
+            # phases 由任务执行期写入，这里不改动（仍保留完整阶段轨迹）。
+            if isinstance(self.summary, dict) and self.summary.get("success") is False:
+                self.status = FAILED
+            else:
+                self.status = DONE
             self.finished_at = time.time()
             self._notify_finished()
             return True

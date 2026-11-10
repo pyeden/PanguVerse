@@ -1126,6 +1126,8 @@ def _job_summary(run: RunResult) -> dict[str, Any]:
         "skipped": summary["skipped"],
         "healed_cases": summary["healed_cases"],
         "duration_ms": summary["duration_ms"],
+        # additive：job 终态判据（全部用例通过才算 done）
+        "success": bool(summary["success"]),
     }
 
 

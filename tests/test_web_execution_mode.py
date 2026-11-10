@@ -173,6 +173,54 @@ def test_unfreeze_keeps_history_and_writes_two_audit_entries(api: WebAPI) -> Non
     assert actions.index("freeze") < actions.index("unfreeze")
 
 
+def test_repeated_freeze_appends_history(api: WebAPI) -> None:
+    """P2：解冻后再次固化不得丢历史；top-level 只保留最新指针。"""
+    wid, task_id = approved_published(api)
+    run_task(api, task_id)
+
+    status, first = call(
+        api, "POST", f"/api/studio/{wid}/freeze", {"rev": 0, "message": "第一次固化"}
+    )
+    assert status == 200, first
+    workflow = studio.read_workflow(api.root, wid)
+    history = workflow["freeze_history"]
+    assert len(history) == 1
+    assert history[0]["frozen_ref"] == first["frozen_ref"]
+    assert history[0]["frozen_by"] == "local"
+    assert history[0]["message"] == "第一次固化"
+    assert isinstance(history[0]["frozen_at"], (int, float))
+
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/unfreeze", {"message": "解冻再改"}
+    )
+    assert status == 200, body
+    workflow = studio.read_workflow(api.root, wid)
+    assert len(workflow["freeze_history"]) == 1  # unfreeze 不动历史
+    assert workflow["frozen_ref"] == first["frozen_ref"]
+
+    status, second = call(
+        api, "POST", f"/api/studio/{wid}/freeze", {"rev": 0, "message": "第二次固化"}
+    )
+    assert status == 200, second
+    workflow = studio.read_workflow(api.root, wid)
+    history = workflow["freeze_history"]
+    assert len(history) == 2
+    assert [item["message"] for item in history] == ["第一次固化", "第二次固化"]
+    assert [item["frozen_ref"] for item in history] == [
+        first["frozen_ref"],
+        second["frozen_ref"],
+    ]
+    assert all(item["frozen_by"] == "local" for item in history)
+    # 顶层仍取最新值
+    assert workflow["frozen_ref"] == second["frozen_ref"]
+    assert workflow["frozen_at"] == history[-1]["frozen_at"]
+    assert workflow["execution_mode"] == "frozen"
+
+    status, detail = call(api, "GET", f"/api/studio/{wid}")
+    assert status == 200, detail
+    assert detail["freeze_history"] == history
+
+
 def test_frozen_run_marks_meta_without_llm_planning(
     api: WebAPI, monkeypatch: pytest.MonkeyPatch
 ) -> None:

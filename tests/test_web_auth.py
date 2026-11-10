@@ -228,9 +228,12 @@ def test_a31_rate_limit_after_five_failures(web: Client) -> None:
         assert status == 401 and body["error"]["code"] == "bad_credentials"
     status, body, headers = web.login("wrong")
     assert status == 429
-    assert_error(body, "too_many_attempts")
+    assert body["error"]["code"] == "too_many_attempts"
+    assert isinstance(body["error"]["message"], str) and body["error"]["message"]
     retry_after = headers.get("Retry-After")
     assert retry_after is not None and int(retry_after) > 0
+    # P2：响应体也带秒数，前端不必依赖 header 才能提示倒计时。
+    assert body["retry_after_seconds"] == int(retry_after)
 
     # 被限流后，即使密码正确也不放行
     status, body, _headers = web.login(PASSWORD)
