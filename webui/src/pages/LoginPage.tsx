@@ -24,10 +24,15 @@ export function LoginPage({
     document.title = '登录 · PanguVerse'
   }, [])
 
+  // 只在首次挂载时决定焦点：跟随 username 会在每次输入后把焦点抢到密码框
+  const focusedOnce = useRef(false)
   useEffect(() => {
+    if (focusedOnce.current) return
+    focusedOnce.current = true
     if (!username) userRef.current?.focus()
     else passwordRef.current?.focus()
-  }, [username])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const submit = async (event: React.FormEvent) => {
     event.preventDefault()
