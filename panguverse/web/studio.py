@@ -86,6 +86,7 @@ _STATUS_BY_CODE = {
     "capability_gap": 409,
     "atom_missing": 409,
     "no_successful_run": 409,
+    "frozen_read_only": 409,
     "not_general": 422,
     "replay_failed": 422,
     "internal_error": 500,
@@ -127,6 +128,18 @@ def execution_mode_of(workflow: Mapping[str, Any] | None) -> str:
     """读取执行态；旧 workflow.json 缺字段一律按 debug（兼容历史数据）。"""
     value = str((workflow or {}).get("execution_mode") or "").strip()
     return value if value in EXECUTION_MODES else DEFAULT_EXECUTION_MODE
+
+
+def _assert_not_frozen(workflow: Mapping[str, Any]) -> None:
+    """冻结态守卫：已固化任务的图只读，任何改图入口必须先通过这里。
+
+    只挡图变更；freeze/unfreeze/run/publish/review/list/get 等只读或状态机
+    入口不经过此守卫。
+    """
+    if execution_mode_of(workflow) == "frozen":
+        raise StudioError(
+            "frozen_read_only", "任务已固化：先回到调试再修改", status=409
+        )
 
 
 def _as_rev(value: Any, *, field: str = "rev") -> int:
@@ -1588,9 +1601,10 @@ def patch_node(
     root: Path, wid: str, node_id: str, payload: Any, *, actor: str = "local"
 ) -> dict[str, Any]:
     data = _as_dict(payload)
+    workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     if "draft" in data:
         return update_draft_node(root, wid, node_id, data, actor=actor)
-    workflow = read_workflow(root, wid)
     revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
     nodes = [dict(node) for node in revision.get("nodes") or []]
 
@@ -1780,6 +1794,7 @@ def rebind_node_to_atom(
 ) -> dict[str, Any]:
     """把某个 revision 里的节点 atom 换成已注册工作区原子，并生成新 rev。"""
     workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     base = int(workflow.get("current_rev") or 0) if base_rev is None else int(base_rev)
     revision = read_revision(root, wid, base)
     nodes = [dict(node) for node in revision.get("nodes") or []]
@@ -2010,9 +2025,10 @@ def _make_node(data: Mapping[str, Any], *, case_id: str, case_name: str) -> dict
 
 def add_node(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
     data = _as_dict(payload)
+    workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     if "draft" in data or ("code" in data and "atom" not in data):
         return add_draft_node(root, wid, data, actor=actor)
-    workflow = read_workflow(root, wid)
     revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
     nodes = [dict(node) for node in revision.get("nodes") or []]
     edges = [dict(edge) for edge in revision.get("edges") or []]
@@ -2081,6 +2097,7 @@ def delete_node(
     root: Path, wid: str, node_id: str, *, actor: str = "local"
 ) -> dict[str, Any]:
     workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
     nodes = [dict(node) for node in revision.get("nodes") or []]
     _find_node(nodes, node_id)
@@ -2111,6 +2128,7 @@ def delete_node(
 def add_edge(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[str, Any]:
     data = _as_dict(payload)
     workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     revision = read_revision(root, wid, int(workflow.get("current_rev") or 0))
     nodes = [dict(node) for node in revision.get("nodes") or []]
     edges = [dict(edge) for edge in revision.get("edges") or []]
@@ -2198,6 +2216,7 @@ def replan(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict[
     data = _as_dict(payload)
     instruction = _clean_text(data.get("instruction"), field="instruction", required=True)
     workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     base_rev = int(workflow.get("current_rev") or 0)
     revision = read_revision(root, wid, base_rev)
 
@@ -2338,6 +2357,7 @@ def apply_diff(root: Path, wid: str, payload: Any, *, actor: str = "local") -> d
         raise StudioError("bad_request", "accepted 不能为空（请至少接受一项变更）")
 
     workflow = read_workflow(root, wid)
+    _assert_not_frozen(workflow)
     proposal = _read_json(
         _workflow_dir(root, wid) / "proposals" / f"{proposed_rev}.json",
         not_found=f"提案 {proposed_rev} 不存在",

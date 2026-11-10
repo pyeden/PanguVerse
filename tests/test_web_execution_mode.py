@@ -295,3 +295,64 @@ def test_freeze_and_unfreeze_validation(api: WebAPI) -> None:
     status, body = call(api, "POST", f"/api/studio/{wid}/unfreeze", {})
     assert status == 400, body
     assert body["error"]["code"] == "bad_request"
+
+
+def _graph_view(api: WebAPI, wid: str) -> dict[str, Any]:
+    status, detail = call(api, "GET", f"/api/studio/{wid}")
+    assert status == 200, detail
+    return detail
+
+
+def test_frozen_blocks_graph_mutations_until_unfreeze(api: WebAPI) -> None:
+    """G1：frozen 下改图四入口一律 409 frozen_read_only；解冻后同样操作成功。"""
+    wid, task_id = approved_published(api)
+    run_task(api, task_id)
+    status, frozen = call(
+        api, "POST", f"/api/studio/{wid}/freeze", {"rev": 0, "message": "固化"}
+    )
+    assert status == 200, frozen
+    assert studio.execution_mode_of(studio.read_workflow(api.root, wid)) == "frozen"
+
+    detail = _graph_view(api, wid)
+    nodes = [str(node["id"]) for node in detail["graph"]["nodes"]]
+    assert len(nodes) >= 2
+    first, last = nodes[0], nodes[-1]
+    atom = detail["graph"]["nodes"][0]["atom"]
+
+    mutations = [
+        ("PATCH", f"/api/studio/{wid}/nodes/{first}", {"name": "改名"}),
+        ("DELETE", f"/api/studio/{wid}/nodes/{first}", None),
+        ("POST", f"/api/studio/{wid}/edges", {"from": last, "to": first, "kind": "order"}),
+        ("POST", f"/api/studio/{wid}/nodes", {"atom": atom, "name": "新增节点", "id": "extra_node"}),
+    ]
+    for method, path, payload in mutations:
+        status, body = call(api, method, path, payload)
+        assert status == 409, (method, path, body)
+        assert body["error"]["code"] == "frozen_read_only", (method, path, body)
+
+    status, unfrozen = call(api, "POST", f"/api/studio/{wid}/unfreeze", {"message": "回到调试"})
+    assert status == 200, unfrozen
+
+    status, body = call(api, "PATCH", f"/api/studio/{wid}/nodes/{first}", {"name": "改名成功"})
+    assert status == 200, body
+    status, body = call(api, "POST", f"/api/studio/{wid}/edges", {"from": last, "to": first, "kind": "order"})
+    assert status == 201, body
+    status, body = call(api, "POST", f"/api/studio/{wid}/nodes", {"atom": atom, "name": "新增节点", "id": "extra_node"})
+    assert status == 201, body
+    status, body = call(api, "DELETE", f"/api/studio/{wid}/nodes/extra_node")
+    assert status == 200, body
+
+
+def test_debug_draft_remains_editable(api: WebAPI) -> None:
+    """G1：debug 态（未固化）任务不受冻结守卫影响，改图照常成功。"""
+    status, draft = call(
+        api, "POST", "/api/studio/drafts", {"intent": INTENT, "domain_pack": "local_fs"}
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    assert studio.execution_mode_of(studio.read_workflow(api.root, wid)) == "debug"
+
+    node_id = draft["graph"]["nodes"][0]["id"]
+    status, body = call(api, "PATCH", f"/api/studio/{wid}/nodes/{node_id}", {"name": "改个名"})
+    assert status == 200, body
+    assert body["rev"] == 1
