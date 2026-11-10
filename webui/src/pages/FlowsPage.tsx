@@ -37,7 +37,13 @@ function stateOf(workflow: Workflow): string {
 }
 
 function stateMeta(workflow: Workflow) {
-  return STATE_META[stateOf(workflow)] || { label: stateOf(workflow), tone: 'neutral' as const }
+  const state = stateOf(workflow)
+  const base = STATE_META[state] || { label: state, tone: 'neutral' as const }
+  // 已发布过、但当前 rev 又变成草稿：徽标要和“已发布”筛选口径一致，不能显示成纯草稿
+  if (state !== 'published' && workflow.published_ref) {
+    return { label: `${base.label} · 有已发布版本`, tone: 'ok' as const }
+  }
+  return base
 }
 
 function isPublished(workflow: Workflow): boolean {

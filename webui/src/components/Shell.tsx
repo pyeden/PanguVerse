@@ -139,7 +139,7 @@ export function Shell({
             <a key={item.id} href={href(item.href)} className={`nav-item ${active === item.id ? 'is-active' : ''}`} aria-current={active === item.id ? 'page' : undefined}>
               <span className="nav-icon"><Icon name={item.icon} size={18} /></span>
               <span className="nav-label">{item.label}</span>
-              {item.hint ? <span className="nav-hint">{item.hint}</span> : null}
+              {item.hint ? <span className="nav-hint" aria-hidden="true">{item.hint}</span> : null}
               {active === item.id ? <span className="nav-active-mark" aria-hidden="true" /> : null}
             </a>
           ))}

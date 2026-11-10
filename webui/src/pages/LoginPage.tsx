@@ -21,6 +21,10 @@ export function LoginPage({
   const userRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
+    document.title = '登录 · PanguVerse'
+  }, [])
+
+  useEffect(() => {
     if (!username) userRef.current?.focus()
     else passwordRef.current?.focus()
   }, [username])
