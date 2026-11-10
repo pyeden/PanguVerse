@@ -77,7 +77,8 @@ export default function App() {
 
   const statusQuery = useQuery({ queryKey: ['status'], queryFn: api.status, enabled: authState === 'in', staleTime: 30_000 })
   const title = pageTitle(route)
-  useEffect(() => { document.title = `${title} · PanguVerse` }, [title])
+  // authState 变化时也要重算：登录页会把标题改成「登录」，登录后路由 title 可能没变
+  useEffect(() => { document.title = `${title} · PanguVerse` }, [title, authState])
 
   const logout = async () => {
     try {
