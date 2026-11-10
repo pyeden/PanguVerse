@@ -728,6 +728,7 @@ class WebBrowserSemantics(GenericSemantics):
             "url 端口只放纯 URL：不要把用户意图说明拼进 URL，整句意图放 intent/说明类字段",
             "站点专用解析原子只适用于其站点（如 baidu_hot_report 只解析百度热搜）；跨站点请用通用抓取+提取，缺能力时按 capability_gap 处理",
             "标题/文案断言要用多语言品牌写法（如 必应|Bing），只写英文域名会在本地化页面误杀",
+            "wait_for 只用于「JS 渲染后才出现」的关键文本；不要用导航词/泛词（新闻、首页、登录），静态页面省略 wait_for",
             "链接用 web_extract_links(${open.html})，正文用 web_get_text(${open.html})",
             "动态内容用 web_wait_for_text 轮询；它的 timeout 明确失败且不可重试",
             "web_screenshot 的 path 相对 workspace 根（.panguverse/artifacts/web/…）",
