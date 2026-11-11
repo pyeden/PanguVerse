@@ -78,6 +78,7 @@ export function RunDetailPage() {
 
   const runQuery = useQuery({ queryKey: ['run', rid], queryFn: () => api.run(rid), enabled: !!rid })
   const insightQuery = useQuery({ queryKey: ['insight', rid], queryFn: () => api.insight(rid), enabled: !!rid })
+  const diffQuery = useQuery({ queryKey: ['run-diff', rid], queryFn: () => api.runDiff(rid), enabled: !!rid })
   const projectQuery = useQuery({ queryKey: ['project', pid], queryFn: () => api.project(pid), enabled: !!pid })
   const runArtifactsQuery = useQuery({
     queryKey: ['run-artifacts', rid],
@@ -303,6 +304,57 @@ export function RunDetailPage() {
                 {insight.degraded_reason ? <div className="insight-degraded"><Icon name="warning" size={14} />{insight.degraded_reason}</div> : null}
                 <Markdown value={insight.summary_md} />
                 {Array.isArray(insight.corrections) && insight.corrections.length ? <div className="insight-corrections"><Badge tone="neutral">确定性校正 {insight.corrections.length} 项</Badge></div> : null}
+              </>
+            ) : null}
+          </section>
+
+          <section className="panel" data-testid="run-diff-panel">
+            <SectionHeader
+              title="与上次对比"
+              description="同一任务上一次运行的变化：步骤、产出物、变量。"
+              icon="refresh"
+            />
+            {diffQuery.isLoading ? <Loading label="正在对比…" /> : null}
+            {diffQuery.data && diffQuery.data.available === false ? (
+              <p className="muted">没有可对比的历史运行。</p>
+            ) : null}
+            {diffQuery.data?.available ? (
+              <>
+                <div className="task-meta" style={{ marginBottom: 8 }}>
+                  <span>基线 <span className="mono">{String(diffQuery.data.base_id)}</span></span>
+                  <span>·</span>
+                  <span>步骤 {Number(diffQuery.data.counts?.steps || 0)}</span>
+                  <span>产出物 {Number(diffQuery.data.counts?.artifacts || 0)}</span>
+                  <span>变量 {Number(diffQuery.data.counts?.variables || 0)}</span>
+                </div>
+                {(diffQuery.data.steps || []).length ? (
+                  <ul className="task-list">
+                    {(diffQuery.data.steps || []).slice(0, 12).map((item: AnyRecord, index: number) => (
+                      <li key={`diff-step-${index}`} className="task-row">
+                        <span className="mono">{String(item.step)}</span>
+                        <Badge tone={item.change === 'status_changed' ? 'bad' : 'warn'}>{String(item.change)}</Badge>
+                        <span className="muted">
+                          {String(item.base_status || '')} → {String(item.target_status || '')}
+                          {item.duration_delta_ms ? ` · ${Number(item.duration_delta_ms) > 0 ? '+' : ''}${item.duration_delta_ms}ms` : ''}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                ) : <p className="muted">步骤状态与耗时无变化。</p>}
+                {(diffQuery.data.variables || []).length ? (
+                  <div className="task-meta" style={{ marginTop: 8 }}>
+                    {(diffQuery.data.variables || []).slice(0, 8).map((item: AnyRecord, index: number) => (
+                      <span key={`diff-var-${index}`} className="mono">{String(item.name)}: {String(item.base)} → {String(item.target)}</span>
+                    ))}
+                  </div>
+                ) : null}
+                {(diffQuery.data.artifacts || []).length ? (
+                  <div className="task-meta" style={{ marginTop: 8 }}>
+                    {(diffQuery.data.artifacts || []).slice(0, 8).map((item: AnyRecord, index: number) => (
+                      <span key={`diff-art-${index}`}>{String(item.name)} · {String(item.change)}</span>
+                    ))}
+                  </div>
+                ) : null}
               </>
             ) : null}
           </section>

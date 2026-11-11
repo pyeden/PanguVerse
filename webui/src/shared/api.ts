@@ -189,6 +189,8 @@ export const api = {
   runs: (limit = 50) => request<RunSummary[]>(`api/runs?limit=${limit}`),
   queryRuns: (params: URLSearchParams) => request<{ total: number; items: RunSummary[] }>(`api/runs/query?${params.toString()}`),
   run: (rid: string) => request<RunDetail>(`api/runs/${encodeURIComponent(rid)}`),
+  runDiff: (rid: string, base?: string) =>
+    request<AnyRecord>(`api/runs/${encodeURIComponent(rid)}/diff${base ? `?base=${encodeURIComponent(base)}` : ''}`),
   insight: (rid: string) => request<Insight>(`api/runs/${encodeURIComponent(rid)}/insight`),
   generateInsight: (rid: string, refresh = false) =>
     request<Insight>(`api/runs/${encodeURIComponent(rid)}/insight`, { method: 'POST', body: { refresh } }),
