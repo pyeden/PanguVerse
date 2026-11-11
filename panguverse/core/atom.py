@@ -92,6 +92,9 @@ class Atom:
     #: 该原子产出的「任务产出物」名字（如 ``("summary_md",)``）；空表示不产出。
     #: 只声明语义，不改变执行结果：收集由 Web 层在运行结束后尽力完成。
     produces: tuple[str, ...] = ()
+    #: 该原子适用的站点（host 后缀，如 ``baidu.com``）；空表示不限站点。
+    #: 计划校验据此把「跨站复用」识别为 capability_gap，而不是等到运行期静默失败。
+    sites: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.name:
@@ -113,6 +116,7 @@ class Atom:
         self.declares_variables = tuple(self.declares_variables)
         self.needs_tool = str(self.needs_tool or "")
         self.produces = tuple(str(item) for item in self.produces)
+        self.sites = tuple(str(site).strip().lower() for site in self.sites if str(site).strip())
 
     # ------------------------------------------------------------------ #
     # 契约视图
@@ -234,6 +238,8 @@ class Atom:
             data["declares_variables"] = list(self.declares_variables)
         if self.produces:
             data["produces"] = list(self.produces)
+        if self.sites:
+            data["sites"] = list(self.sites)
         if self.failure_class:
             data["failure_class"] = self.failure_class
         return data
@@ -263,6 +269,7 @@ def atom(
     effect_resolver: Callable[[Mapping[str, Any]], Iterable[str]] | None = None,
     needs_tool: str = "",
     produces: Iterable[str] = (),
+    sites: Iterable[str] = (),
 ) -> Callable[[Callable[..., Any]], Atom]:
     """装饰器写法：``@atom("http_request", ...) def http_request(ctx, url): ...``"""
 
@@ -290,6 +297,7 @@ def atom(
             effect_resolver=effect_resolver,
             needs_tool=needs_tool,
             produces=tuple(produces),
+            sites=tuple(sites),
         )
 
     return decorate

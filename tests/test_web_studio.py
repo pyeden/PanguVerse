@@ -1031,3 +1031,51 @@ def test_archive_is_idempotent_and_validates_input(api: WebAPI) -> None:
     status, body = call(api, "POST", "/api/studio/w-abcdef12/archive", {"archived": True})
     assert status == 404, body
     assert body["error"]["code"] == "not_found"
+
+
+def test_site_bound_atom_mismatch_is_capability_gap() -> None:
+    """G3：站点专用原子跨站复用 → capability_gap，而不是运行期静默产空。"""
+    from panguverse.core.atom import Atom
+
+    atom = Atom(name="baidu_hot_report", fn=lambda: None, sites=("baidu.com",))
+
+    class Registry:
+        def get(self, name: str) -> Atom:
+            return atom
+
+    bing = [{"id": "n1", "atom": "baidu_hot_report", "params": {"url": "https://www.bing.com/"}}]
+    issues = studio._site_mismatches(bing, Registry())
+    assert issues and issues[0]["code"] == "capability_gap"
+    assert "baidu.com" in issues[0]["message"]
+    assert "www.bing.com" in issues[0]["message"]
+
+    baidu = [{"id": "n1", "atom": "baidu_hot_report", "params": {"url": "https://top.baidu.com/board?tab=realtime"}}]
+    assert studio._site_mismatches(baidu, Registry()) == []
+
+    neutral = Atom(name="generic", fn=lambda: None)
+
+    class NeutralRegistry:
+        def get(self, name: str) -> Atom:
+            return neutral
+
+    assert studio._site_mismatches(bing, NeutralRegistry()) == []
+
+
+def test_validate_nodes_surfaces_site_gap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """G3：校验结果里必须出现 capability_gap，而不是只当成普通断言失败。"""
+    monkeypatch.setattr(
+        studio,
+        "_site_mismatches",
+        lambda nodes, registry: [
+            studio._semantic_issue("capability_gap", "原子仅支持 baidu.com", node_id="n1")
+        ],
+    )
+    result = studio.validate_nodes(
+        tmp_path,
+        wid="w-sitegap",
+        rev=0,
+        nodes=[{"id": "n1", "atom": "log", "params": {"message": "x"}}],
+        edges=[],
+    )
+    assert any(item["code"] == "capability_gap" for item in result["errors"])
+    assert "原子仅支持 baidu.com" in result["capability_gaps"]

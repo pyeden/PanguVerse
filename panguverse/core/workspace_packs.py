@@ -104,6 +104,7 @@ def _atom_from_manifest(raw: Mapping[str, Any], *, base: Path, pack: str, domain
         source="explore",
         version=str(raw.get("version") or "0.1.0"),
         produces=produces,
+        sites=tuple(str(site) for site in (raw.get("sites") or ()) if str(site).strip()),
     )
 
 

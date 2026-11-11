@@ -28,6 +28,7 @@ import uuid
 from collections.abc import Iterable, Mapping
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..axe.plan import PlanRequest
 from ..axe.planner import RuleBasedPlanner
@@ -642,6 +643,65 @@ def _semantic_issue(code: str, message: str, *, node_id: str = "", hint: str = "
     return issue
 
 
+def _site_mismatches(
+    nodes: Iterable[Mapping[str, Any]], registry: Any
+) -> list[dict[str, Any]]:
+    """站点专用原子被跨站复用 → capability_gap。
+
+    原子可用 ``sites=("baidu.com",)`` 声明适用范围；目标 host 不匹配时在计划校验
+    阶段就报缺口，而不是等到运行期解析出 0 条、看起来像普通失败。
+    """
+    def _hosts(params: Any) -> list[str]:
+        found: list[str] = []
+        if not isinstance(params, Mapping):
+            return found
+        for value in params.values():
+            if not isinstance(value, str) or not re.match(r"^https?://", value.strip(), re.I):
+                continue
+            host = (urlsplit(value.strip()).hostname or "").lower()
+            if host and host not in found:
+                found.append(host)
+        return found
+
+    all_nodes = list(nodes)
+    # 工作流级目标：站点专用原子往往只接 source，URL 挂在别的节点上，需要回退到这里
+    workflow_hosts: list[str] = []
+    for node in all_nodes:
+        for host in _hosts(node.get("params")):
+            if host not in workflow_hosts:
+                workflow_hosts.append(host)
+
+    issues: list[dict[str, Any]] = []
+    for node in all_nodes:
+        atom_name = str(node.get("atom") or "").strip()
+        if not atom_name:
+            continue
+        try:
+            atom = registry.get(atom_name)
+        except Exception:  # noqa: BLE001 - 未注册原子由其他检查负责
+            continue
+        sites = tuple(
+            str(site).strip().lower()
+            for site in (getattr(atom, "sites", ()) or ())
+            if str(site).strip()
+        )
+        if not sites:
+            continue
+        hosts = _hosts(node.get("params")) or workflow_hosts
+        for host in hosts:
+            if any(host == site or host.endswith("." + site) for site in sites):
+                continue
+            issues.append(
+                _semantic_issue(
+                    "capability_gap",
+                    f"原子 {atom_name} 仅支持 {', '.join(sites)}，当前目标是 {host}",
+                    node_id=str(node.get("id") or ""),
+                    hint="换用通用原子，或先补该站点的专用原子再规划",
+                )
+            )
+    return issues
+
+
 def _semantic_checks(
     *,
     nodes: list[Mapping[str, Any]],
@@ -773,6 +833,12 @@ def validate_nodes(
         explore=explore,
     )
     errors.extend(semantic)
+    site_issues = _site_mismatches(nodes, registry)
+    errors.extend(site_issues)
+    if site_issues:
+        detail["capability_gaps"] = list(detail.get("capability_gaps") or []) + [
+            item["message"] for item in site_issues
+        ]
     warnings.extend(semantic_warnings)
     error_nodes = {item.get("node_id") for item in errors if item.get("node_id")}
     affected = _downstream_nodes(nodes, edges, error_nodes)
