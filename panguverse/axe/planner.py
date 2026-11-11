@@ -206,7 +206,8 @@ class LLMPlanner:
         problems: list[str] = []
         for round_index in range(self.max_repair_rounds + 1):
             try:
-                data = self.client.complete_json(SYSTEM_PROMPT, user_prompt)
+                # 规划必须可复现：显式 temperature=0，不依赖客户端默认值
+                data = self.client.complete_json(SYSTEM_PROMPT, user_prompt, temperature=0.0)
             except Exception as exc:  # noqa: BLE001 - 任何 LLM 失败都要降级而不是中断
                 return self._degrade(request, f"LLM 调用失败: {exc}")
             try:

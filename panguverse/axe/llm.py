@@ -270,6 +270,7 @@ class LLMClient:
         user: str,
         *,
         timeout: float | None = None,
+        temperature: float = 0.0,
     ) -> dict[str, Any]:
         """要求返回 JSON 对象；解析失败会抛出 LLMError。
 
@@ -281,6 +282,7 @@ class LLMClient:
         text = self.complete(
             system,
             user,
+            temperature=temperature,
             json_mode=True,
             max_tokens=json_max_tokens,
             timeout=timeout,
