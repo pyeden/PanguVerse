@@ -805,6 +805,11 @@ class WebAPI:
                 return json_response(
                     studio.debug_workflow(self.root, wid, body, actor=actor), status=202
                 )
+            if action == "run" and method == "POST":
+                return json_response(
+                    studio.run_workflow(self.root, wid, body, jobs=self.jobs, actor=actor),
+                    status=202,
+                )
             if action == "review" and method == "POST":
                 return json_response(studio.review(self.root, wid, body))
             if action == "publish" and method == "POST":

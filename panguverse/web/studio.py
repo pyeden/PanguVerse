@@ -1414,6 +1414,7 @@ def list_drafts(
 ) -> dict[str, Any]:
     base = studio_root(root)
     items: list[dict[str, Any]] = []
+    refs: dict[str, str] = {}
     if base.is_dir():
         for child in sorted(base.iterdir()):
             if not child.is_dir() or not WID_RE.match(child.name):
@@ -1435,6 +1436,9 @@ def list_drafts(
                 node_count = len(revision.get("nodes") or [])
             except StudioError:
                 node_count = 0
+            current_rev = int(workflow.get("current_rev") or 0)
+            workflow_wid = str(workflow.get("wid") or child.name)
+            refs[workflow_wid] = f"{child.name}@{current_rev}"
             items.append(
                 {
                     "wid": workflow.get("wid"),
@@ -1442,19 +1446,101 @@ def list_drafts(
                     "intent": workflow.get("intent"),
                     "domain_pack": workflow.get("domain_pack"),
                     "state": workflow.get("state"),
-                    "current_rev": workflow.get("current_rev"),
+                    "current_rev": current_rev,
                     "published_ref": workflow.get("published_ref"),
                     "execution_mode": execution_mode_of(workflow),
                     "frozen_ref": workflow.get("frozen_ref") or "",
                     "frozen_at": workflow.get("frozen_at"),
                     "archived_at": workflow.get("archived_at"),
                     "node_count": node_count,
+                    "last_run": None,
+                    "freeze_ready": False,
                     "created_at": workflow.get("created_at"),
                     "updated_at": workflow.get("updated_at"),
                 }
             )
+    if items:
+        run_index = _draft_run_index(root, set(refs.values()))
+        for item in items:
+            state = run_index.get(refs.get(str(item.get("wid")), ""))
+            item["last_run"] = state
+            item["freeze_ready"] = bool(
+                state and state.get("success") and item.get("execution_mode") == "debug"
+            )
     items.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
     return {"drafts": items}
+
+
+#: 任务卡只回看最近这么多次正式运行，避免列表全量读 runs。
+DRAFT_LIST_RUN_WINDOW = 200
+
+
+def _report_workflow_ref(report: Mapping[str, Any]) -> str:
+    meta = report.get("meta")
+    if not isinstance(meta, Mapping):
+        return ""
+    direct = str(meta.get("workflow_ref") or "")
+    if direct:
+        return direct
+    config = meta.get("run_config")
+    if isinstance(config, Mapping):
+        return str(config.get("workflow_ref") or "")
+    return ""
+
+
+def _draft_run_index(root: Path, refs: set[str]) -> dict[str, dict[str, Any]]:
+    """``{workflow_ref: last_run}``；只在最近 ``DRAFT_LIST_RUN_WINDOW`` 条运行里找。
+
+    ``runs/`` 目录名不是时间序，因此先按 ``report.json`` 的 mtime 取最新 N 条，
+    再按报告里的 ``started_at`` 选出每个 ref 最近的一次，避免老 run 覆盖新结果。
+    """
+    from . import service
+
+    base = service.runs_root(root)
+    if not base.is_dir() or not refs:
+        return {}
+    candidates: list[tuple[float, str, Path]] = []
+    try:
+        children = list(base.iterdir())
+    except OSError:
+        return {}
+    for child in children:
+        if not child.is_dir():
+            continue
+        report_path = child / "report.json"
+        try:
+            mtime = report_path.stat().st_mtime
+        except OSError:
+            continue
+        candidates.append((mtime, child.name, report_path))
+    candidates.sort(key=lambda item: item[0], reverse=True)
+
+    index: dict[str, dict[str, Any]] = {}
+    for _mtime, run_dir, report_path in candidates[: max(1, DRAFT_LIST_RUN_WINDOW)]:
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(report, dict):
+            continue
+        ref = _report_workflow_ref(report)
+        if not ref or ref not in refs:
+            continue
+        started = float(report.get("started_at") or 0)
+        previous = index.get(ref)
+        if previous is not None and float(previous.get("_started") or 0) >= started:
+            continue
+        success = _run_succeeded(report)
+        index[ref] = {
+            "run_id": report.get("run_id") or run_dir,
+            "status": "done" if success else "failed",
+            "success": success,
+            "finished_at": report.get("finished_at"),
+            "_started": started,
+        }
+    for state in index.values():
+        state.pop("_started", None)
+    return index
 
 
 def _ui_path(root: Path, wid: str) -> Path:
@@ -2796,6 +2882,61 @@ def publish(root: Path, wid: str, payload: Any, *, actor: str = "local") -> dict
         "message": message,
         "published_at": record["published_at"],
         "reused": False,
+    }
+
+
+def run_workflow(
+    root: Path, wid: str, payload: Any, *, jobs: Any, actor: str = "local"
+) -> dict[str, Any]:
+    """运行当前版本：必须已发布，复用发布时的任务定义入队。
+
+    与 ``freeze`` 的前置一致（``published_ref == wid@current_rev``），
+    但运行本身不改变执行态；返回 job/task/workflow_ref 供任务卡直接追踪。
+    """
+    from . import service
+
+    if payload is not None and not isinstance(payload, Mapping):
+        raise StudioError("bad_request", "请求体必须是 JSON 对象")
+    workflow = read_workflow(root, wid)
+    rev = int(workflow.get("current_rev") or 0)
+    ref = f"{wid}@{rev}"
+    published_ref = str(workflow.get("published_ref") or "")
+    details = {"workflow_ref": ref, "published_ref": published_ref, "current_rev": rev}
+    if published_ref != ref:
+        raise StudioError(
+            "not_published",
+            "当前版本尚未发布，请先发布再运行",
+            status=409,
+            details=details,
+        )
+    try:
+        load_published(root, ref)
+    except StudioError as exc:
+        if exc.code != "not_found":
+            raise
+        raise StudioError(
+            "not_published",
+            "当前版本的发布记录不存在，请先发布再运行",
+            status=409,
+            details=details,
+        ) from exc
+    task = service.ensure_published_workflow_task(root, wid, rev)
+    job = service.run_task(jobs, root, task["task_id"], payload)
+    _append_audit(
+        _workflow_dir(root, wid),
+        {
+            "action": "run",
+            "actor": actor,
+            "wid": wid,
+            "to": ref,
+            "rev": rev,
+            "note": job.job_id,
+        },
+    )
+    return {
+        "job_id": job.job_id,
+        "task_id": task["task_id"],
+        "workflow_ref": ref,
     }
 
 

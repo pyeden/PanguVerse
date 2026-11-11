@@ -477,7 +477,7 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/studio/drafts` | `{intent, domain_pack?, exclude_atoms?, allow_llm?}` → 201 `{wid, rev:0, state, planner, plan_source, confidence, assumptions, capability_gaps, graph, validation}`；无法表达 → **422 `capability_gap`**（无 graph） |
-| GET | `/api/studio/drafts` | `?status=&domain_pack=` → `{drafts:[...]}` |
+| GET | `/api/studio/drafts` | `?status=&domain_pack=` → `{drafts:[...]}`；每项追加 `last_run`（`{run_id,status,success,finished_at}` 或 `null`）与 `freeze_ready` |
 | GET | `/api/studio/{wid}` | `?rev=` 取图 + 元信息 + `ui` |
 | PATCH | `/api/studio/{wid}/nodes/{nid}` | 改参数/改名/锁定/替换原子/`case_id` → 新 rev（`origin=human`） |
 | POST | `/api/studio/{wid}/nodes` | `{atom, params?, ..., after?}` → 新 rev（201） |
@@ -491,9 +491,14 @@ PATCH 的 env 是**键级合并**，三态与任务 CRUD 完全一致：`"***"`/
 | POST | `/api/studio/{wid}/review` | `{base_rev?, rev}` → `{diff, risks, validation, audit_tail}` |
 | POST | `/api/studio/{wid}/state` | `{to:"review|approved|rejected", note?, risk_ack?, confirmed_risks?}` |
 | POST | `/api/studio/{wid}/publish` | `{rev, message}` → `{workflow_ref:"<wid>@<rev>", reused, task}` |
+| POST | `/api/studio/{wid}/run` | 无 body 或 `{env?}`；要求 `published_ref == <wid>@current_rev`，否则 **409 `not_published`** → **202** `{job_id, task_id, workflow_ref}` |
 
 节点坐标：`PATCH .../nodes/{nid}` 只带 `{"ui":{"x":..,"y":..}}` 时只更新 `ui.json`，**不产生新 rev**。
 其它字段变更一律产生新 rev，并把 `state` 重置为 `draft`（旧批准失效）。
+
+任务卡的 `last_run` 按 `workflow_ref=<wid>@current_rev` 匹配正式运行报告，列表只解析最近
+`200` 条 run（先按 `report.json` mtime 取窗口，再按 `started_at` 取每个 ref 最新一条）；
+`freeze_ready = execution_mode == "debug" && last_run.success == true`。
 
 ### 7.2a 规划来源与能力缺口（v6.0 §2）
 

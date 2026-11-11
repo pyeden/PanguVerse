@@ -547,6 +547,160 @@ def test_task_run_records_task_trigger(api: WebAPI, tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 任务卡直跑 / 可固化判断
+# --------------------------------------------------------------------------- #
+def _publish_local_fs(api: WebAPI, tmp_path: Path) -> tuple[str, dict[str, Any]]:
+    fs_root = tmp_path / "fs"
+    fs_root.mkdir(exist_ok=True)
+    service.save_last_env(api.root, {"FS_ROOT": str(fs_root)})
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "备份配置文件并校验备份存在", "domain_pack": "local_fs"},
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/state", {"to": "approved", "risk_ack": True}
+    )
+    assert status == 200, body
+    status, published = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "可运行版本"}
+    )
+    assert status == 200, published
+    return wid, published
+
+
+def test_studio_run_requires_published_current_rev(api: WebAPI, tmp_path: Path) -> None:
+    status, draft = call(
+        api,
+        "POST",
+        "/api/studio/drafts",
+        {"intent": "备份配置文件并校验备份存在", "domain_pack": "local_fs"},
+    )
+    assert status == 201, draft
+    wid = draft["wid"]
+
+    status, body = call(api, "POST", f"/api/studio/{wid}/run", {})
+    assert status == 409, body
+    assert body["error"]["code"] == "not_published"
+    assert body["error"]["workflow_ref"] == f"{wid}@0"
+
+    status, body = call(api, "POST", "/api/studio/w-deadbeef/run", {})
+    assert status == 404, body
+
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/state", {"to": "approved", "risk_ack": True}
+    )
+    assert status == 200, body
+    status, published = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 0, "message": "首发"}
+    )
+    assert status == 200, published
+    task_id = published["task"]["task_id"]
+
+    status, queued = call(api, "POST", f"/api/studio/{wid}/run", {})
+    assert status == 202, queued
+    assert queued["task_id"] == task_id
+    assert queued["workflow_ref"] == f"{wid}@0"
+    assert queued["job_id"]
+
+    job = wait_job(api, queued["job_id"])
+    assert job["status"] == "done", job
+    assert job["run_id"]
+
+    # 再跑一次仍复用同一个任务定义，不重复建任务
+    status, again = call(api, "POST", f"/api/studio/{wid}/run", {})
+    assert status == 202, again
+    assert again["task_id"] == task_id
+    wait_job(api, again["job_id"])
+
+
+def test_drafts_last_run_and_freeze_ready(api: WebAPI, tmp_path: Path) -> None:
+    wid, _published = _publish_local_fs(api, tmp_path)
+
+    # 无运行：last_run=null，未就绪
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    assert status == 200, listing
+    row = next(item for item in listing["drafts"] if item["wid"] == wid)
+    assert row["last_run"] is None
+    assert row["freeze_ready"] is False
+
+    # 成功运行：last_run 指向该 run，debug 态可固化
+    status, queued = call(api, "POST", f"/api/studio/{wid}/run", {})
+    assert status == 202, queued
+    job = wait_job(api, queued["job_id"])
+    assert job["status"] == "done", job
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    row = next(item for item in listing["drafts"] if item["wid"] == wid)
+    assert row["last_run"]["run_id"] == job["run_id"]
+    assert row["last_run"]["status"] == "done"
+    assert row["last_run"]["success"] is True
+    assert isinstance(row["last_run"]["finished_at"], (int, float))
+    assert row["freeze_ready"] is True
+
+    # 新 rev 的失败运行必须覆盖旧 rev 的成功结果
+    status, detail = call(api, "GET", f"/api/studio/{wid}")
+    assert status == 200, detail
+    target = next(
+        node for node in detail["graph"]["nodes"] if node["atom"] == "assert_file_contains"
+    )
+    params = dict(target["params"])
+    params["text"] = "mode=NOT_THERE"
+    status, patched = call(
+        api, "PATCH", f"/api/studio/{wid}/nodes/{target['id']}", {"params": params}
+    )
+    assert status == 200, patched
+    assert patched["rev"] == 1
+    status, body = call(
+        api, "POST", f"/api/studio/{wid}/state", {"to": "approved", "risk_ack": True}
+    )
+    assert status == 200, body
+    status, published2 = call(
+        api, "POST", f"/api/studio/{wid}/publish", {"rev": 1, "message": "制造失败"}
+    )
+    assert status == 200, published2
+    assert published2["workflow_ref"] == f"{wid}@1"
+
+    status, queued2 = call(api, "POST", f"/api/studio/{wid}/run", {})
+    assert status == 202, queued2
+    failed = wait_job(api, queued2["job_id"])
+    assert failed["status"] == "failed", failed
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    row = next(item for item in listing["drafts"] if item["wid"] == wid)
+    assert row["last_run"]["run_id"] == failed["run_id"]
+    assert row["last_run"]["status"] == "failed"
+    assert row["last_run"]["success"] is False
+    assert row["freeze_ready"] is False
+
+
+def test_drafts_last_run_scan_is_bounded(
+    api: WebAPI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """列表只解析最近 N 条 report；窗口外的旧运行不参与 last_run。"""
+    wid_a, _ = _publish_local_fs(api, tmp_path)
+    status, queued_a = call(api, "POST", f"/api/studio/{wid_a}/run", {})
+    assert status == 202, queued_a
+    run_a = wait_job(api, queued_a["job_id"])
+    assert run_a["status"] == "done", run_a
+
+    wid_b, _ = _publish_local_fs(api, tmp_path)
+    status, queued_b = call(api, "POST", f"/api/studio/{wid_b}/run", {})
+    assert status == 202, queued_b
+    run_b = wait_job(api, queued_b["job_id"])
+    assert run_b["status"] == "done", run_b
+
+    monkeypatch.setattr(studio, "DRAFT_LIST_RUN_WINDOW", 1)
+    status, listing = call(api, "GET", "/api/studio/drafts")
+    assert status == 200, listing
+    rows = {item["wid"]: item for item in listing["drafts"]}
+    assert rows[wid_a]["last_run"] is None
+    assert rows[wid_b]["last_run"]["run_id"] == run_b["run_id"]
+    assert rows[wid_b]["freeze_ready"] is True
+
+
+# --------------------------------------------------------------------------- #
 # 调试隔离 / URL 限制 / 打码
 # --------------------------------------------------------------------------- #
 def test_debug_is_isolated_and_url_override_rejected(api: WebAPI, tmp_path: Path) -> None:
