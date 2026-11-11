@@ -328,6 +328,16 @@ class WebAPI:
                     run_id, filename = rest
                     if filename == "insight":
                         return json_response(service.get_insight(self.root, run_id))
+                    if filename == "diff":
+                        from . import rundiff
+
+                        return json_response(
+                            rundiff.diff_runs(
+                                self.root,
+                                run_id,
+                                base_id=_first(query, "base") or None,
+                            )
+                        )
                     if filename == "config":
                         return json_response(service.run_config(self.root, run_id))
                     if filename in ("report.html", "junit.xml"):
