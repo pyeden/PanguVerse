@@ -208,9 +208,9 @@ def _check_case(
             missing = [cap for cap in atom.capabilities if cap not in set(capabilities)]
             if missing:
                 result.issues.append(
-                    Issue("P203", "warning",
+                    Issue("P203", "error",
                           f"原子需要能力 {', '.join(missing)}，但本次未授权", case.case_id, step.id,
-                          hint="用 --allow-capabilities 显式授权")
+                          hint="用 --allow-capabilities 或 PANGUVERSE_ALLOWED_CAPABILITIES 显式授权")
                 )
 
         # -- P204 相对根取值 ------------------------------------------------ #

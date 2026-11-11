@@ -96,15 +96,37 @@ def pack_registry() -> Any:
     return builtin_pack_registry()
 
 
+def allowed_capabilities(reg: Any) -> frozenset[str]:
+    """本次运行的能力授权集合。
+
+    - ``PANGUVERSE_ALLOWED_CAPABILITIES`` 显式给出时直接采用（逗号分隔）；
+    - 否则默认放行注册表里出现过的能力，但禁用 ``shell``
+      （可用 ``PANGUVERSE_DENIED_CAPABILITIES`` 追加禁用项）。
+    """
+    raw = (os.environ.get("PANGUVERSE_ALLOWED_CAPABILITIES") or "").strip()
+    if raw:
+        return frozenset(item.strip() for item in raw.split(",") if item.strip())
+    denied = {"shell"}
+    extra = (os.environ.get("PANGUVERSE_DENIED_CAPABILITIES") or "").strip()
+    if extra:
+        denied |= {item.strip() for item in extra.split(",") if item.strip()}
+    declared = {cap for pack in reg.packs() for cap in pack.capabilities()}
+    return frozenset(declared - denied)
+
+
 def build_axe(root: Path, *, enable_llm: bool = True) -> PanguAxe:
     from ..core.workspace_packs import workspace_registry
 
     # 工作区 pack（探索固化产物）只在本 workspace 的运行时可见。
-    return PanguAxe(
-        registry=workspace_registry(root, registry()),
+    reg = workspace_registry(root, registry())
+    axe = PanguAxe(
+        registry=reg,
         workspace=str(root),
         enable_llm=enable_llm,
     )
+    # 执行前的能力闸门：计划校验会拒绝未授权的原子（P203 error）
+    axe.settings.capabilities = allowed_capabilities(reg)
+    return axe
 
 
 def llm_enabled() -> bool:
