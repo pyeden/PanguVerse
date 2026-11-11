@@ -577,6 +577,31 @@ def _relative_output(value: Any) -> str | None:
     return text
 
 
+def _locate_absolute(root: Path, workspace: Path, value: str) -> Path | None:
+    """解析绝对产物路径，但只允许落在受信根目录内（防目录穿越）。
+
+    原子返回绝对路径是合理约定（如 ``news_data.json`` 的绝对路径），
+    不能因为「不是相对路径」就判定源文件缺失。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    candidate = Path(text).expanduser()
+    if not candidate.is_absolute():
+        return None
+    try:
+        target = candidate.resolve()
+    except OSError:
+        return None
+    for base in (workspace, root, Path(root) / STATE_DIRNAME, artifacts_root(root)):
+        try:
+            target.relative_to(Path(base).resolve())
+        except (OSError, ValueError):
+            continue
+        return target if target.is_file() else None
+    return None
+
+
 def _run_workspace(root: Path, run_id: str) -> Path:
     """本次运行的持久工作目录：``<runs>/<run_id>/workspace``。"""
     return _runs_root(root) / run_id / "workspace"
@@ -744,13 +769,19 @@ def collect_run(
                     candidate = _relative_output(raw_value)
                     if candidate and _locate_output(root, base_workspace, candidate):
                         path_text = candidate
+                    elif candidate is None:
+                        absolute = _locate_absolute(root, base_workspace, raw_value)
+                        if absolute is not None:
+                            path_text = str(absolute)
                 if path_text is None and declared_path and _locate_output(
                     root, base_workspace, declared_path
                 ):
                     path_text = declared_path
 
                 if path_text is not None:
-                    source = _locate_output(root, base_workspace, path_text)
+                    source = _locate_output(root, base_workspace, path_text) or _locate_absolute(
+                        root, base_workspace, path_text
+                    )
                     try:
                         data = source.read_bytes() if source is not None else b""
                     except OSError as exc:

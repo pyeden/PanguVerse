@@ -777,3 +777,19 @@ def test_a10_run_registers_report_outputs_end_to_end(web: WebClient) -> None:
     # 再查一次不重复登记
     status, again = web.get_json(f"/api/artifacts?run={run_id}")
     assert status == 200 and again["total"] == listing["total"]
+
+
+def test_locate_absolute_artifact_inside_workspace(tmp_path) -> None:
+    """G5：绝对产物路径只要在受信根目录内就应被登记，而不是误报源缺失。"""
+    from panguverse.web import artifacts
+
+    workspace = tmp_path / "runs" / "r1" / "workspace"
+    workspace.mkdir(parents=True)
+    produced = workspace / "report.html"
+    produced.write_text("ok", encoding="utf-8")
+
+    assert artifacts._locate_absolute(tmp_path, workspace, str(produced)) == produced.resolve()
+
+    outside = tmp_path.parent / "outside-artifact.txt"
+    outside.write_text("nope", encoding="utf-8")
+    assert artifacts._locate_absolute(tmp_path, workspace, str(outside)) is None
