@@ -112,24 +112,24 @@ export function OverviewPage() {
 
       <div className="kpi-grid" aria-label="关键指标">
         <div className="kpi">
-          <div className="kpi-head"><span>今日运行数</span><Icon name="play" size={15} /></div>
+          <div className="kpi-head"><span className="kpi-label">今日运行数<span className="kpi-scope">今日</span></span><Icon name="play" size={15} /></div>
           <strong className="kpi-value">{loading ? '—' : todayRuns.length}</strong>
           <span className="kpi-sub">{loading ? '正在统计' : todayRuns.length ? `最近一次 ${relativeTime(runWhen(todayRuns[0]))}` : '今天还没有运行'}</span>
         </div>
         <div className="kpi">
-          <div className="kpi-head"><span>成功率</span><Icon name="check" size={15} /></div>
+          <div className="kpi-head"><span className="kpi-label">成功率<span className="kpi-scope">今日</span></span><Icon name="check" size={15} /></div>
           <strong className={`kpi-value ${caseStats.rate !== null && caseStats.rate < 80 ? 'bad' : caseStats.rate !== null ? 'ok' : ''}`}>
-            {loading ? '—' : caseStats.rate === null ? '—' : `${caseStats.rate}%`}
+            {loading ? '—' : `${caseStats.rate ?? 0}%`}
           </strong>
           <span className="kpi-sub">{loading ? '正在统计' : caseStats.total ? `${caseStats.passed}/${caseStats.total} 用例通过` : '今日暂无用例数据'}</span>
         </div>
         <div className="kpi">
-          <div className="kpi-head"><span>待审任务数</span><Icon name="tasks" size={15} /></div>
+          <div className="kpi-head"><span className="kpi-label">待审任务数<span className="kpi-scope">今日</span></span><Icon name="tasks" size={15} /></div>
           <strong className="kpi-value">{loading ? '—' : pendingTasks.length}</strong>
           <span className="kpi-sub">{loading ? '正在统计' : pendingTasks.length ? '草稿或待审，等你推进' : '没有待处理任务'}</span>
         </div>
         <div className="kpi">
-          <div className="kpi-head"><span>失败数</span><Icon name="warning" size={15} /></div>
+          <div className="kpi-head"><span className="kpi-label">失败数<span className="kpi-scope">今日</span></span><Icon name="warning" size={15} /></div>
           <strong className={`kpi-value ${failedRuns.length ? 'bad' : 'ok'}`}>{loading ? '—' : failedRuns.length}</strong>
           <span className="kpi-sub">{loading ? '正在统计' : failedRuns.length ? '今日运行失败，请查看运行记录' : '今日没有失败运行'}</span>
         </div>

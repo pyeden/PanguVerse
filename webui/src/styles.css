@@ -1947,3 +1947,74 @@ report signatures */
   .freeze-summary .execution-mode-ref { max-width: 100%; }
   .execution-mode-badge .execution-mode-ref { max-width: 150px; }
 }
+
+/* -------------------------------------------------------------------------- */
+/* Experience polish: KPI scope, freeze readiness, diff variables            */
+/* -------------------------------------------------------------------------- */
+
+.kpi-label { display: inline-flex; align-items: center; gap: 5px; min-width: 0; }
+.kpi-scope {
+  flex: 0 0 auto;
+  padding: 1px 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 999px;
+  color: var(--cyan);
+  font-size: 8px;
+  line-height: 1.4;
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+.freeze-ready-badge { flex: 0 0 auto; }
+
+.diff-vars {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.diff-var-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  min-width: 0;
+  padding: 5px 0;
+  border-top: 1px dashed var(--line);
+  font-size: 9.5px;
+}
+.diff-var-key {
+  flex: 0 1 34%;
+  min-width: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.diff-var-values {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+  color: var(--dim);
+  overflow-wrap: anywhere;
+}
+.diff-var-base,
+.diff-var-target {
+  min-width: 0;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+}
+.diff-var-target { color: var(--muted); }
+.diff-var-arrow { flex: 0 0 auto; color: var(--dim); }
+
+@media (max-width: 900px) {
+  .task-actions { flex-wrap: wrap; }
+  .task-actions .btn { flex: 1 1 auto; min-width: 0; }
+}
+
+@media (max-width: 640px) {
+  .task-actions .btn { flex: 1 1 calc(50% - 4px); }
+  .diff-var-row { flex-direction: column; gap: 2px; }
+  .diff-var-key { flex: 0 1 auto; max-width: 100%; }
+  .kpi-sub { white-space: normal; }
+}

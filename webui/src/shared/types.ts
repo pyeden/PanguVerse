@@ -79,6 +79,8 @@ export interface RunSummary {
   meta?: AnyRecord
   status?: string
   last_status?: string
+  /** 任务卡 last_run 摘要直接给出成功与否。 */
+  success?: boolean
   project_id?: string
   suite_id?: string
   suite_name?: string
@@ -586,6 +588,10 @@ export interface Workflow {
   frozen_at?: number | null
   frozen_by?: string
   goal_checks?: GoalCheck[]
+  /** 当前版本的最近一次正式运行；无运行时为 null。 */
+  last_run?: RunSummary | null
+  /** 当前版本是否满足固化条件（最近一次运行成功等）。 */
+  freeze_ready?: boolean
   [key: string]: any
 }
 

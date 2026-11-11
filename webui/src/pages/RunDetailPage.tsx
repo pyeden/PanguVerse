@@ -42,6 +42,23 @@ import {
   useToast,
 } from '../components/ui'
 
+function diffValue(value: unknown, max = 60): string {
+  const clip = (text: string) => text.length > max ? `${text.slice(0, max - 1)}…` : text
+  if (value === null || value === undefined) return '—'
+  if (typeof value === 'string') {
+    const text = value.replace(/\s+/g, ' ').trim()
+    return text ? clip(text) : '空字符串'
+  }
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value)
+  if (Array.isArray(value)) return clip(`[${value.length} 项]`)
+  if (typeof value === 'object') {
+    const keys = Object.keys(value as AnyRecord)
+    const head = keys.slice(0, 3).join(', ')
+    return clip(`{${keys.length} 键${head ? `: ${head}` : ''}${keys.length > 3 ? '…' : ''}}`)
+  }
+  return clip(String(value))
+}
+
 export function RunDetailPage() {
   const route = useRoute()
   const pid = route.query.get('project') || ''
@@ -342,11 +359,18 @@ export function RunDetailPage() {
                   </ul>
                 ) : <p className="muted">步骤状态与耗时无变化。</p>}
                 {(diffQuery.data.variables || []).length ? (
-                  <div className="task-meta" style={{ marginTop: 8 }}>
+                  <ul className="diff-vars" aria-label="变量变化">
                     {(diffQuery.data.variables || []).slice(0, 8).map((item: AnyRecord, index: number) => (
-                      <span key={`diff-var-${index}`} className="mono">{String(item.name)}: {String(item.base)} → {String(item.target)}</span>
+                      <li key={`diff-var-${index}`} className="diff-var-row">
+                        <span className="diff-var-key mono" title={String(item.name)}>{String(item.name)}</span>
+                        <span className="diff-var-values">
+                          <span className="diff-var-base mono">{diffValue(item.base)}</span>
+                          <span className="diff-var-arrow" aria-hidden="true">→</span>
+                          <span className="diff-var-target mono">{diffValue(item.target)}</span>
+                        </span>
+                      </li>
                     ))}
-                  </div>
+                  </ul>
                 ) : null}
                 {(diffQuery.data.artifacts || []).length ? (
                   <div className="task-meta" style={{ marginTop: 8 }}>

@@ -42,6 +42,16 @@ export function SettingsPage() {
         </section>
 
         <section className="panel">
+          <SectionHeader icon="settings" title="高级运行" description="旧任务运行配置" />
+          <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <p className="muted" style={{ margin: 0, fontSize: 11, lineHeight: 1.55 }}>
+              用于场景 / 意图类旧任务的运行入口与环境覆盖；新任务请从任务卡的「运行」直接执行。
+            </p>
+            <a className="inline-link" href={href('/tasks/config')}>打开高级运行 →</a>
+          </div>
+        </section>
+
+        <section className="panel">
           <SectionHeader icon="flow" title="快捷入口" description="常用模块" />
           <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 6 }}>
             <a className="inline-link" href={href('/overview')}>概览</a>

@@ -820,6 +820,21 @@ export async function mockUnfreezeWorkflow(
   return { wid, execution_mode: 'debug', previous_frozen_ref: previous }
 }
 
+export async function mockRunWorkflow(
+  wid: string,
+  _body: AnyRecord = {},
+): Promise<{ job_id: string; task_id: string; workflow_ref: string; status: string }> {
+  const store = load()
+  const workflow = ensure(wid)
+  if (!workflow.published_ref) throw new Error('请先在审阅页发布')
+  const taskId = `task-${wid}`
+  const jobId = `job-${Date.now().toString(36)}`
+  workflow.audit.push({ ts: now(), actor: 'you', action: 'workflow.run', ref: workflow.published_ref, job_id: jobId })
+  store.workflows[wid] = workflow
+  save(store)
+  return { job_id: jobId, task_id: taskId, workflow_ref: String(workflow.published_ref), status: 'queued' }
+}
+
 export function mockReset(): void {
   try {
     localStorage.removeItem(STORE_KEY)

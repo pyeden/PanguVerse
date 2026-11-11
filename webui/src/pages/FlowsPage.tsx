@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ApiError, studioApi } from '../shared/api'
 import { href, navigate, useRoute, withQuery } from '../shared/router'
-import { relativeTime } from '../shared/utils'
+import { formatTime, relativeTime, shortId, statusLabel, statusOf } from '../shared/utils'
 import type { Workflow } from '../shared/types'
 import { Icon } from '../components/Icon'
 import { ExecutionModeBadgeForWorkflow } from '../components/ExecutionModeBadge'
@@ -19,6 +19,7 @@ import {
   SearchInput,
   SectionHeader,
   Select,
+  StatusBadge,
   useToast,
 } from '../components/ui'
 
@@ -56,6 +57,23 @@ function nodeCountOf(workflow: Workflow): number {
   return Number(workflow.node_count ?? workflow.graph?.nodes?.length ?? workflow.nodes?.length ?? 0)
 }
 
+function canFreezeWorkflow(workflow: Workflow): boolean {
+  return !workflow.archived_at
+    && !!workflow.freeze_ready
+    && String(workflow.execution_mode || '').toLowerCase() === 'debug'
+}
+
+function lastRunView(workflow: Workflow) {
+  const run = workflow.last_run || null
+  if (!run) return null
+  const rawStatus = statusOf(run)
+  const success = run.success === true || (run.success !== false && ['passed', 'done', 'success'].includes(rawStatus))
+  const failed = run.success === false || rawStatus === 'failed' || rawStatus === 'errored'
+  const status = success ? 'passed' : failed ? 'failed' : rawStatus
+  const label = success ? '最近成功' : failed ? '最近失败' : rawStatus === 'running' ? '运行中' : statusLabel(rawStatus)
+  return { run, status, label }
+}
+
 function actionError(error: unknown, action: string): { message: string; unavailable: boolean } {
   if (error instanceof ApiError && error.status === 404) {
     return { message: `${action}接口尚未就绪（404）；后端升级后即可使用`, unavailable: true }
@@ -80,6 +98,8 @@ export function FlowsPage() {
   const [renameName, setRenameName] = useState('')
   const [renameError, setRenameError] = useState('')
   const [archiveTarget, setArchiveTarget] = useState<{ workflow: Workflow; archived: boolean } | null>(null)
+  const [freezeTarget, setFreezeTarget] = useState<Workflow | null>(null)
+  const [freezeMessage, setFreezeMessage] = useState('')
 
   const workflows = draftsQuery.data || []
 
@@ -149,6 +169,54 @@ export function FlowsPage() {
     },
   })
 
+  const runMutation = useMutation({
+    mutationFn: (workflow: Workflow) => studioApi.runWorkflow(workflow.wid, {}),
+    onSuccess: (result) => {
+      refreshLists()
+      const runId = String(result.run_id || '')
+      push(runId ? `已开始运行 · ${shortId(runId)}` : '已提交运行', 'ok')
+      navigate(runId ? `/runs/${encodeURIComponent(runId)}` : '/runs')
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && (error.status === 409 || error.code === 'not_published')) {
+        push('请先在审阅页发布', 'warn')
+        return
+      }
+      if (error instanceof ApiError && error.status === 404) {
+        push('运行入口尚未就绪（404）；后端升级后即可使用', 'warn')
+        return
+      }
+      push(error instanceof Error ? error.message : '运行失败', 'error')
+    },
+  })
+
+  const freezeMutation = useMutation({
+    mutationFn: ({ workflow, message }: { workflow: Workflow; message: string }) => (
+      studioApi.freezeWorkflow(workflow.wid, { message: message.trim() })
+    ),
+    onSuccess: (result) => {
+      refreshLists()
+      setFreezeTarget(null)
+      setFreezeMessage('')
+      const checks = Array.isArray(result.goal_checks) ? result.goal_checks.length : 0
+      push(`已固化 ${result.frozen_ref}${checks ? ` · ${checks} 项验收` : ''}；后续确定性执行`, 'ok')
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 404) {
+        push('固化入口尚未就绪（404）；后端升级后即可使用', 'warn')
+        return
+      }
+      push(error instanceof Error ? error.message : '固化失败', 'error')
+    },
+  })
+
+  const openFreeze = (workflow: Workflow) => {
+    if (!canFreezeWorkflow(workflow)) return
+    setFreezeTarget(workflow)
+    const rev = workflow.current_rev ?? workflow.rev ?? 0
+    setFreezeMessage(`固化 ${workflow.wid}@${rev} 为生产任务`)
+  }
+
   const openRename = (workflow: Workflow) => {
     setRenameTarget(workflow)
     setRenameName(workflow.name || '')
@@ -184,10 +252,7 @@ export function FlowsPage() {
         title="任务"
         description="一句话生成的任务，打开画布继续编辑与发布。"
         actions={
-          <>
-            <Button variant="ghost" icon="settings" onClick={() => navigate('/tasks/config')}>运行配置</Button>
-            <Button variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>
-          </>
+          <Button variant="primary" icon="spark" onClick={() => navigate('/next/console')}>新建任务</Button>
         }
       />
 
@@ -243,6 +308,7 @@ export function FlowsPage() {
             const nodes = nodeCountOf(workflow)
             const rev = workflow.current_rev ?? workflow.rev ?? 0
             const archived = !!workflow.archived_at
+            const lastRun = lastRunView(workflow)
             return (
               <article className={`task-card workflow-card ${archived ? 'is-archived' : ''}`} key={workflow.wid} data-testid={`workflow-row-${workflow.wid}`}>
                 <span className={`task-icon tone-${meta.tone === 'ok' ? 'cyan' : meta.tone === 'warn' ? 'warn' : 'neutral'}`}>
@@ -254,6 +320,7 @@ export function FlowsPage() {
                     <ExecutionModeBadgeForWorkflow workflow={workflow} />
                     <Badge tone={meta.tone}>{meta.label}</Badge>
                     {archived ? <Badge tone="warn">已归档</Badge> : null}
+                    {canFreezeWorkflow(workflow) ? <Badge tone="ok" className="freeze-ready-badge"><Icon name="lock" size={10} />可固化</Badge> : null}
                   </div>
                   <p className="task-target">{workflow.intent || '无意图文本'}</p>
                   <div className="task-meta">
@@ -266,10 +333,31 @@ export function FlowsPage() {
                     <span>更新于 {relativeTime(workflow.updated_at)}</span>
                   </div>
                 </div>
+                <div className="task-last">
+                  {lastRun ? (
+                    <a href={href(`/runs/${lastRun.run.run_id}`)} className="task-last-link" title={lastRun.run.finished_at ? formatTime(lastRun.run.finished_at) : undefined}>
+                      <StatusBadge status={lastRun.status} />
+                      <span>{lastRun.label}</span>
+                    </a>
+                  ) : <Badge tone="neutral">未运行</Badge>}
+                </div>
                 <div className="task-actions">
+                  {!archived ? (
+                    <Button
+                      size="sm"
+                      variant="primary"
+                      icon="play"
+                      loading={runMutation.isPending && runMutation.variables?.wid === workflow.wid}
+                      onClick={() => runMutation.mutate(workflow)}
+                      data-testid={`run-workflow-${workflow.wid}`}
+                    >运行</Button>
+                  ) : null}
                   <a className="btn btn-ghost btn-sm" href={href(`/studio/${workflow.wid}`)}>
                     <Icon name="flow" size={15} /><span>打开</span>
                   </a>
+                  {canFreezeWorkflow(workflow) ? (
+                    <Button size="sm" variant="soft" icon="lock" onClick={() => openFreeze(workflow)} data-testid={`freeze-workflow-${workflow.wid}`}>固化</Button>
+                  ) : null}
                   <Button size="sm" variant="ghost" icon="edit" onClick={() => openRename(workflow)} data-testid={`rename-workflow-${workflow.wid}`}>重命名</Button>
                   <Button
                     size="sm"
@@ -286,6 +374,56 @@ export function FlowsPage() {
           })}
         </div>
       ) : null}
+
+      <Modal
+        open={!!freezeTarget}
+        onClose={() => { if (!freezeMutation.isPending) setFreezeTarget(null) }}
+        title="固化为生产任务"
+        subtitle="固化后只执行固定节点图，LLM 不再生成或修改节点。"
+        size="sm"
+        footer={
+          <>
+            <Button variant="ghost" onClick={() => setFreezeTarget(null)} disabled={freezeMutation.isPending}>取消</Button>
+            <Button
+              variant="primary"
+              icon="lock"
+              loading={freezeMutation.isPending}
+              disabled={!freezeMessage.trim()}
+              onClick={() => freezeTarget && freezeMutation.mutate({ workflow: freezeTarget, message: freezeMessage })}
+              data-testid="confirm-freeze-workflow"
+            >确认固化</Button>
+          </>
+        }
+      >
+        <div className="freeze-summary" data-testid="freeze-confirm-summary">
+          <div>
+            <span>固化版本</span>
+            <code className="execution-mode-ref">{freezeTarget ? `${freezeTarget.wid}@${freezeTarget.current_rev ?? freezeTarget.rev ?? 0}` : '当前版本'}</code>
+          </div>
+          <div>
+            <span>最近一次运行</span>
+            <strong className="tone-ok">运行成功</strong>
+            <small>{freezeTarget?.last_run?.run_id ? `run ${shortId(freezeTarget.last_run.run_id)}` : '已满足固化条件'}</small>
+          </div>
+        </div>
+        <div className="notice-inline warn-note">
+          <Icon name="shield" size={15} />
+          <div>
+            <strong>固化后不会自动改图</strong>
+            <p>LLM 不再规划、生成或注册节点；失败只做重试与重认证。需要继续改图时请在画布切回调试。</p>
+          </div>
+        </div>
+        <Field label="固化说明" hint="写入 audit；说明为什么这个版本可以进入生产。">
+          <textarea
+            className="textarea"
+            rows={3}
+            value={freezeMessage}
+            onChange={(event) => setFreezeMessage(event.target.value)}
+            placeholder="说明这个版本可以进入生产的原因"
+            aria-label="固化说明"
+          />
+        </Field>
+      </Modal>
 
       <Modal
         open={!!renameTarget}

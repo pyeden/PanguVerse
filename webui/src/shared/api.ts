@@ -469,6 +469,26 @@ export const studioApi = {
     return (items as AnyRecord[]).map((item) => normalizeWorkflow(item))
   },
 
+  /**
+   * POST api/studio/{wid}/run —— 从任务卡直接运行当前发布版本。
+   * 未发布时后端返回 409 not_published；旧服务没有该路由时返回 404。
+   */
+  async runWorkflow(
+    wid: string,
+    body: AnyRecord = {},
+  ): Promise<{ job_id: string; task_id?: string; workflow_ref?: string; run_id?: string; status?: string }> {
+    return realOrMock(
+      () => request<{ job_id: string; task_id?: string; workflow_ref?: string; run_id?: string; status?: string }>(
+        `api/studio/${encode(wid)}/run`,
+        { method: 'POST', body },
+      ),
+      async () => {
+        const { mockRunWorkflow } = await import('./studioMock')
+        return mockRunWorkflow(wid, body)
+      },
+    )
+  },
+
   async renameWorkflow(wid: string, name: string): Promise<{ wid: string; name: string; current_rev?: number }> {
     return realOrMock(
       () => request<{ wid: string; name: string; current_rev?: number }>(`api/studio/${encode(wid)}`, {
